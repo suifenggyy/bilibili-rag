@@ -1412,3 +1412,50 @@ body {
   gap: 8px;
   flex-wrap: wrap;
 }
+
+/* ==================== 抖音导出面板 ==================== */
+
+.douyin-cookie-input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1.5px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input, var(--bg-secondary));
+  color: var(--text);
+  font-size: 12px;
+  font-family: monospace;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.15s;
+  line-height: 1.5;
+}
+
+.douyin-cookie-input:focus {
+  border-color: var(--primary);
+}
+
+.douyin-cookie-input::placeholder {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.douyin-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.douyin-cookie-guide {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.douyin-fields code {
+  background: var(--bg-tertiary, #f1f5f9);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11px;
+  word-break: break-all;
+}

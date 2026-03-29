@@ -340,3 +340,48 @@ export const exportApi = {
     listJobs: (sessionId: string) =>
         request<{ jobs: ExportJobStatus[] }>(`/export/jobs?session_id=${sessionId}`),
 };
+
+// ==================== 抖音导出 ====================
+
+export interface DouyinExportRequest {
+    cookie: string;
+    evil0ctal_url?: string;
+    limit?: number;
+    asr_backend: "auto" | "dashscope" | "ollama";
+    ollama_url?: string;
+    ollama_model?: string;
+    ollama_language?: string;
+}
+
+export interface DouyinExportJobStatus {
+    job_id: string;
+    status: "pending" | "running" | "completed" | "failed";
+    progress: number;
+    total_videos: number;
+    processed_videos: number;
+    current_video: string;
+    message: string;
+    file_count: number;
+    created_at: string;
+    completed_at?: string;
+}
+
+export const douyinExportApi = {
+    // 启动导出任务
+    start: (data: DouyinExportRequest) =>
+        request<{ job_id: string; message: string }>(
+            "/douyin-export/start",
+            {
+                method: "POST",
+                body: JSON.stringify(data),
+            }
+        ),
+
+    // 查询任务状态
+    getStatus: (jobId: string) =>
+        request<DouyinExportJobStatus>(`/douyin-export/status/${jobId}`),
+
+    // 下载导出 ZIP
+    getDownloadUrl: (jobId: string) =>
+        `${API_BASE_URL}/douyin-export/download/${jobId}`,
+};

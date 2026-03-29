@@ -26,5 +26,11 @@ python-dotenv==1.0.1
 # Logging
 loguru==0.7.2
 
+# Instapaper 文章正文提取
+trafilatura==2.0.0
+
+# pyinstapaper - Instapaper Full API Python 客户端
+pyinstapaper==0.2.2
+
 # System dependency (required for ASR local fallback)
 # ffmpeg (install separately and add to PATH)

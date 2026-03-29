@@ -56,8 +56,14 @@ logs/
 # B站登录 session 缓存（含敏感 Cookie，不提交）
 .bili_session.json
 
+# Instapaper xAuth token 缓存（不提交）
+.instapaper_session.json
+
 # 抖音导出输出目录（含用户私有内容，不提交）
 douyin_output/
+
+# Instapaper 导出输出目录
+instapaper_output/
 
 # macOS
 .DS_Store

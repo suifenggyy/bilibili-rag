@@ -385,3 +385,55 @@ export const douyinExportApi = {
     getDownloadUrl: (jobId: string) =>
         `${API_BASE_URL}/douyin-export/download/${jobId}`,
 };
+
+// ==================== Instapaper 导出 ====================
+
+export interface InstapaperFolder {
+    folder_id: string;
+    title: string;
+}
+
+export interface InstapaperExportRequest {
+    consumer_key: string;
+    consumer_secret: string;
+    email: string;
+    password: string;
+    folders: string[];
+    limit?: number;
+}
+
+export interface InstapaperExportJobStatus {
+    job_id: string;
+    status: "pending" | "running" | "completed" | "failed";
+    progress: number;
+    total_articles: number;
+    processed_articles: number;
+    current_article: string;
+    message: string;
+    file_count: number;
+    created_at: string;
+    completed_at?: string;
+}
+
+export const instapaperExportApi = {
+    // 获取文件夹列表
+    getFolders: (consumerKey: string, consumerSecret: string, email: string, password: string) =>
+        request<{ folders: InstapaperFolder[] }>(
+            `/instapaper-export/folders?consumer_key=${encodeURIComponent(consumerKey)}&consumer_secret=${encodeURIComponent(consumerSecret)}&email=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}`
+        ),
+
+    // 启动导出任务
+    start: (data: InstapaperExportRequest) =>
+        request<{ job_id: string; message: string }>(
+            "/instapaper-export/start",
+            { method: "POST", body: JSON.stringify(data) }
+        ),
+
+    // 查询任务状态
+    getStatus: (jobId: string) =>
+        request<InstapaperExportJobStatus>(`/instapaper-export/status/${jobId}`),
+
+    // 下载导出 ZIP
+    getDownloadUrl: (jobId: string) =>
+        `${API_BASE_URL}/instapaper-export/download/${jobId}`,
+};

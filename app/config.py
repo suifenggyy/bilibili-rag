@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     douyin_cookie: str = Field(default="", env="DOUYIN_COOKIE")
     douyin_evil0ctal_url: str = Field(default="http://localhost:2333", env="DOUYIN_EVIL0CTAL_URL")
     douyin_output_dir: str = Field(default="douyin_output", env="DOUYIN_OUTPUT_DIR")
+
+    # Instapaper 配置
+    instapaper_consumer_key: str = Field(default="", env="INSTAPAPER_CONSUMER_KEY")
+    instapaper_consumer_secret: str = Field(default="", env="INSTAPAPER_CONSUMER_SECRET")
+    instapaper_email: str = Field(default="", env="INSTAPAPER_EMAIL")
+    instapaper_password: str = Field(default="", env="INSTAPAPER_PASSWORD")
     
     # 应用配置
     app_host: str = Field(default="0.0.0.0", env="APP_HOST")

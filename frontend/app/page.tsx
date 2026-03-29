@@ -7,6 +7,7 @@ import SourcesPanel from "@/components/SourcesPanel";
 import ChatPanel from "@/components/ChatPanel";
 import ExportPanel from "@/components/ExportPanel";
 import DouyinExportPanel from "@/components/DouyinExportPanel";
+import InstapaperExportPanel from "@/components/InstapaperExportPanel";
 import { UserInfo, authApi } from "@/lib/api";
 
 export default function Home() {
@@ -16,7 +17,7 @@ export default function Home() {
   const [showDemo, setShowDemo] = useState(false);
   const [statsKey, setStatsKey] = useState(0);
   const [selectedFolderIds, setSelectedFolderIds] = useState<number[]>([]);
-  const [activeTab, setActiveTab] = useState<"rag" | "export" | "douyin">("rag");
+  const [activeTab, setActiveTab] = useState<"rag" | "export" | "douyin" | "instapaper">("rag");
 
   // 拖拽调整宽度
   const [leftWidth, setLeftWidth] = useState(320);
@@ -206,6 +207,15 @@ export default function Home() {
                   </svg>
                   抖音导出
                 </button>
+                <button
+                  className={`workspace-tab ${activeTab === "instapaper" ? "workspace-tab-active" : ""}`}
+                  onClick={() => setActiveTab("instapaper")}
+                >
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" style={{ marginRight: 5 }}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+                  </svg>
+                  Instapaper
+                </button>
               </div>
 
               {activeTab === "rag" && (
@@ -217,6 +227,7 @@ export default function Home() {
               )}
               {activeTab === "export" && <ExportPanel sessionId={session!} />}
               {activeTab === "douyin" && <DouyinExportPanel />}
+              {activeTab === "instapaper" && <InstapaperExportPanel />}
             </section>
           </section>
         )}

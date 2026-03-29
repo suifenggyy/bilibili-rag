@@ -40,6 +40,8 @@ bilibili-rag/
 │       ├── content_fetcher.py    # 视频内容获取（ASR + 降级策略）
 │       ├── asr.py                # DashScope ASR 服务
 │       ├── asr_local.py          # Ollama 本地 ASR 服务（Whisper）
+│       ├── douyin.py             # 抖音 API 封装（Evil0ctal 中间层）
+│       ├── douyin_fetcher.py     # 抖音音频下载 + ASR 转写
 │       └── rag.py                # 向量检索与 RAG 对话
 │
 ├── frontend/                     # 前端（Next.js + React + Tailwind CSS）
@@ -55,7 +57,8 @@ bilibili-rag/
 │   └── lib/api.ts                # API 请求封装
 │
 ├── scripts/
-│   └── export_favorites_to_md.py # 收藏夹 → Markdown 独立导出脚本
+│   ├── export_favorites_to_md.py # B站收藏夹 → Markdown 独立导出脚本
+│   └── export_douyin_to_md.py    # 抖音收藏夹 → Markdown 独立导出脚本
 │
 ├── test/                         # 诊断脚本（需在项目根目录运行）
 │   ├── debug_asr_single.py       # 测试单视频 ASR 转写
@@ -298,6 +301,86 @@ output/
 ```
 
 每个 Markdown 文件包含：视频元信息表格（BV号超链接、UP主、时长、发布日期）、封面图、视频简介、ASR 转写全文（转写失败时降级为标题 + 简介）。
+
+---
+
+## 🎵 模式三：抖音收藏夹导出脚本
+
+`scripts/export_douyin_to_md.py` 将**抖音收藏夹**中的视频音频转写为 Markdown 文档，与 B站导出脚本平行独立运行。
+
+### 前提条件
+
+**1. 部署 Evil0ctal API 中间层**（处理抖音动态签名 A-Bogus）
+
+```bash
+git clone https://github.com/Evil0ctal/Douyin_TikTok_Download_API
+cd Douyin_TikTok_Download_API && pip install -r requirements.txt
+python main.py   # 默认监听 http://localhost:2333
+```
+
+**2. 获取抖音 Cookie**（抖音不提供扫码 API，需手动复制）
+
+1. Chrome/Edge 打开 [https://www.douyin.com](https://www.douyin.com) 并登录
+2. 按 F12 → Application → Cookies → `douyin.com`
+3. 将所有字段拼接为 `"key1=val1; key2=val2; ..."` 格式
+4. 填入 `.env` 的 `DOUYIN_COOKIE` 或通过 `--cookie` 参数传入
+
+### 配置
+
+```bash
+# .env
+DOUYIN_COOKIE=ttwid=xxx; sessionid=xxx; odin_tt=xxx; msToken=xxx; ...
+DOUYIN_EVIL0CTAL_URL=http://localhost:2333   # Evil0ctal API 地址
+DOUYIN_OUTPUT_DIR=douyin_output              # 输出目录
+```
+
+### 用法
+
+```bash
+# 交互式选择导出数量（推荐初次使用）
+python scripts/export_douyin_to_md.py
+
+# 指定 Cookie（不配置环境变量时使用）
+python scripts/export_douyin_to_md.py --cookie "ttwid=xxx; sessionid=xxx; ..."
+
+# 导出全部收藏视频
+python scripts/export_douyin_to_md.py --all
+
+# 仅导出最新 20 个
+python scripts/export_douyin_to_md.py --limit 20
+
+# 指定输出目录
+python scripts/export_douyin_to_md.py --output-dir ~/douyin-notes
+
+# 使用 Ollama 本地 ASR（不消耗 API 额度）
+python scripts/export_douyin_to_md.py --asr-backend ollama
+
+# 使用更高精度的 Whisper 模型
+python scripts/export_douyin_to_md.py --asr-backend ollama --ollama-model whisper:large
+
+# 指定 Evil0ctal 服务地址（非默认端口时使用）
+python scripts/export_douyin_to_md.py --evil0ctal-url http://192.168.1.100:2333
+```
+
+### 输出文件结构
+
+```
+douyin_output/
+├── 这个视频讲得太好了_7234567890123456789.md
+├── 学习Python必看_7198765432109876543.md
+└── 美食探店日记_7111122223333444455.md
+```
+
+每个 Markdown 文件包含：视频信息表格（ID 超链接、作者、时长、发布日期）、封面图、ASR 转写全文。
+
+### 与 B站导出对比
+
+| 维度 | B站 | 抖音 |
+|------|-----|------|
+| 登录方式 | 扫码（官方 API） | 手动复制 Cookie |
+| 中间层 | 无需 | 需部署 Evil0ctal API |
+| 收藏组织 | 按收藏夹分目录 | 统一输出目录 |
+| ASR 复用 | ✅ DashScope / Ollama | ✅ 完全相同 |
 
 ---
 

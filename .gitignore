@@ -56,6 +56,9 @@ logs/
 # B站登录 session 缓存（含敏感 Cookie，不提交）
 .bili_session.json
 
+# 抖音导出输出目录（含用户私有内容，不提交）
+douyin_output/
+
 # macOS
 .DS_Store
 

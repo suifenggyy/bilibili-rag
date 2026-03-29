@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     ollama_base_url: str = Field(default="http://localhost:11434", env="OLLAMA_BASE_URL")
     ollama_asr_model: str = Field(default="whisper", env="OLLAMA_ASR_MODEL")
     ollama_asr_language: str = Field(default="zh", env="OLLAMA_ASR_LANGUAGE")
+
+    # 抖音导出配置
+    douyin_cookie: str = Field(default="", env="DOUYIN_COOKIE")
+    douyin_evil0ctal_url: str = Field(default="http://localhost:2333", env="DOUYIN_EVIL0CTAL_URL")
+    douyin_output_dir: str = Field(default="douyin_output", env="DOUYIN_OUTPUT_DIR")
     
     # 应用配置
     app_host: str = Field(default="0.0.0.0", env="APP_HOST")

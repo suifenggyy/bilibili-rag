@@ -5,6 +5,7 @@ import LoginModal from "@/components/LoginModal";
 import DemoFlowModal from "@/components/DemoFlowModal";
 import SourcesPanel from "@/components/SourcesPanel";
 import ChatPanel from "@/components/ChatPanel";
+import ExportPanel from "@/components/ExportPanel";
 import { UserInfo, authApi } from "@/lib/api";
 
 export default function Home() {
@@ -14,6 +15,7 @@ export default function Home() {
   const [showDemo, setShowDemo] = useState(false);
   const [statsKey, setStatsKey] = useState(0);
   const [selectedFolderIds, setSelectedFolderIds] = useState<number[]>([]);
+  const [activeTab, setActiveTab] = useState<"rag" | "export">("rag");
 
   // 拖拽调整宽度
   const [leftWidth, setLeftWidth] = useState(320);
@@ -174,11 +176,37 @@ export default function Home() {
             />
 
             <section className="panel panel-chat" style={{ flex: 1 }}>
-              <ChatPanel
-                statsKey={statsKey}
-                sessionId={session ?? undefined}
-                folderIds={selectedFolderIds}
-              />
+              {/* 选项卡切换 */}
+              <div className="workspace-tabs">
+                <button
+                  className={`workspace-tab ${activeTab === "rag" ? "workspace-tab-active" : ""}`}
+                  onClick={() => setActiveTab("rag")}
+                >
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" style={{ marginRight: 5 }}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-3 3v-3z" />
+                  </svg>
+                  知识库问答
+                </button>
+                <button
+                  className={`workspace-tab ${activeTab === "export" ? "workspace-tab-active" : ""}`}
+                  onClick={() => setActiveTab("export")}
+                >
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" style={{ marginRight: 5 }}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5 5m0 0l5-5m-5 5V4" />
+                  </svg>
+                  导出 Markdown
+                </button>
+              </div>
+
+              {activeTab === "rag" ? (
+                <ChatPanel
+                  statsKey={statsKey}
+                  sessionId={session ?? undefined}
+                  folderIds={selectedFolderIds}
+                />
+              ) : (
+                <ExportPanel sessionId={session!} />
+              )}
             </section>
           </section>
         )}

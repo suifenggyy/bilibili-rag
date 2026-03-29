@@ -11,7 +11,7 @@ import sys
 
 from app.config import settings, ensure_directories
 from app.database import init_db
-from app.routers import auth, favorites, knowledge, chat
+from app.routers import auth, favorites, knowledge, chat, export
 
 
 # 配置日志
@@ -85,6 +85,7 @@ app.include_router(auth.router)
 app.include_router(favorites.router)
 app.include_router(knowledge.router)
 app.include_router(chat.router)
+app.include_router(export.router)
 
 
 @app.get("/")

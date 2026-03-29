@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     asr_timeout: int = Field(default=600, env="ASR_TIMEOUT")
     asr_model_local: str = Field(default="paraformer-realtime-v2", env="ASR_MODEL_LOCAL")
     asr_input_format: str = Field(default="pcm", env="ASR_INPUT_FORMAT")
+
+    # Ollama 本地 ASR（Whisper）
+    ollama_base_url: str = Field(default="http://localhost:11434", env="OLLAMA_BASE_URL")
+    ollama_asr_model: str = Field(default="whisper", env="OLLAMA_ASR_MODEL")
+    ollama_asr_language: str = Field(default="zh", env="OLLAMA_ASR_LANGUAGE")
     
     # 应用配置
     app_host: str = Field(default="0.0.0.0", env="APP_HOST")

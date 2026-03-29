@@ -53,6 +53,9 @@ logs/
 .cache/
 *.cache
 
+# B站登录 session 缓存（含敏感 Cookie，不提交）
+.bili_session.json
+
 # macOS
 .DS_Store
 

@@ -159,6 +159,29 @@ export interface ChatResponse {
     }>;
 }
 
+// ==================== 导出相关类型 ====================
+
+export interface ExportRequest {
+    folder_ids: number[];
+    asr_backend: "auto" | "dashscope" | "ollama";
+    ollama_url?: string;
+    ollama_model?: string;
+    ollama_language?: string;
+}
+
+export interface ExportJobStatus {
+    job_id: string;
+    status: "pending" | "running" | "completed" | "failed";
+    progress: number;
+    total_videos: number;
+    processed_videos: number;
+    current_video: string;
+    message: string;
+    created_at: string;
+    completed_at?: string;
+    file_count: number;
+}
+
 // ==================== API 函数 ====================
 
 // 认证相关
@@ -291,4 +314,29 @@ export const chatApi = {
             `/chat/search?query=${encodeURIComponent(query)}&k=${k}`,
             { method: "POST" }
         ),
+};
+
+// 导出相关
+export const exportApi = {
+    // 启动导出任务
+    start: (data: ExportRequest, sessionId: string) =>
+        request<{ job_id: string; message: string }>(
+            `/export/start?session_id=${sessionId}`,
+            {
+                method: "POST",
+                body: JSON.stringify(data),
+            }
+        ),
+
+    // 查询任务状态
+    getStatus: (jobId: string) =>
+        request<ExportJobStatus>(`/export/status/${jobId}`),
+
+    // 下载导出 ZIP（返回 blob URL）
+    getDownloadUrl: (jobId: string) =>
+        `${API_BASE_URL}/export/download/${jobId}`,
+
+    // 列出历史任务
+    listJobs: (sessionId: string) =>
+        request<{ jobs: ExportJobStatus[] }>(`/export/jobs?session_id=${sessionId}`),
 };

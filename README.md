@@ -16,7 +16,9 @@
 | 🎙️ ASR 语音转写 | 支持 DashScope 云端（paraformer）和 Ollama 本地（Whisper）两种后端 |
 | 🔍 语义检索 | 基于 ChromaDB 向量检索 |
 | 💬 RAG 对话问答 | 基于收藏内容回答问题，附来源溯源 |
-| 📝 收藏夹导出 | 独立脚本：将收藏夹视频转写内容批量导出为 Markdown 文件，不依赖 RAG |
+| 📝 B 站收藏夹导出 | 将收藏夹视频转写内容批量导出为 Markdown 文件 |
+| 🎵 抖音收藏夹导出 | 获取抖音收藏视频，音频 ASR 转写后导出 Markdown |
+| 📖 Instapaper 书签导出 | 获取书签列表，用 trafilatura 提取文章正文，无需 Premium |
 
 ---
 
@@ -33,7 +35,10 @@ bilibili-rag/
 │   │   ├── auth.py               # 登录接口（扫码 / 会话管理）
 │   │   ├── favorites.py          # 收藏夹接口
 │   │   ├── knowledge.py          # 知识库构建接口
-│   │   └── chat.py               # 对话问答接口
+│   │   ├── chat.py               # 对话问答接口
+│   │   ├── export.py             # B站收藏夹导出接口
+│   │   ├── douyin_export.py      # 抖音收藏夹导出接口
+│   │   └── instapaper_export.py  # Instapaper 书签导出接口
 │   └── services/
 │       ├── bilibili.py           # B 站 API 封装（登录、收藏夹、视频、音频）
 │       ├── wbi.py                # B 站 WBI 签名工具
@@ -42,6 +47,8 @@ bilibili-rag/
 │       ├── asr_local.py          # Ollama 本地 ASR 服务（Whisper）
 │       ├── douyin.py             # 抖音 API 封装（Evil0ctal 中间层）
 │       ├── douyin_fetcher.py     # 抖音音频下载 + ASR 转写
+│       ├── instapaper.py         # Instapaper OAuth 1.0a xAuth 认证 + 书签 API
+│       ├── article_fetcher.py    # 文章正文提取（trafilatura）
 │       └── rag.py                # 向量检索与 RAG 对话
 │
 ├── frontend/                     # 前端（Next.js + React + Tailwind CSS）
@@ -53,12 +60,16 @@ bilibili-rag/
 │   │   ├── ChatPanel.tsx         # 对话面板
 │   │   ├── SourcesPanel.tsx      # 来源溯源面板
 │   │   ├── DemoFlowModal.tsx     # 演示流程弹窗
-│   │   └── OrganizePreviewModal.tsx  # 收藏夹整理预览
+│   │   ├── OrganizePreviewModal.tsx  # 收藏夹整理预览
+│   │   ├── ExportPanel.tsx       # B站收藏夹导出面板
+│   │   ├── DouyinExportPanel.tsx # 抖音收藏夹导出面板
+│   │   └── InstapaperExportPanel.tsx # Instapaper 书签导出面板
 │   └── lib/api.ts                # API 请求封装
 │
 ├── scripts/
 │   ├── export_favorites_to_md.py # B站收藏夹 → Markdown 独立导出脚本
-│   └── export_douyin_to_md.py    # 抖音收藏夹 → Markdown 独立导出脚本
+│   ├── export_douyin_to_md.py    # 抖音收藏夹 → Markdown 独立导出脚本
+│   └── export_instapaper_to_md.py # Instapaper 书签 → Markdown 独立导出脚本
 │
 ├── test/                         # 诊断脚本（需在项目根目录运行）
 │   ├── debug_asr_single.py       # 测试单视频 ASR 转写
@@ -72,10 +83,14 @@ bilibili-rag/
 ├── data/                         # 运行时数据（自动生成，不入 git）
 │   ├── bilibili_rag.db           # SQLite 数据库
 │   ├── chroma_db/                # ChromaDB 向量库
-│   └── asr_tmp/                  # ASR 临时音频文件
+│   ├── asr_tmp/                  # ASR 临时音频文件
+│   ├── exports/                  # B站导出任务文件
+│   ├── douyin_exports/           # 抖音导出任务文件
+│   └── instapaper_exports/       # Instapaper 导出任务文件
 │
 ├── .env.example                  # 环境变量模板
 ├── .bili_session.json            # B 站登录缓存（自动生成，不入 git）
+├── .instapaper_session.json      # Instapaper token 缓存（自动生成，不入 git）
 ├── requirements.txt              # Python 依赖
 └── README.md                     # 本文档
 ```
@@ -157,6 +172,19 @@ OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_ASR_MODEL=whisper             # whisper / whisper:large 等
 OLLAMA_ASR_LANGUAGE=zh               # 语言提示，留空则自动检测
 
+# ── 抖音导出 ──────────────────────────────────────────────
+# 浏览器手动复制：Chrome → douyin.com → F12 → Application → Cookies
+DOUYIN_COOKIE=
+DOUYIN_EVIL0CTAL_URL=http://localhost:2333
+DOUYIN_OUTPUT_DIR=douyin_output
+
+# ── Instapaper 导出 ────────────────────────────────────────
+# 申请 API Key：https://www.instapaper.com/main/request_oauth_consumer_token
+INSTAPAPER_CONSUMER_KEY=
+INSTAPAPER_CONSUMER_SECRET=
+INSTAPAPER_EMAIL=
+INSTAPAPER_PASSWORD=
+
 # ── 应用 ──────────────────────────────────────────────────
 APP_HOST=0.0.0.0
 APP_PORT=8000
@@ -200,9 +228,14 @@ npm run dev
 
 1. 打开 `http://localhost:3000`
 2. 点击登录 → 用手机 B 站 App 扫码
-3. 选择收藏夹 → 点击「构建知识库」
-4. 等待 ASR 转写完成
-5. 在对话框中提问，获取带来源的答案
+3. 右侧面板有四个功能 Tab：
+
+| Tab | 功能 |
+|-----|------|
+| **知识库问答** | 选择收藏夹 → 构建知识库 → RAG 对话问答 |
+| **B站导出** | 选择收藏夹 + ASR 后端 → 导出 Markdown → 下载 ZIP |
+| **抖音导出** | 粘贴 Cookie + Evil0ctal URL → 导出收藏视频转写 → 下载 ZIP |
+| **Instapaper** | 填写 API Key + 邮箱密码 → 选择文件夹 → 提取正文 → 下载 ZIP |
 
 ### API 路由一览
 
@@ -218,10 +251,17 @@ npm run dev
 | `/knowledge/status` | GET | 查看入库状态 |
 | `/chat/ask` | POST | RAG 问答 |
 | `/chat/search` | POST | 语义检索片段 |
-| `/export/start` | POST | 启动 Markdown 导出任务 |
-| `/export/status/{job_id}` | GET | 查询导出任务进度 |
-| `/export/download/{job_id}` | GET | 下载导出 ZIP |
-| `/export/jobs` | GET | 历史导出任务列表 |
+| `/export/start` | POST | B站导出：启动任务 |
+| `/export/status/{id}` | GET | B站导出：查询进度 |
+| `/export/download/{id}` | GET | B站导出：下载 ZIP |
+| `/export/jobs` | GET | B站导出：历史任务 |
+| `/douyin-export/start` | POST | 抖音导出：启动任务 |
+| `/douyin-export/status/{id}` | GET | 抖音导出：查询进度 |
+| `/douyin-export/download/{id}` | GET | 抖音导出：下载 ZIP |
+| `/instapaper-export/start` | POST | Instapaper 导出：启动任务 |
+| `/instapaper-export/status/{id}` | GET | Instapaper 导出：查询进度 |
+| `/instapaper-export/download/{id}` | GET | Instapaper 导出：下载 ZIP |
+| `/instapaper-export/folders` | GET | Instapaper：获取文件夹列表 |
 
 ---
 

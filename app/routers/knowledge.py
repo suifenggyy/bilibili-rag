@@ -15,7 +15,7 @@ from app.database import get_db, get_db_context
 from app.models import FavoriteFolder, FavoriteVideo, VideoCache, UserSession, ContentSource, VideoContent
 from app.services.bilibili import BilibiliService
 from app.services.content_fetcher import ContentFetcher
-from app.services.asr import ASRService
+from app.services.asr_factory import create_asr_service
 from app.services.rag import RAGService
 from app.routers.auth import get_session
 
@@ -533,7 +533,7 @@ async def sync_folders(
         dedeuserid=cookies.get("DedeUserID"),
     )
     rag = get_rag_service()
-    asr_service = ASRService()
+    asr_service = create_asr_service()
     content_fetcher = ContentFetcher(bili, asr_service)
 
     try:
@@ -630,7 +630,7 @@ async def _build_knowledge_base_task(
             bili_jct=cookies.get("bili_jct"),
             dedeuserid=cookies.get("DedeUserID"),
         )
-        asr_service = ASRService()
+        asr_service = create_asr_service()
         content_fetcher = ContentFetcher(bili, asr_service)
         rag = get_rag_service()
 

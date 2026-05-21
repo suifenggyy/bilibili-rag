@@ -10,11 +10,15 @@ B站收藏夹 → Markdown 导出工具
   - dashscope：DashScope 云端（需配置 DASHSCOPE_API_KEY）
   - ollama：本地 Whisper（需安装 Ollama 并运行 `ollama pull whisper`）
 
+音频下载依赖：
+  - yt-dlp：用于从 B站页面稳定提取音频
+  - ffmpeg：用于音频抽取/转码
+
 用法:
     python scripts/export_favorites_to_md.py                         # 交互式选择收藏夹
     python scripts/export_favorites_to_md.py --all                   # 导出所有收藏夹
     python scripts/export_favorites_to_md.py --folder-id 12345678    # 导出指定收藏夹
-    python scripts/export_favorites_to_md.py --output-dir ./output   # 指定输出目录
+    python scripts/export_favorites_to_md.py --output-dir /path/to/collection   # 指定输出目录
     python scripts/export_favorites_to_md.py --relogin               # 强制重新扫码登录
     python scripts/export_favorites_to_md.py --asr-backend ollama    # 使用 Ollama 本地转写
     python scripts/export_favorites_to_md.py --asr-backend ollama --ollama-model whisper:large
@@ -37,6 +41,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
 from loguru import logger
+from app.services.content_summary import append_summary_section
 
 load_dotenv(ROOT_DIR / ".env")
 
@@ -46,6 +51,11 @@ SESSION_CACHE_FILE = ROOT_DIR / ".bili_session.json"
 
 def _get_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
+
+
+DEFAULT_COLLECTION_OUTPUT_DIR = (
+    "/Users/gongyongyue/FangcloudV2/personal_space.localized/同步空间/个人资料/Obsidian/jarvis/collection"
+)
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
@@ -265,6 +275,7 @@ def _build_markdown(
     asr_text: str,
     source: str,
     folder_title: str,
+    summary_block: str = "",
 ) -> str:
     """构建 Markdown 文件内容"""
     title = video.get("title") or "未知标题"
@@ -302,6 +313,7 @@ def _build_markdown(
     if intro:
         lines += ["", "## 视频简介", "", intro]
 
+    append_summary_section(lines, summary_block)
     lines += ["", "---", "", "## 转写内容", ""]
 
     if asr_text and asr_text.strip():
@@ -331,11 +343,8 @@ async def export_folder(
     folder_title = folder.get("title", f"收藏夹_{media_id}")
     media_count = folder.get("media_count", 0)
 
-    folder_dir = output_dir / _safe_filename(folder_title)
-    folder_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"\n📁 收藏夹：{folder_title}（共 {media_count} 个视频）")
-    print(f"   输出目录：{folder_dir}")
+    print(f"   输出目录：{output_dir}")
 
     # 获取所有视频
     try:
@@ -374,7 +383,7 @@ async def export_folder(
         cid = (video.get("ugc") or {}).get("first_cid") or video.get("cid") or None
 
         safe_title = _safe_filename(title)
-        md_path = folder_dir / f"{safe_title}_{bvid}.md"
+        md_path = output_dir / f"{safe_title}_{bvid}.md"
 
         # 已存在则跳过
         if md_path.exists():
@@ -387,9 +396,20 @@ async def export_folder(
         try:
             from app.models import ContentSource
 
-            video_content = await fetcher.fetch_content(bvid, cid=cid, title=title)
+            video_content = await fetcher.fetch_content(
+                bvid,
+                cid=cid,
+                title=title,
+                fail_on_audio_download_error=True,
+            )
             source = video_content.source.value if hasattr(video_content.source, "value") else str(video_content.source)
-            md_content = _build_markdown(video, video_content.content, source, folder_title)
+            md_content = _build_markdown(
+                video,
+                video_content.content,
+                source,
+                folder_title,
+                getattr(video_content, "summary_block", ""),
+            )
 
             md_path.write_text(md_content, encoding="utf-8")
             source_label = "ASR ✅" if source == "asr" else "基本信息 ⚠️"
@@ -449,13 +469,12 @@ async def _build_asr_service(args):
     """根据参数构建 ASR 服务实例，并在启动时做可用性检查"""
     backend = args.asr_backend
 
-    # 自动选择：未配置 DashScope Key 时优先尝试 Ollama
+    # 自动选择：跟随 .env 中的 ASR_BACKEND
     if backend == "auto":
-        if args.api_key:
-            backend = "dashscope"
-        else:
-            backend = "ollama"
-            print("⚠️  未配置 DASHSCOPE_API_KEY，自动切换到 Ollama 本地 ASR")
+        backend = _get_env("ASR_BACKEND", "whisper").strip().lower() or "whisper"
+        if backend == "auto":
+            backend = "whisper"
+        print(f"ℹ️  自动模式使用 .env 中的 ASR_BACKEND={backend}")
 
     if backend == "dashscope":
         if not args.api_key:
@@ -463,6 +482,17 @@ async def _build_asr_service(args):
         from app.services.asr import ASRService
         print(f"🔊 ASR 后端：DashScope（{_get_env('ASR_MODEL', 'paraformer-v2')}）")
         return ASRService(api_key=args.api_key or None)
+
+    if backend == "whisper":
+        from app.services.asr_whisper import OpenAIWhisperASRService
+
+        asr = OpenAIWhisperASRService(
+            model=_get_env("WHISPER_MODEL", "turbo"),
+            language=_get_env("WHISPER_LANGUAGE", "zh"),
+            timeout=int(_get_env("ASR_TIMEOUT", "600")),
+        )
+        print(f"🔊 ASR 后端：openai-whisper 本地（模型：{asr.model_name}）")
+        return asr
 
     # Ollama 后端
     from app.services.asr_local import OllamaASRService
@@ -494,7 +524,7 @@ async def _build_asr_service(args):
     return asr
 
 
-async def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="B站收藏夹音频转写 → Markdown 导出工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -504,8 +534,8 @@ async def main():
     parser.add_argument("--all", action="store_true", help="导出所有收藏夹")
     parser.add_argument(
         "--output-dir",
-        default="output",
-        help="输出目录（默认: ./output）",
+        default=_get_env("COLLECTION_OUTPUT_DIR", DEFAULT_COLLECTION_OUTPUT_DIR),
+        help="输出目录（默认读取 COLLECTION_OUTPUT_DIR）",
     )
     parser.add_argument(
         "--relogin",
@@ -515,9 +545,9 @@ async def main():
     # ASR 后端选择
     parser.add_argument(
         "--asr-backend",
-        default="auto",
-        choices=["auto", "dashscope", "ollama"],
-        help="ASR 转写后端（auto=有 DashScope Key 则用 DashScope，否则用 Ollama）",
+        default="ollama",
+        choices=["auto", "dashscope", "ollama", "whisper"],
+        help="ASR 转写后端（默认: ollama；auto=按 .env 中 ASR_BACKEND 解析）",
     )
     # DashScope 参数
     parser.add_argument(
@@ -541,19 +571,25 @@ async def main():
         default=_get_env("OLLAMA_ASR_LANGUAGE", "zh"),
         help="转写语言提示（默认: zh，留空则自动检测）",
     )
+    return parser
+
+
+async def main():
+    parser = build_parser()
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    from app.services.content_storage import ContentStorageManager
     from app.services.content_fetcher import ContentFetcher
+
+    storage_manager = ContentStorageManager(export_root=args.output_dir)
+    output_dir = storage_manager.get_export_dir("bilibili")
 
     # 登录（复用缓存或扫码）
     bili, user_info = await ensure_logged_in(relogin=args.relogin)
 
     # 初始化 ASR 服务
     asr = await _build_asr_service(args)
-    fetcher = ContentFetcher(bili, asr)
+    fetcher = ContentFetcher(bili, asr, storage_manager=storage_manager)
 
     try:
         # 获取收藏夹列表

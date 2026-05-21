@@ -16,6 +16,19 @@ from loguru import logger
 from app.models import VideoContent, ContentSource
 from app.services.bilibili import BilibiliService
 from app.services.asr import ASRService
+from app.services.content_storage import ContentStorageManager
+from app.services.asr_temp_file_manager import ASRTempFileManager
+from app.services.content_summary import ContentSummaryService
+from app.services.text_postprocessor import TextPostProcessor
+from app.services.text_postprocessor_factory import create_text_postprocessor
+
+
+class AudioDownloadError(RuntimeError):
+    """音频下载失败，且不应继续产出兜底内容。"""
+
+
+class ASRProcessingError(RuntimeError):
+    """ASR 处理失败，且不应继续产出兜底内容。"""
 
 
 class ContentFetcher:
@@ -27,11 +40,35 @@ class ContentFetcher:
     2. 视频基本信息 (兜底)
     """
     
-    def __init__(self, bilibili_service: BilibiliService, asr_service: ASRService):
+    def __init__(
+        self,
+        bilibili_service: BilibiliService,
+        asr_service: ASRService,
+        text_postprocessor: Optional[TextPostProcessor] = None,
+        summary_service: Optional[ContentSummaryService] = None,
+        storage_manager: Optional[ContentStorageManager] = None,
+    ):
         self.bili = bilibili_service
         self.asr = asr_service
+        self.text_postprocessor = text_postprocessor or create_text_postprocessor()
+        self.summary_service = summary_service or ContentSummaryService()
+        self.storage_manager = storage_manager or ContentStorageManager()
+        self.temp_file_manager = ASRTempFileManager(
+            source="bilibili",
+            storage_manager=self.storage_manager,
+        )
+        if hasattr(self.asr, "temp_file_manager"):
+            self.asr.temp_file_manager.source = "bilibili"
+            self.asr.temp_file_manager.storage_manager = self.storage_manager
     
-    async def fetch_content(self, bvid: str, cid: int = None, title: str = None) -> VideoContent:
+    async def fetch_content(
+        self,
+        bvid: str,
+        cid: int = None,
+        title: str = None,
+        fail_on_audio_download_error: bool = False,
+        fail_on_asr_error: bool = False,
+    ) -> VideoContent:
         """
         获取视频内容，自动降级
         
@@ -66,14 +103,25 @@ class ContentFetcher:
         # Level 1: 跳过 AI 摘要，优先使用 ASR
         logger.info(f"[{bvid}] 已跳过 AI 摘要，优先使用 ASR")
 
-        asr_text = await self._try_asr(bvid, cid)
+        asr_text = await self._try_asr(
+            bvid,
+            cid,
+            title=title,
+            fail_on_audio_download_error=fail_on_audio_download_error,
+            fail_on_asr_error=fail_on_asr_error,
+        )
         if asr_text:
+            self._persist_text_artifact(title, "asr_raw.txt", asr_text)
+            asr_text = await self._postprocess_asr_text(bvid, asr_text)
+            self._persist_text_artifact(title, "asr_corrected.txt", asr_text)
+            summary_block = await self._summarize_content(bvid, asr_text)
             logger.info(f"[{bvid}] 使用 ASR 文本")
             return VideoContent(
                 bvid=bvid,
                 title=title,
                 content=asr_text,
-                source=ContentSource.ASR
+                source=ContentSource.ASR,
+                summary_block=summary_block,
             )
         
         # ASR 失败时，补齐基础信息（避免遗漏简介）
@@ -99,7 +147,14 @@ class ContentFetcher:
             source=ContentSource.BASIC_INFO
         )
 
-    async def _try_asr(self, bvid: str, cid: int) -> Optional[str]:
+    async def _try_asr(
+        self,
+        bvid: str,
+        cid: int,
+        title: Optional[str] = None,
+        fail_on_audio_download_error: bool = False,
+        fail_on_asr_error: bool = False,
+    ) -> Optional[str]:
         """尝试进行音频转写"""
         try:
             audio_url = await self.bili.get_audio_url(bvid, cid)
@@ -109,20 +164,64 @@ class ContentFetcher:
             status = await self._probe_audio_url(bvid, audio_url)
             if status is not None and status < 400:
                 logger.info(f"[{bvid}] 音频 URL 可达，使用 Transcription")
-                text = await self.asr.transcribe_url(audio_url)
+                await self._persist_audio_copy(bvid, audio_url, title=title or bvid)
+                text = await self.asr.transcribe_url(audio_url, title=title or bvid)
             else:
                 logger.info(f"[{bvid}] 音频 URL 不可达，使用 Recognition 兜底")
-                text = await self._try_asr_with_local_audio(bvid, cid, audio_url)
+                text = await self._try_asr_with_local_audio(
+                    bvid,
+                    cid,
+                    audio_url,
+                    title=title,
+                    fail_on_audio_download_error=fail_on_audio_download_error,
+                )
 
             if not text or len(text) < 50:
+                if fail_on_asr_error:
+                    raise ASRProcessingError(f"[{bvid}] ASR 失败或内容过少")
                 logger.info(f"[{bvid}] ASR 内容过少")
                 return None
             preview = text[:120].replace("\n", " ").strip()
             logger.info(f"[{bvid}] ASR 成功，长度={len(text)}，预览：{preview}")
             return text
+        except AudioDownloadError:
+            raise
+        except ASRProcessingError:
+            raise
         except Exception as e:
+            if fail_on_asr_error:
+                raise ASRProcessingError(f"[{bvid}] ASR 失败: {e}") from e
             logger.warning(f"[{bvid}] ASR 失败: {e}")
             return None
+
+    async def _postprocess_asr_text(self, bvid: str, text: str) -> str:
+        processor = getattr(self, "text_postprocessor", None)
+        raw_text = (text or "").strip()
+        if not processor or not raw_text:
+            return raw_text
+
+        try:
+            processed_text = await processor.postprocess(raw_text)
+        except Exception as e:
+            logger.warning(f"[{bvid}] ASR 文本后处理失败，回退原始文本: {e}")
+            return raw_text
+
+        normalized = (processed_text or "").strip()
+        if not normalized:
+            logger.warning(f"[{bvid}] ASR 文本后处理为空，回退原始文本")
+            return raw_text
+        return normalized
+
+    async def _summarize_content(self, bvid: str, text: str) -> str:
+        summary_service = getattr(self, "summary_service", None)
+        cleaned = (text or "").strip()
+        if not summary_service or not cleaned:
+            return ""
+        try:
+            return await summary_service.summarize(cleaned)
+        except Exception as e:
+            logger.warning(f"[{bvid}] 内容总结失败，跳过总结块: {e}")
+            return ""
 
     async def _probe_audio_url(self, bvid: str, audio_url: str) -> Optional[int]:
         """探测音频 URL 可达性（不带 Cookie，模拟 ASR 服务拉取）"""
@@ -156,11 +255,16 @@ class ContentFetcher:
         return status
 
     async def _try_asr_with_local_audio(
-        self, bvid: str, cid: int, audio_url: str
+        self,
+        bvid: str,
+        cid: int,
+        audio_url: str,
+        title: Optional[str] = None,
+        fail_on_audio_download_error: bool = False,
     ) -> Optional[str]:
         """本地下载后使用 Recognition 直传"""
-        tmp_dir = os.path.join("data", "asr_tmp")
-        os.makedirs(tmp_dir, exist_ok=True)
+        readable_title = title or bvid
+        yt_dlp_path = self.temp_file_manager.build_path(readable_title, ".mp3", prefix="audio")
 
         try:
             parsed = urlparse(audio_url)
@@ -168,27 +272,74 @@ class ContentFetcher:
         except Exception:
             ext = ".m4s"
 
-        filename = f"{bvid}_{cid}_{int(time.time())}{ext}"
-        file_path = os.path.join(tmp_dir, filename)
+        fallback_path = self.temp_file_manager.build_path(readable_title, ext, prefix="audio")
+        file_path = yt_dlp_path
 
-        ok = await self.bili.download_audio_to_file(audio_url, file_path)
-        if not ok:
-            logger.info(f"[{bvid}] 本地下载音频失败")
-            return None
+        yt_dlp_error = None
+        try:
+            await self.bili.download_bvid_audio_to_file(
+                bvid,
+                cid,
+                yt_dlp_path,
+                raise_on_error=True,
+            )
+        except Exception as e:
+            yt_dlp_error = str(e)
+            logger.info(f"[{bvid}] yt-dlp 页面下载失败，回退音频直链下载")
+            try:
+                await self.bili.download_audio_to_file(
+                    audio_url,
+                    fallback_path,
+                    raise_on_error=True,
+                )
+                file_path = fallback_path
+            except Exception as direct_error:
+                message = (
+                    f"[{bvid}] 音频下载失败；"
+                    f" yt-dlp={yt_dlp_error};"
+                    f" direct={direct_error}"
+                )
+                if fail_on_audio_download_error:
+                    raise AudioDownloadError(message) from direct_error
+                logger.warning(message)
+                return None
 
         if os.path.exists(file_path) and os.path.getsize(file_path) < 1024:
-            logger.info(f"[{bvid}] 本地音频文件过小，跳过上传")
-            try:
-                os.remove(file_path)
-            except Exception:
-                logger.debug(f"[{bvid}] 清理过小音频失败: {file_path}")
+            message = f"[{bvid}] 本地音频文件过小，跳过上传: {file_path}"
+            logger.info(message)
+            if fail_on_audio_download_error:
+                raise AudioDownloadError(message)
             return None
 
-        text = await self.asr.transcribe_local_file(file_path)
+        self.temp_file_manager.cleanup_if_needed()
+
+        text = await self.asr.transcribe_local_file(file_path, title=readable_title)
         if text:
             preview = text[:120].replace("\n", " ").strip()
             logger.info(f"[{bvid}] Recognition ASR 成功，长度={len(text)}，预览：{preview}")
         return text
+
+    async def _persist_audio_copy(self, bvid: str, audio_url: str, title: str) -> None:
+        try:
+            parsed = urlparse(audio_url)
+            ext = os.path.splitext(parsed.path)[1] or ".m4s"
+        except Exception:
+            ext = ".m4s"
+
+        file_path = self.storage_manager.build_work_file_path("bilibili", title, f"audio{ext}")
+        if file_path.exists():
+            return
+
+        try:
+            await self.bili.download_audio_to_file(audio_url, str(file_path), raise_on_error=True)
+            self.storage_manager.cleanup_workspace_if_needed()
+        except Exception as exc:
+            logger.info(f"[{bvid}] 额外保存音频副本失败，继续 ASR: {exc}")
+
+    def _persist_text_artifact(self, title: str, filename: str, text: str) -> None:
+        if not (text or "").strip():
+            return
+        self.storage_manager.write_work_text("bilibili", title, filename, text.strip())
 
     def _transcode_audio_to_wav(self, bvid: str, file_path: str) -> Optional[str]:
         """使用 ffmpeg 转码为 16k 单声道 wav，提高 ASR 兼容性"""

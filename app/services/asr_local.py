@@ -18,6 +18,8 @@ from typing import Optional
 import httpx
 from loguru import logger
 
+from app.services.asr_temp_file_manager import ASRTempFileManager
+
 
 class OllamaASRService:
     """
@@ -46,31 +48,29 @@ class OllamaASRService:
         self.model = model
         self.language = language
         self.timeout = timeout
+        self.temp_file_manager = ASRTempFileManager()
 
     # ==================== 公共接口 ====================
 
-    async def transcribe_url(self, audio_url: str) -> Optional[str]:
+    async def transcribe_url(self, audio_url: str, title: Optional[str] = None) -> Optional[str]:
         """
         下载音频 URL 后进行本地转写。
 
         Ollama Whisper 不支持直接传 URL，需先下载到本地再转写。
         """
-        tmp_path = None
-        try:
-            tmp_path = await self._download_audio(audio_url)
-            if not tmp_path:
-                return None
-            return await self.transcribe_local_file(tmp_path)
-        finally:
-            _remove_file(tmp_path)
+        tmp_path = await self._download_audio(audio_url, title=title)
+        if not tmp_path:
+            return None
+        return await self.transcribe_local_file(tmp_path, title=title)
 
-    async def transcribe_local_file(self, file_path: str) -> Optional[str]:
+    async def transcribe_local_file(self, file_path: str, title: Optional[str] = None) -> Optional[str]:
         """将本地音频文件转写为文本"""
-        return await asyncio.to_thread(self._transcribe_file_sync, file_path)
+        resolved_title = title or os.path.splitext(os.path.basename(file_path))[0]
+        return await asyncio.to_thread(self._transcribe_file_sync, file_path, resolved_title)
 
     # ==================== 内部实现 ====================
 
-    def _transcribe_file_sync(self, file_path: str) -> Optional[str]:
+    def _transcribe_file_sync(self, file_path: str, title: str) -> Optional[str]:
         """同步转写本地文件（在线程中运行）"""
         if not os.path.exists(file_path):
             logger.warning(f"[OllamaASR] 文件不存在: {file_path}")
@@ -79,13 +79,7 @@ class OllamaASRService:
         # 转码为 16kHz 单声道 WAV（Whisper 的最佳输入格式）
         wav_path = self._to_wav(file_path)
         transcribe_path = wav_path or file_path
-        cleanup_wav = wav_path and wav_path != file_path
-
-        try:
-            return self._call_ollama_transcribe(transcribe_path)
-        finally:
-            if cleanup_wav:
-                _remove_file(wav_path)
+        return self._call_ollama_transcribe(transcribe_path, title)
 
     def _to_wav(self, file_path: str) -> Optional[str]:
         """使用 ffmpeg 将音频转为 16kHz 单声道 WAV"""
@@ -118,14 +112,13 @@ class OllamaASRService:
                 return None
             if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1024:
                 logger.warning("[OllamaASR] ffmpeg 输出文件过小")
-                _remove_file(wav_path)
                 return None
             return wav_path
         except Exception as e:
             logger.warning(f"[OllamaASR] ffmpeg 转码异常: {e}")
             return None
 
-    def _call_ollama_transcribe(self, file_path: str) -> Optional[str]:
+    def _call_ollama_transcribe(self, file_path: str, title: str) -> Optional[str]:
         """调用 Ollama OpenAI 兼容的转写接口"""
         endpoint = f"{self.base_url}/v1/audio/transcriptions"
         file_size = os.path.getsize(file_path)
@@ -170,6 +163,7 @@ class OllamaASRService:
                 f"[OllamaASR] 转写完成: 耗时={elapsed:.1f}s, "
                 f"长度={len(text)}, 预览: {preview}"
             )
+            self.temp_file_manager.write_result(title, text)
             return text
 
         except httpx.ConnectError:
@@ -186,11 +180,13 @@ class OllamaASRService:
             logger.warning(f"[OllamaASR] 转写异常: {e}")
             return None
 
-    async def _download_audio(self, audio_url: str) -> Optional[str]:
+    async def _download_audio(self, audio_url: str, title: Optional[str] = None) -> Optional[str]:
         """下载音频 URL 到临时文件"""
-        tmp_dir = os.path.join("data", "asr_tmp")
-        os.makedirs(tmp_dir, exist_ok=True)
-        tmp_path = os.path.join(tmp_dir, f"ollama_{int(time.time())}.m4s")
+        try:
+            path_ext = os.path.splitext(httpx.URL(audio_url).path)[1] or ".m4s"
+        except Exception:
+            path_ext = ".m4s"
+        tmp_path = self.temp_file_manager.build_path(title or "ollama_audio", path_ext, prefix="audio")
 
         try:
             async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
@@ -206,12 +202,11 @@ class OllamaASRService:
                                 f.write(chunk)
             if os.path.getsize(tmp_path) < 1024:
                 logger.warning("[OllamaASR] 下载音频文件过小")
-                _remove_file(tmp_path)
                 return None
+            self.temp_file_manager.cleanup_if_needed()
             return tmp_path
         except Exception as e:
             logger.warning(f"[OllamaASR] 音频下载异常: {e}")
-            _remove_file(tmp_path)
             return None
 
     # ==================== 工具方法 ====================
@@ -235,12 +230,3 @@ class OllamaASRService:
             return self.model.split(":")[0] in model_names
         except Exception:
             return False
-
-
-def _remove_file(path: Optional[str]) -> None:
-    """安全删除文件"""
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except Exception as e:
-            logger.debug(f"[OllamaASR] 清理临时文件失败: {path} - {e}")

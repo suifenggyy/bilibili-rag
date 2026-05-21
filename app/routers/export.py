@@ -18,8 +18,11 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
 
+from app.config import settings
 from app.routers.auth import get_session
 from app.services.bilibili import BilibiliService
+from app.services.content_summary import append_summary_section
+from app.services.content_storage import ContentStorageManager
 from app.services.content_fetcher import ContentFetcher
 
 router = APIRouter(prefix="/export", tags=["导出"])
@@ -27,16 +30,12 @@ router = APIRouter(prefix="/export", tags=["导出"])
 # 导出任务状态（内存存储，重启后清空）
 export_tasks: dict[str, dict] = {}
 
-# 导出文件存储目录
-EXPORT_DIR = os.path.join("data", "exports")
-
-
 # ==================== 请求 / 响应模型 ====================
 
 class ExportRequest(BaseModel):
     """导出请求"""
     folder_ids: List[int]
-    asr_backend: str = "auto"          # auto | dashscope | ollama
+    asr_backend: str = "auto"          # auto | dashscope | ollama | whisper
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "whisper"
     ollama_language: str = "zh"
@@ -72,7 +71,13 @@ def _format_duration(seconds: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def _build_markdown(video: dict, content: str, source: str, folder_title: str) -> str:
+def _build_markdown(
+    video: dict,
+    content: str,
+    source: str,
+    folder_title: str,
+    summary_block: str = "",
+) -> str:
     title = video.get("title") or "未知标题"
     bvid = video.get("bvid") or ""
     owner = (video.get("upper") or {}).get("name") or video.get("owner_name") or "未知UP主"
@@ -100,6 +105,7 @@ def _build_markdown(video: dict, content: str, source: str, folder_title: str) -
         lines += ["", f"![封面]({cover})"]
     if intro:
         lines += ["", "## 视频简介", "", intro]
+    append_summary_section(lines, summary_block)
     lines += ["", "---", "", "## 转写内容", ""]
     lines.append(content.strip() if content and content.strip() else "_（未获取到有效内容）_")
     lines += ["", "---", f"", f"_导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"]
@@ -108,21 +114,13 @@ def _build_markdown(video: dict, content: str, source: str, folder_title: str) -
 
 def _build_asr_service(req: ExportRequest):
     """根据请求参数构建 ASR 服务实例"""
-    from app.config import settings
+    from app.services.asr_factory import create_asr_service
 
-    backend = req.asr_backend
-    if backend == "auto":
-        backend = "dashscope" if settings.openai_api_key else "ollama"
-
-    if backend == "dashscope":
-        from app.services.asr import ASRService
-        return ASRService()
-
-    from app.services.asr_local import OllamaASRService
-    return OllamaASRService(
-        base_url=req.ollama_url,
-        model=req.ollama_model,
-        language=req.ollama_language,
+    return create_asr_service(
+        backend=req.asr_backend,
+        ollama_base_url=req.ollama_url,
+        ollama_model=req.ollama_model,
+        ollama_language=req.ollama_language,
     )
 
 
@@ -131,8 +129,6 @@ def _build_asr_service(req: ExportRequest):
 async def _run_export(job_id: str, req: ExportRequest, cookies: dict):
     """后台执行导出任务"""
     task = export_tasks[job_id]
-    job_dir = os.path.join(EXPORT_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
 
     bili = BilibiliService(
         sessdata=cookies.get("SESSDATA"),
@@ -140,7 +136,8 @@ async def _run_export(job_id: str, req: ExportRequest, cookies: dict):
         dedeuserid=cookies.get("DedeUserID"),
     )
     asr = _build_asr_service(req)
-    fetcher = ContentFetcher(bili, asr)
+    storage_manager = ContentStorageManager()
+    fetcher = ContentFetcher(bili, asr, storage_manager=storage_manager)
 
     try:
         task["status"] = "running"
@@ -188,14 +185,11 @@ async def _run_export(job_id: str, req: ExportRequest, cookies: dict):
             task["processed_videos"] = idx
             task["progress"] = int(idx / total * 95)
 
-            # 目标文件路径
-            folder_dir = os.path.join(job_dir, _safe_filename(folder_title))
-            os.makedirs(folder_dir, exist_ok=True)
-            safe_title = _safe_filename(title)
-            md_path = os.path.join(folder_dir, f"{safe_title}_{bvid}.md")
+            md_path = storage_manager.build_markdown_path("bilibili", title, bvid)
 
-            if os.path.exists(md_path):
+            if md_path.exists():
                 file_count += 1
+                task["output_files"].append(str(md_path))
                 continue
 
             try:
@@ -205,10 +199,17 @@ async def _run_export(job_id: str, req: ExportRequest, cookies: dict):
                     if hasattr(video_content.source, "value")
                     else str(video_content.source)
                 )
-                md_content = _build_markdown(video, video_content.content, source, folder_title)
+                md_content = _build_markdown(
+                    video,
+                    video_content.content,
+                    source,
+                    folder_title,
+                    getattr(video_content, "summary_block", ""),
+                )
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(md_content)
                 file_count += 1
+                task["output_files"].append(str(md_path))
                 logger.info(f"[Export] [{idx+1}/{total}] ✅ {title[:40]} ({source})")
             except Exception as e:
                 logger.error(f"[Export] [{idx+1}/{total}] ❌ {bvid}: {e}")
@@ -255,10 +256,9 @@ async def start_export(
         raise HTTPException(status_code=400, detail="请至少选择一个收藏夹")
 
     # 检查 Ollama 可用性（仅在使用 ollama 时）
-    backend = req.asr_backend
-    if backend == "auto":
-        from app.config import settings
-        backend = "dashscope" if settings.openai_api_key else "ollama"
+    from app.services.asr_factory import resolve_asr_backend
+
+    backend = resolve_asr_backend(req.asr_backend)
     if backend == "ollama":
         from app.services.asr_local import OllamaASRService
         asr_check = OllamaASRService(base_url=req.ollama_url, model=req.ollama_model)
@@ -285,6 +285,7 @@ async def start_export(
         "current_video": "",
         "message": "任务已创建，等待启动...",
         "file_count": 0,
+        "output_files": [],
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
     }
@@ -317,19 +318,17 @@ async def download_export(job_id: str):
     if task["status"] != "completed":
         raise HTTPException(status_code=400, detail="任务尚未完成")
 
-    job_dir = os.path.join(EXPORT_DIR, job_id)
-    if not os.path.exists(job_dir):
+    output_files = [path for path in task.get("output_files", []) if os.path.exists(path)]
+    if not output_files:
         raise HTTPException(status_code=404, detail="导出文件不存在")
 
     # 打包为 ZIP 并流式返回
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(job_dir):
-            for fname in files:
-                if fname.endswith(".md"):
-                    abs_path = os.path.join(root, fname)
-                    arc_name = os.path.relpath(abs_path, job_dir)
-                    zf.write(abs_path, arc_name)
+        export_root = os.path.expanduser(settings.collection_output_dir)
+        for abs_path in output_files:
+            arc_name = os.path.relpath(abs_path, export_root)
+            zf.write(abs_path, arc_name)
     zip_buffer.seek(0)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

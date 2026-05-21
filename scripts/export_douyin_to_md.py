@@ -29,7 +29,7 @@
     python scripts/export_douyin_to_md.py --cookie "ttwid=xxx; sessionid=xxx; ..."
 
     # 指定输出目录
-    python scripts/export_douyin_to_md.py --output-dir ./douyin_output
+    python scripts/export_douyin_to_md.py --output-dir /path/to/collection
 
     # 导出所有收藏视频
     python scripts/export_douyin_to_md.py --all
@@ -58,12 +58,18 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
 from loguru import logger
+from app.services.content_summary import append_summary_section
 
 load_dotenv(ROOT_DIR / ".env")
 
 
 def _get_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
+
+
+DEFAULT_COLLECTION_OUTPUT_DIR = (
+    "/Users/gongyongyue/FangcloudV2/personal_space.localized/同步空间/个人资料/Obsidian/jarvis/collection"
+)
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
@@ -116,6 +122,7 @@ def _build_markdown(vc, asr_text: str, source: str) -> str:
     if vc.cover_url:
         lines += ["", f"![封面]({vc.cover_url})"]
 
+    append_summary_section(lines, getattr(vc, "summary_block", ""))
     lines += ["", "---", "", "## 转写内容", ""]
 
     if asr_text and asr_text.strip():
@@ -138,11 +145,10 @@ async def _build_asr_service(args):
     backend = args.asr_backend
 
     if backend == "auto":
-        if args.api_key:
-            backend = "dashscope"
-        else:
-            backend = "ollama"
-            print("⚠️  未配置 DASHSCOPE_API_KEY，自动切换到 Ollama 本地 ASR")
+        backend = _get_env("ASR_BACKEND", "whisper").strip().lower() or "whisper"
+        if backend == "auto":
+            backend = "whisper"
+        print(f"ℹ️  自动模式使用 .env 中的 ASR_BACKEND={backend}")
 
     if backend == "dashscope":
         if not args.api_key:
@@ -151,6 +157,17 @@ async def _build_asr_service(args):
         from app.services.asr import ASRService
         print(f"🔊 ASR 后端：DashScope（{_get_env('ASR_MODEL', 'paraformer-v2')}）")
         return ASRService(api_key=args.api_key)
+
+    if backend == "whisper":
+        from app.services.asr_whisper import OpenAIWhisperASRService
+
+        asr = OpenAIWhisperASRService(
+            model=_get_env("WHISPER_MODEL", "turbo"),
+            language=_get_env("WHISPER_LANGUAGE", "zh"),
+            timeout=int(_get_env("ASR_TIMEOUT", "600")),
+        )
+        print(f"🔊 ASR 后端：openai-whisper 本地（模型：{asr.model_name}）")
+        return asr
 
     # Ollama 后端
     from app.services.asr_local import OllamaASRService
@@ -279,8 +296,8 @@ async def main():
     )
     parser.add_argument(
         "--output-dir",
-        default=_get_env("DOUYIN_OUTPUT_DIR", "douyin_output"),
-        help="输出目录（默认: ./douyin_output）",
+        default=_get_env("COLLECTION_OUTPUT_DIR", DEFAULT_COLLECTION_OUTPUT_DIR),
+        help="输出目录（默认读取 COLLECTION_OUTPUT_DIR）",
     )
     parser.add_argument(
         "--all",
@@ -296,9 +313,9 @@ async def main():
     # ASR 后端
     parser.add_argument(
         "--asr-backend",
-        default="auto",
-        choices=["auto", "dashscope", "ollama"],
-        help="ASR 转写后端（auto=有 Key 用 DashScope，否则用 Ollama）",
+        default=_get_env("ASR_BACKEND", "whisper"),
+        choices=["auto", "dashscope", "ollama", "whisper"],
+        help="ASR 转写后端（默认读取 ASR_BACKEND；auto=按 .env 中 ASR_BACKEND 解析）",
     )
     parser.add_argument(
         "--api-key",
@@ -334,13 +351,13 @@ async def main():
         )
         sys.exit(1)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     # ── 初始化服务 ────────────────────────────────────────────────────────
     from app.services.douyin import DouyinService
+    from app.services.content_storage import ContentStorageManager
     from app.services.douyin_fetcher import DouyinContentFetcher
 
+    storage_manager = ContentStorageManager(export_root=args.output_dir)
+    output_dir = storage_manager.get_export_dir("douyin")
     douyin = DouyinService(cookie=args.cookie, evil0ctal_url=args.evil0ctal_url)
 
     print(f"\n🔗 检查 Evil0ctal API 服务（{args.evil0ctal_url}）...", end="", flush=True)
@@ -349,9 +366,8 @@ async def main():
         print(
             f"\n❌ 无法连接到 Evil0ctal API 服务（{args.evil0ctal_url}）\n\n"
             "   请先按以下步骤部署：\n"
-            "   git clone https://github.com/Evil0ctal/Douyin_TikTok_Download_API\n"
-            "   cd Douyin_TikTok_Download_API && pip install -r requirements.txt\n"
-            "   python main.py"
+            "docker pull evil0ctal/douyin_tiktok_download_api:latest\n"
+            "docker run -d --name douyin_tiktok_api -p 2333:80 evil0ctal/douyin_tiktok_download_api"
         )
         await douyin.close()
         sys.exit(1)
@@ -369,7 +385,7 @@ async def main():
         print(" ✅")
 
     asr = await _build_asr_service(args)
-    fetcher = DouyinContentFetcher(asr_service=asr)
+    fetcher = DouyinContentFetcher(asr_service=asr, storage_manager=storage_manager)
 
     try:
         # ── 获取收藏夹视频列表 ───────────────────────────────────────────

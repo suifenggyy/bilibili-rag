@@ -292,7 +292,7 @@ export default function InstapaperExportPanel() {
           </div>
 
           <p className="ollama-hint" style={{ marginBottom: 12 }}>
-            正文通过 <strong>trafilatura</strong> 从原始 URL 提取，付费墙内容将降级保存标题 + 链接。
+            正文会先用 <strong>requests + trafilatura</strong> 提取，失败后回退到 <strong>Playwright</strong> 渲染抓取；仍失败时只保存标题和链接。
           </p>
 
           {error && (

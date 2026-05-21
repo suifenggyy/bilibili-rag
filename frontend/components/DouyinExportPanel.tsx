@@ -7,7 +7,7 @@ import {
   douyinExportApi,
 } from "@/lib/api";
 
-type ASRBackend = "auto" | "dashscope" | "ollama";
+type ASRBackend = "auto" | "dashscope" | "ollama" | "whisper";
 
 export default function DouyinExportPanel() {
   // Cookie & 连接配置
@@ -182,7 +182,7 @@ export default function DouyinExportPanel() {
           </div>
 
           <div className="asr-options">
-            {(["auto", "dashscope", "ollama"] as ASRBackend[]).map((b) => (
+            {(["auto", "dashscope", "ollama", "whisper"] as ASRBackend[]).map((b) => (
               <label key={b} className={`asr-option ${asrBackend === b ? "asr-option-active" : ""}`}>
                 <input
                   type="radio"
@@ -194,14 +194,22 @@ export default function DouyinExportPanel() {
                 />
                 <div className="asr-option-content">
                   <span className="asr-option-name">
-                    {b === "auto" ? "自动选择" : b === "dashscope" ? "DashScope 云端" : "Ollama 本地"}
+                    {b === "auto"
+                      ? "自动选择"
+                      : b === "dashscope"
+                      ? "DashScope 云端"
+                      : b === "ollama"
+                      ? "Ollama 本地"
+                      : "openai-whisper 本地"}
                   </span>
                   <span className="asr-option-desc">
                     {b === "auto"
-                      ? "有 API Key 则云端，否则本地"
+                      ? "按 .env 中 ASR_BACKEND 选择"
                       : b === "dashscope"
                       ? "paraformer-v2，中文效果最佳"
-                      : "Whisper，完全免费，数据不出本机"}
+                      : b === "ollama"
+                      ? "Whisper，需本地 Ollama 服务"
+                      : "Whisper，直接在本机运行，无需额外服务"}
                   </span>
                 </div>
               </label>

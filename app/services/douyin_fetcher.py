@@ -2,20 +2,24 @@
 抖音内容获取器
 
 下载抖音视频音频并使用 ASR 进行语音转写，输出转写文本。
-支持 DashScope 和 Ollama 两种 ASR 后端（与 B站模块共用）。
+支持 DashScope、Ollama 和 openai-whisper 三种 ASR 后端（与 B站模块共用）。
 """
 
 import asyncio
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
 from loguru import logger
+
+from app.services.content_storage import ContentStorageManager
+from app.services.content_summary import ContentSummaryService
+from app.services.text_postprocessor import TextPostProcessor
+from app.services.text_postprocessor_factory import create_text_postprocessor
 
 
 @dataclass
@@ -31,6 +35,7 @@ class DouyinVideoContent:
     share_url: str = ""
     content: str = ""
     content_source: str = "basic_info"  # "asr" | "basic_info"
+    summary_block: str = ""
 
 
 class DouyinContentFetcher:
@@ -43,7 +48,7 @@ class DouyinContentFetcher:
         3. 调用 ASR 服务进行语音转写
         4. 失败时降级返回仅含基本信息的内容
 
-    兼容 ASRService（DashScope）和 OllamaASRService 两种后端。
+    兼容 DashScope、Ollama 和 openai-whisper 三种后端。
     """
 
     # 单个视频下载超时（秒）
@@ -51,15 +56,27 @@ class DouyinContentFetcher:
     # 音频下载最大文件大小：500MB
     MAX_AUDIO_SIZE = 500 * 1024 * 1024
 
-    def __init__(self, asr_service, tmp_dir: str = "data/douyin_tmp"):
+    def __init__(
+        self,
+        asr_service,
+        tmp_dir: str = "data/douyin_tmp",
+        text_postprocessor: Optional[TextPostProcessor] = None,
+        summary_service: Optional[ContentSummaryService] = None,
+        storage_manager: Optional[ContentStorageManager] = None,
+    ):
         """
         Args:
-            asr_service:  ASR 服务实例（ASRService 或 OllamaASRService）
+            asr_service:  ASR 服务实例（需实现 transcribe_url / transcribe_local_file）
             tmp_dir:      临时文件目录
         """
         self.asr = asr_service
         self.tmp_dir = tmp_dir
-        os.makedirs(tmp_dir, exist_ok=True)
+        self.text_postprocessor = text_postprocessor or create_text_postprocessor()
+        self.summary_service = summary_service or ContentSummaryService()
+        self.storage_manager = storage_manager or ContentStorageManager()
+        if hasattr(self.asr, "temp_file_manager"):
+            self.asr.temp_file_manager.source = "douyin"
+            self.asr.temp_file_manager.storage_manager = self.storage_manager
 
     async def fetch_content(self, video_info: dict) -> DouyinVideoContent:
         """
@@ -94,23 +111,26 @@ class DouyinContentFetcher:
 
         # 尝试每个播放 URL，直到成功
         for idx, url in enumerate(play_urls[:3]):
-            tmp_video = os.path.join(self.tmp_dir, f"{aweme_id}_{int(time.time())}.mp4")
+            tmp_video = str(self.storage_manager.build_work_file_path("douyin", title, "video.mp4"))
             try:
                 logger.debug(f"[DouyinFetcher] 下载视频 [{idx+1}/{min(len(play_urls),3)}]: {url[:80]}")
                 downloaded = await self._download_video(url, tmp_video)
                 if not downloaded:
                     continue
 
-                transcript = await self._extract_and_transcribe(tmp_video, aweme_id)
+                self.storage_manager.cleanup_workspace_if_needed()
+
+                transcript = await self._extract_and_transcribe(tmp_video, aweme_id, title)
                 if transcript:
-                    base.content = transcript
+                    self.storage_manager.write_work_text("douyin", title, "asr_raw.txt", transcript.strip())
+                    base.content = await self._postprocess_asr_text(aweme_id, transcript)
+                    self.storage_manager.write_work_text("douyin", title, "asr_corrected.txt", base.content.strip())
                     base.content_source = "asr"
+                    base.summary_block = await self._summarize_content(aweme_id, base.content)
                     return base
 
             except Exception as e:
                 logger.warning(f"[DouyinFetcher] 处理失败 [{aweme_id}] url={idx}: {e}")
-            finally:
-                _remove_file(tmp_video)
 
         logger.warning(f"[DouyinFetcher] ASR 失败，降级为基本信息: {aweme_id}")
         return base
@@ -164,19 +184,43 @@ class DouyinContentFetcher:
             logger.warning(f"[DouyinFetcher] 下载异常: {e}")
             return False
 
-    async def _extract_and_transcribe(self, video_path: str, aweme_id: str) -> Optional[str]:
+    async def _extract_and_transcribe(self, video_path: str, aweme_id: str, title: str) -> Optional[str]:
         """提取音频 → ASR 转写"""
-        wav_path = os.path.join(self.tmp_dir, f"{aweme_id}_{int(time.time())}_audio.wav")
+        wav_path = str(self.storage_manager.build_work_file_path("douyin", title, "audio.wav"))
+        converted = await asyncio.to_thread(self._to_wav, video_path, wav_path)
+        if not converted:
+            return await self.asr.transcribe_local_file(video_path, title=title or aweme_id)
+        self.storage_manager.cleanup_workspace_if_needed()
+        return await self.asr.transcribe_local_file(wav_path, title=title or aweme_id)
+
+    async def _postprocess_asr_text(self, aweme_id: str, text: str) -> str:
+        processor = getattr(self, "text_postprocessor", None)
+        raw_text = (text or "").strip()
+        if not processor or not raw_text:
+            return raw_text
+
         try:
-            converted = await asyncio.to_thread(self._to_wav, video_path, wav_path)
-            if not converted:
-                # 直接尝试原始文件
-                transcript = await self.asr.transcribe_local_file(video_path)
-            else:
-                transcript = await self.asr.transcribe_local_file(wav_path)
-            return transcript
-        finally:
-            _remove_file(wav_path)
+            processed_text = await processor.postprocess(raw_text)
+        except Exception as e:
+            logger.warning(f"[DouyinFetcher] 文本后处理失败，回退原始文本 [{aweme_id}]: {e}")
+            return raw_text
+
+        normalized = (processed_text or "").strip()
+        if not normalized:
+            logger.warning(f"[DouyinFetcher] 文本后处理为空，回退原始文本 [{aweme_id}]")
+            return raw_text
+        return normalized
+
+    async def _summarize_content(self, aweme_id: str, text: str) -> str:
+        summary_service = getattr(self, "summary_service", None)
+        cleaned = (text or "").strip()
+        if not summary_service or not cleaned:
+            return ""
+        try:
+            return await summary_service.summarize(cleaned)
+        except Exception as e:
+            logger.warning(f"[DouyinFetcher] 内容总结失败，跳过总结块 [{aweme_id}]: {e}")
+            return ""
 
     def _to_wav(self, src: str, dst: str) -> bool:
         """使用 ffmpeg 将视频转为 16kHz 单声道 WAV"""

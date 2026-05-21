@@ -133,6 +133,7 @@ class VideoContent(BaseModel):
     content: str
     source: ContentSource
     outline: Optional[list] = None
+    summary_block: Optional[str] = None
 
 
 class QRCodeResponse(BaseModel):

@@ -3,11 +3,16 @@ Bilibili RAG 知识库系统
 
 B站 API 服务模块
 """
+import asyncio
+import base64
+import io
+import os
+import tempfile
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+
 import httpx
 import qrcode
-import io
-import base64
-from typing import Optional, Dict, Any, List
 from loguru import logger
 from app.services.wbi import wbi_signer
 
@@ -497,6 +502,137 @@ class BilibiliService:
 
         return None
 
+    async def download_bvid_audio_to_file(
+        self,
+        bvid: str,
+        cid: int,
+        file_path: str,
+        raise_on_error: bool = False,
+    ) -> bool:
+        """
+        使用 yt-dlp 从 B站页面下载音频到本地文件。
+
+        优先使用页面 URL，规避临时音频直链失效或外部不可达的问题。
+        """
+        video_url = await self._build_video_url(bvid, cid)
+        if not video_url:
+            message = f"未能定位对应分P，跳过 yt-dlp 页面下载 [{bvid}] cid={cid}"
+            logger.info(message)
+            if raise_on_error:
+                raise RuntimeError(message)
+            return False
+        return await asyncio.to_thread(
+            self._download_audio_with_yt_dlp_sync,
+            video_url,
+            file_path,
+            raise_on_error,
+        )
+
+    async def _build_video_url(self, bvid: str, cid: int) -> Optional[str]:
+        video_url = f"https://www.bilibili.com/video/{bvid}/"
+
+        try:
+            video_info = await self.get_video_info(bvid)
+        except Exception as e:
+            logger.debug(f"构建视频页面 URL 时获取视频信息失败 [{bvid}]: {e}")
+            return None
+
+        if video_info.get("cid") == cid:
+            return video_url
+
+        pages = video_info.get("pages") or []
+        for index, page in enumerate(pages, start=1):
+            if page.get("cid") == cid:
+                return f"{video_url}?p={index}"
+
+        return None
+
+    def _build_yt_dlp_cookiefile(self) -> Optional[str]:
+        cookies = self._get_cookies()
+        if not cookies:
+            return None
+
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+        try:
+            tmp.write("# Netscape HTTP Cookie File\n")
+            for name, value in cookies.items():
+                if not value:
+                    continue
+                tmp.write(f".bilibili.com\tTRUE\t/\tTRUE\t0\t{name}\t{value}\n")
+        finally:
+            tmp.close()
+
+        return tmp.name
+
+    def _download_audio_with_yt_dlp_sync(
+        self,
+        video_url: str,
+        file_path: str,
+        raise_on_error: bool = False,
+    ) -> bool:
+        try:
+            import yt_dlp
+        except ImportError:
+            message = "未安装 yt-dlp，无法使用页面级音频下载"
+            logger.warning(message)
+            if raise_on_error:
+                raise RuntimeError(message)
+            return False
+
+        target_path = Path(file_path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        headers = dict(self.HEADERS)
+        cookiefile = self._build_yt_dlp_cookiefile()
+        version = getattr(getattr(yt_dlp, "version", None), "__version__", "unknown")
+
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(target_path.with_suffix(".%(ext)s")),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "overwrites": True,
+            "http_headers": headers,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": target_path.suffix.lstrip(".") or "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+        if cookiefile:
+            ydl_opts["cookiefile"] = cookiefile
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+        except Exception as e:
+            message = f"yt-dlp({version}) 下载音频失败 [{video_url}]: {e}"
+            logger.warning(message)
+            if raise_on_error:
+                raise RuntimeError(message) from e
+            return False
+        finally:
+            if cookiefile and os.path.exists(cookiefile):
+                os.remove(cookiefile)
+
+        if not target_path.exists() or target_path.stat().st_size == 0:
+            message = f"yt-dlp({version}) 下载结果不存在或为空: {target_path}"
+            logger.warning(message)
+            if raise_on_error:
+                raise RuntimeError(message)
+            return False
+
+        logger.info(
+            f"yt-dlp({version}) 下载音频成功: file={target_path.name}, "
+            f"path={target_path}, size={target_path.stat().st_size}"
+        )
+
+        return True
+
     async def download_subtitle(self, subtitle_url: str) -> str:
         """
         下载字幕文件
@@ -523,7 +659,12 @@ class BilibiliService:
         
         return "\n".join(texts)
 
-    async def download_audio_to_file(self, audio_url: str, file_path: str) -> bool:
+    async def download_audio_to_file(
+        self,
+        audio_url: str,
+        file_path: str,
+        raise_on_error: bool = False,
+    ) -> bool:
         """
         下载音频流到本地文件（带 Cookie 与 Referer）
         
@@ -535,6 +676,8 @@ class BilibiliService:
             是否下载成功
         """
         if not audio_url:
+            if raise_on_error:
+                raise RuntimeError("音频 URL 为空")
             return False
 
         headers = dict(self.HEADERS)
@@ -545,9 +688,10 @@ class BilibiliService:
                 "GET", audio_url, headers=headers, cookies=cookies
             ) as resp:
                 if resp.status_code not in (200, 206):
-                    logger.warning(
-                        f"下载音频失败: status_code={resp.status_code} url={audio_url}"
-                    )
+                    message = f"下载音频失败: status_code={resp.status_code} url={audio_url}"
+                    logger.warning(message)
+                    if raise_on_error:
+                        raise RuntimeError(message)
                     return False
                 with open(file_path, "wb") as f:
                     async for chunk in resp.aiter_bytes():
@@ -556,5 +700,8 @@ class BilibiliService:
                         f.write(chunk)
             return True
         except Exception as e:
-            logger.warning(f"下载音频异常: {e}")
+            message = f"下载音频异常: {e}"
+            logger.warning(message)
+            if raise_on_error:
+                raise RuntimeError(message) from e
             return False

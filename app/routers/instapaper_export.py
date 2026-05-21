@@ -24,10 +24,12 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from app.config import settings
+from app.services.content_storage import ContentStorageManager
+
 router = APIRouter(prefix="/instapaper-export", tags=["Instapaper导出"])
 
 instapaper_export_tasks: dict[str, dict] = {}
-INSTAPAPER_EXPORT_DIR = os.path.join("data", "instapaper_exports")
 
 # 内置文件夹（Instapaper 固定）
 BUILTIN_FOLDERS = [
@@ -76,14 +78,14 @@ def _safe_filename(name: str, max_len: int = 80) -> str:
 
 async def _run_instapaper_export(job_id: str, req: InstapaperExportRequest):
     task = instapaper_export_tasks[job_id]
-    job_dir = os.path.join(INSTAPAPER_EXPORT_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
+    task.setdefault("output_files", [])
 
     from app.services.instapaper import InstapaperService
     from app.services.article_fetcher import ArticleFetcher
 
     svc = InstapaperService(req.consumer_key, req.consumer_secret)
-    fetcher = ArticleFetcher()
+    storage_manager = ContentStorageManager()
+    fetcher = ArticleFetcher(storage_manager=storage_manager)
 
     try:
         task["status"] = "running"
@@ -141,15 +143,11 @@ async def _run_instapaper_export(job_id: str, req: InstapaperExportRequest):
             task["processed_articles"] = idx
             task["progress"] = int(idx / total * 95)
 
-            # 按文件夹分子目录
-            folder_dir = os.path.join(job_dir, _safe_filename(folder_title))
-            os.makedirs(folder_dir, exist_ok=True)
+            md_path = storage_manager.build_markdown_path("instapaper", title, bm_id)
 
-            safe_title = _safe_filename(title)
-            md_path = os.path.join(folder_dir, f"{safe_title}_{bm_id}.md")
-
-            if os.path.exists(md_path):
+            if md_path.exists():
                 file_count += 1
+                task["output_files"].append(str(md_path))
                 task["file_count"] = file_count
                 continue
 
@@ -159,6 +157,7 @@ async def _run_instapaper_export(job_id: str, req: InstapaperExportRequest):
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(md_text)
                 file_count += 1
+                task["output_files"].append(str(md_path))
                 logger.info(
                     f"[InstapaperExport] [{idx+1}/{total}] ✅ "
                     f"{title[:40]} ({content['source']})"
@@ -230,6 +229,7 @@ async def start_instapaper_export(
         "current_article": "",
         "message": "任务已创建，等待启动...",
         "file_count": 0,
+        "output_files": [],
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
     }
@@ -258,17 +258,15 @@ async def download_instapaper_export(job_id: str):
     if task["status"] != "completed":
         raise HTTPException(status_code=400, detail="任务尚未完成")
 
-    job_dir = os.path.join(INSTAPAPER_EXPORT_DIR, job_id)
-    if not os.path.exists(job_dir):
+    output_files = [path for path in task.get("output_files", []) if os.path.exists(path)]
+    if not output_files:
         raise HTTPException(status_code=404, detail="导出文件不存在")
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(job_dir):
-            for fname in files:
-                if fname.endswith(".md"):
-                    abs_path = os.path.join(root, fname)
-                    zf.write(abs_path, os.path.relpath(abs_path, job_dir))
+        export_root = os.path.expanduser(settings.collection_output_dir)
+        for abs_path in output_files:
+            zf.write(abs_path, os.path.relpath(abs_path, export_root))
     zip_buffer.seek(0)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

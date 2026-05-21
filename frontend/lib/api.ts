@@ -163,7 +163,7 @@ export interface ChatResponse {
 
 export interface ExportRequest {
     folder_ids: number[];
-    asr_backend: "auto" | "dashscope" | "ollama";
+    asr_backend: "auto" | "dashscope" | "ollama" | "whisper";
     ollama_url?: string;
     ollama_model?: string;
     ollama_language?: string;
@@ -347,7 +347,7 @@ export interface DouyinExportRequest {
     cookie: string;
     evil0ctal_url?: string;
     limit?: number;
-    asr_backend: "auto" | "dashscope" | "ollama";
+    asr_backend: "auto" | "dashscope" | "ollama" | "whisper";
     ollama_url?: string;
     ollama_model?: string;
     ollama_language?: string;

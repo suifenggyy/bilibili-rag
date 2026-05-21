@@ -1,7 +1,8 @@
 """
 Instapaper 书签 → Markdown 导出工具
 
-从 Instapaper 获取收藏书签，提取文章正文（trafilatura），保存为 Markdown 文件。
+从 Instapaper 获取收藏书签，优先用 requests + trafilatura 提取正文，
+失败时回退到 Playwright 渲染后再提取，保存为 Markdown 文件。
 免费账户可用，无需 Instapaper Premium 订阅。
 
 【前提条件】
@@ -10,7 +11,8 @@ Instapaper 书签 → Markdown 导出工具
    填写 Application Name 和说明，通常 1-3 天审核通过
 
 2. 安装依赖：
-   pip install trafilatura pyinstapaper
+   pip install trafilatura playwright
+   playwright install chromium
 
 【文件夹说明】
   unread   稍后阅读（默认收件箱）
@@ -69,6 +71,11 @@ BUILTIN_FOLDERS = {
 
 def _get_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
+
+
+DEFAULT_COLLECTION_OUTPUT_DIR = (
+    "/Users/gongyongyue/FangcloudV2/personal_space.localized/同步空间/个人资料/Obsidian/jarvis/collection"
+)
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
@@ -189,9 +196,7 @@ async def export_folder(
         print("   ⚠️  文件夹为空，跳过")
         return 0, 0
 
-    folder_dir = output_dir / _safe_filename(folder_title)
-    folder_dir.mkdir(parents=True, exist_ok=True)
-    print(f"   输出目录：{folder_dir}")
+    print(f"   输出目录：{output_dir}")
 
     success, failed = 0, 0
 
@@ -201,7 +206,7 @@ async def export_folder(
         url = bookmark.get("url", "")
 
         safe_title = _safe_filename(title)
-        md_path = folder_dir / f"{safe_title}_{bm_id}.md"
+        md_path = output_dir / f"{safe_title}_{bm_id}.md"
 
         if md_path.exists():
             print(f"   [{i:3d}/{total}] ⏭️  已存在，跳过：{title[:50]}")
@@ -296,8 +301,8 @@ async def main():
     )
     parser.add_argument(
         "--output-dir",
-        default=_get_env("INSTAPAPER_OUTPUT_DIR", "instapaper_output"),
-        help="输出目录（默认: ./instapaper_output）",
+        default=_get_env("COLLECTION_OUTPUT_DIR", DEFAULT_COLLECTION_OUTPUT_DIR),
+        help="输出目录（默认读取 COLLECTION_OUTPUT_DIR）",
     )
     args = parser.parse_args()
 
@@ -319,10 +324,11 @@ async def main():
         )
         sys.exit(1)
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    from app.services.content_storage import ContentStorageManager
     from app.services.article_fetcher import ArticleFetcher
+
+    storage_manager = ContentStorageManager(export_root=args.output_dir)
+    output_dir = storage_manager.get_export_dir("instapaper")
 
     # ── 登录 ──────────────────────────────────────────────────────────
     svc = await ensure_logged_in(
@@ -338,7 +344,7 @@ async def main():
         sys.exit(0)
 
     # ── 初始化提取器 ──────────────────────────────────────────────────
-    fetcher = ArticleFetcher()
+    fetcher = ArticleFetcher(storage_manager=storage_manager)
     if not fetcher._trafilatura_available:
         print("⚠️  trafilatura 未安装，正文将无法提取，仅保存标题和 URL")
         print("   安装命令：pip install trafilatura")

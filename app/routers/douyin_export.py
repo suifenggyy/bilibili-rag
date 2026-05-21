@@ -25,13 +25,14 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from app.config import settings
+from app.services.content_summary import append_summary_section
+from app.services.content_storage import ContentStorageManager
+
 router = APIRouter(prefix="/douyin-export", tags=["抖音导出"])
 
 # 任务状态（内存存储，重启后清空）
 douyin_export_tasks: dict[str, dict] = {}
-
-DOUYIN_EXPORT_DIR = os.path.join("data", "douyin_exports")
-
 
 # ==================== 请求 / 响应模型 ====================
 
@@ -49,7 +50,7 @@ class DouyinExportRequest(BaseModel):
     )
     asr_backend: str = Field(
         default="auto",
-        description="ASR 后端：auto | dashscope | ollama",
+        description="ASR 后端：auto | dashscope | ollama | whisper",
     )
     ollama_url: str = Field(default="http://localhost:11434")
     ollama_model: str = Field(default="whisper")
@@ -112,6 +113,7 @@ def _build_markdown(vc, source: str) -> str:
     ]
     if vc.cover_url:
         lines += ["", f"![封面]({vc.cover_url})"]
+    append_summary_section(lines, getattr(vc, "summary_block", ""))
     lines += ["", "---", "", "## 转写内容", ""]
     if vc.content and vc.content.strip():
         lines.append(vc.content.strip())
@@ -123,21 +125,13 @@ def _build_markdown(vc, source: str) -> str:
 
 def _build_asr_service(req: DouyinExportRequest):
     """根据请求参数构建 ASR 服务实例"""
-    from app.config import settings
+    from app.services.asr_factory import create_asr_service
 
-    backend = req.asr_backend
-    if backend == "auto":
-        backend = "dashscope" if settings.openai_api_key else "ollama"
-
-    if backend == "dashscope":
-        from app.services.asr import ASRService
-        return ASRService()
-
-    from app.services.asr_local import OllamaASRService
-    return OllamaASRService(
-        base_url=req.ollama_url,
-        model=req.ollama_model,
-        language=req.ollama_language,
+    return create_asr_service(
+        backend=req.asr_backend,
+        ollama_base_url=req.ollama_url,
+        ollama_model=req.ollama_model,
+        ollama_language=req.ollama_language,
     )
 
 
@@ -146,17 +140,16 @@ def _build_asr_service(req: DouyinExportRequest):
 async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
     """后台执行抖音导出任务"""
     task = douyin_export_tasks[job_id]
-    job_dir = os.path.join(DOUYIN_EXPORT_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
 
     from app.services.douyin import DouyinService
     from app.services.douyin_fetcher import DouyinContentFetcher
 
     douyin = DouyinService(cookie=req.cookie, evil0ctal_url=req.evil0ctal_url)
     asr = _build_asr_service(req)
+    storage_manager = ContentStorageManager()
     fetcher = DouyinContentFetcher(
         asr_service=asr,
-        tmp_dir=os.path.join("data", "douyin_tmp"),
+        storage_manager=storage_manager,
     )
 
     try:
@@ -192,11 +185,11 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
             task["processed_videos"] = idx
             task["progress"] = int(idx / total * 95)
 
-            safe_title = _safe_filename(title)
-            md_path = os.path.join(job_dir, f"{safe_title}_{aweme_id}.md")
+            md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
 
-            if os.path.exists(md_path):
+            if md_path.exists():
                 file_count += 1
+                task["output_files"].append(str(md_path))
                 task["file_count"] = file_count
                 continue
 
@@ -206,6 +199,7 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(md_content)
                 file_count += 1
+                task["output_files"].append(str(md_path))
                 logger.info(
                     f"[DouyinExport] [{idx+1}/{total}] ✅ "
                     f"{title[:40]} ({vc.content_source})"
@@ -267,10 +261,9 @@ async def start_douyin_export(req: DouyinExportRequest, background_tasks: Backgr
         )
 
     # 检查 Ollama 可用性（仅 ollama 后端）
-    backend = req.asr_backend
-    if backend == "auto":
-        from app.config import settings
-        backend = "dashscope" if settings.openai_api_key else "ollama"
+    from app.services.asr_factory import resolve_asr_backend
+
+    backend = resolve_asr_backend(req.asr_backend)
     if backend == "ollama":
         from app.services.asr_local import OllamaASRService
         asr_check = OllamaASRService(base_url=req.ollama_url, model=req.ollama_model)
@@ -295,6 +288,7 @@ async def start_douyin_export(req: DouyinExportRequest, background_tasks: Backgr
         "current_video": "",
         "message": "任务已创建，等待启动...",
         "file_count": 0,
+        "output_files": [],
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
     }
@@ -326,18 +320,16 @@ async def download_douyin_export(job_id: str):
     if task["status"] != "completed":
         raise HTTPException(status_code=400, detail="任务尚未完成")
 
-    job_dir = os.path.join(DOUYIN_EXPORT_DIR, job_id)
-    if not os.path.exists(job_dir):
+    output_files = [path for path in task.get("output_files", []) if os.path.exists(path)]
+    if not output_files:
         raise HTTPException(status_code=404, detail="导出文件不存在")
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _, files in os.walk(job_dir):
-            for fname in files:
-                if fname.endswith(".md"):
-                    abs_path = os.path.join(root, fname)
-                    arc_name = os.path.relpath(abs_path, job_dir)
-                    zf.write(abs_path, arc_name)
+        export_root = os.path.expanduser(settings.collection_output_dir)
+        for abs_path in output_files:
+            arc_name = os.path.relpath(abs_path, export_root)
+            zf.write(abs_path, arc_name)
     zip_buffer.seek(0)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

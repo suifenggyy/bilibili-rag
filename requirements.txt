@@ -11,9 +11,11 @@ aiosqlite==0.20.0
 langchain==0.3.7
 langchain-openai==0.2.6
 langchain-chroma==0.1.4
+langchain-community==0.3.7
 chromadb==0.5.15
 openai==1.59.7
 dashscope==1.20.0
+openai-whisper==20250625
 
 # QR code
 qrcode[pil]==7.4.2
@@ -26,11 +28,14 @@ python-dotenv==1.0.1
 # Logging
 loguru==0.7.2
 
-# Instapaper 文章正文提取
-trafilatura==2.0.0
+# Audio download
+yt-dlp==2026.3.17
 
-# pyinstapaper - Instapaper Full API Python 客户端
-pyinstapaper==0.2.2
+# Instapaper 文章正文提取
+requests==2.32.3
+trafilatura==2.0.0
+playwright==1.55.0
+
 
 # System dependency (required for ASR local fallback)
 # ffmpeg (install separately and add to PATH)

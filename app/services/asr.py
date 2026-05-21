@@ -21,6 +21,7 @@ from dashscope.utils.oss_utils import OssUtils
 from loguru import logger
 
 from app.config import settings
+from app.services.asr_temp_file_manager import ASRTempFileManager
 
 
 class ASRService:
@@ -39,6 +40,7 @@ class ASRService:
         self.timeout = timeout or getattr(settings, "asr_timeout", 600)
         self.local_model = getattr(settings, "asr_model_local", self.model)
         self.input_format = getattr(settings, "asr_input_format", "pcm")
+        self.temp_file_manager = ASRTempFileManager()
 
     def _configure(self) -> None:
         if not self.api_key:
@@ -126,7 +128,7 @@ class ASRService:
             return self._transcode_audio_to_wav(file_path)
         return self._transcode_audio_to_pcm(file_path)
 
-    def _recognize_local_file(self, file_path: str) -> Optional[str]:
+    def _recognize_local_file(self, file_path: str, title: Optional[str] = None) -> Optional[str]:
         """使用 Recognition 直传本地音频"""
         self._configure()
         if not os.path.exists(file_path):
@@ -169,19 +171,16 @@ class ASRService:
             if text:
                 preview = text[:120].replace("\n", " ").strip()
                 logger.info(f"ASR Recognition 成功，长度={len(text)}，预览：{preview}")
+                self.temp_file_manager.write_result(
+                    title or os.path.splitext(os.path.basename(file_path))[0],
+                    text,
+                )
             return text
         except Exception as e:
             logger.warning(f"ASR Recognition 异常: {e}")
             return None
-        finally:
-            for path in {file_path, input_path}:
-                try:
-                    if path and os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    logger.debug(f"ASR 临时文件清理失败: {path}")
 
-    def _download_transcription(self, url: str) -> Optional[str]:
+    def _download_transcription(self, url: str, title: Optional[str] = None) -> Optional[str]:
         try:
             raw = urlrequest.urlopen(url).read().decode("utf-8")
             data = json.loads(raw)
@@ -204,7 +203,10 @@ class ASRService:
         if not texts and isinstance(data.get("text"), str):
             texts.append(data["text"])
 
-        return "\n".join(texts).strip() if texts else None
+        text = "\n".join(texts).strip() if texts else None
+        if text:
+            self.temp_file_manager.write_result(title or "dashscope_asr", text)
+        return text
 
     def _build_api_url(self, *parts: str) -> str:
         base_url = self.base_url or getattr(dashscope, "base_http_api_url", None)
@@ -262,7 +264,7 @@ class ASRService:
             return data["output"]
         return data if isinstance(data, dict) else None
 
-    def _transcribe_sync_restful(self, audio_url: str, model: str) -> Optional[str]:
+    def _transcribe_sync_restful(self, audio_url: str, model: str, title: Optional[str] = None) -> Optional[str]:
         self._configure()
         task_id = self._submit_transcription_task_restful(audio_url, model)
         if not task_id:
@@ -308,15 +310,15 @@ class ASRService:
                     error_message,
                 )
             if sub_status == "SUCCEEDED" and transcription_url:
-                return self._download_transcription(transcription_url)
+                return self._download_transcription(transcription_url, title=title)
 
         logger.warning("ASR 未返回有效转写结果(RESTful)")
         return None
 
-    def _transcribe_sync(self, audio_url: str) -> Optional[str]:
+    def _transcribe_sync(self, audio_url: str, title: Optional[str] = None) -> Optional[str]:
         self._configure()
         if audio_url.startswith("oss://"):
-            return self._transcribe_sync_restful(audio_url, self.model)
+            return self._transcribe_sync_restful(audio_url, self.model, title=title)
 
         kwargs = {}
         if "paraformer" in self.model:
@@ -379,7 +381,7 @@ class ASRService:
                     error_message,
                 )
             if sub_status == "SUCCEEDED" and transcription_url:
-                return self._download_transcription(item["transcription_url"])
+                return self._download_transcription(item["transcription_url"], title=title)
 
         logger.warning("ASR 未返回有效转写结果")
         return None
@@ -403,20 +405,20 @@ class ASRService:
             logger.warning(f"ASR 临时文件上传失败: {e}")
             return None
 
-    async def transcribe_url(self, audio_url: str) -> Optional[str]:
-        return await asyncio.to_thread(self._transcribe_sync, audio_url)
+    async def transcribe_url(self, audio_url: str, title: Optional[str] = None) -> Optional[str]:
+        return await asyncio.to_thread(self._transcribe_sync, audio_url, title)
 
-    async def transcribe_local_file(self, file_path: str) -> Optional[str]:
+    async def transcribe_local_file(self, file_path: str, title: Optional[str] = None) -> Optional[str]:
         """本地文件直传识别（Recognition）"""
-        return await asyncio.to_thread(self._recognize_local_file, file_path)
+        return await asyncio.to_thread(self._recognize_local_file, file_path, title)
 
-    def _transcribe_sync_with_model(self, audio_url: str, model: str) -> Optional[str]:
+    def _transcribe_sync_with_model(self, audio_url: str, model: str, title: Optional[str] = None) -> Optional[str]:
         """使用指定模型转写（用于本地文件上传）"""
         if audio_url.startswith("oss://"):
-            return self._transcribe_sync_restful(audio_url, model)
+            return self._transcribe_sync_restful(audio_url, model, title=title)
         original_model = self.model
         try:
             self.model = model
-            return self._transcribe_sync(audio_url)
+            return self._transcribe_sync(audio_url, title=title)
         finally:
             self.model = original_model

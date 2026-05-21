@@ -1,0 +1,58 @@
+<h2>前端改版方向</h2>
+<p class="subtitle">目标：首页改为文档中心，新增配置页，知识库构建先做流程占位。选一个更接近你想要的整体方向。</p>
+
+<div class="cards">
+  <div class="card" data-choice="a" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">方案 A · 文档优先</div>
+        <div class="mockup-body">
+          <div class="mock-nav">Logo | 文档 | 配置 | 构建知识库</div>
+          <div style="display:flex; gap:12px; margin-top:12px;">
+            <div class="mock-sidebar" style="width:28%;">来源筛选<br>全部 / B站 / 抖音 / Instapaper</div>
+            <div class="mock-content" style="flex:1;">
+              搜索框<br><br>
+              文档列表卡片<br>
+              文档列表卡片<br>
+              文档列表卡片
+            </div>
+          </div>
+          <div style="margin-top:12px;" class="placeholder">点击文档后进入内页 Markdown 阅读视图</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>方案 A：文档中心型</h3>
+      <p>首页直接展示文档列表，配置页独立，构建页作为后续步骤入口。最贴合“先看已抓取内容再决定下一步”的流程。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="b" onclick="toggleSelect(this)">
+    <div class="card-image">
+      <div class="mockup">
+        <div class="mockup-header">方案 B · 工作台型</div>
+        <div class="mockup-body">
+          <div class="mock-nav">Logo | 文档 | 配置 | 构建知识库</div>
+          <div style="display:flex; gap:12px; margin-top:12px;">
+            <div class="mock-sidebar" style="width:24%;">最近文档<br>配置概览<br>构建状态</div>
+            <div class="mock-content" style="flex:1;">
+              欢迎区 / 统计卡片<br><br>
+              最近文档列表<br><br>
+              快捷操作：继续构建 / 修改配置
+            </div>
+          </div>
+          <div style="margin-top:12px;" class="placeholder">首页像控制台，文档只是其中一个区块</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>方案 B：工作台型</h3>
+      <p>首页聚合文档、配置和构建入口，更像总控台；信息更全，但“看文档”不是最强主路径。</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>我的建议</h3>
+  <p>优先选 <strong>方案 A</strong>。这次需求已经明确把首页重心切到“已抓取文档”，而配置页和构建页都更适合作为二级页面，不应该继续挤在同一个工作台里。</p>
+</div>

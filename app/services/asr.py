@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 from http import HTTPStatus
 from typing import Optional, Any
@@ -26,6 +27,10 @@ from app.services.asr_temp_file_manager import ASRTempFileManager
 
 class ASRService:
     """音频转文字服务（DashScope）"""
+
+    # DashScope Recognition SDK 有全局状态，并发调用会导致结果混淆
+    # 用类级别锁确保同一时刻只有一个 Recognition.call() 在执行
+    _recognition_lock = threading.Lock()
 
     def __init__(
         self,
@@ -157,7 +162,8 @@ class ASRService:
                     format=(self.input_format or "pcm"),
                     sample_rate=16000,
                 )
-                result = recognizer.call(input_path)
+                with ASRService._recognition_lock:
+                    result = recognizer.call(input_path)
                 logger.info(
                     "ASR Recognition 结果: status_code={}, code={}, message={}, request_id={}",
                     getattr(result, "status_code", None),

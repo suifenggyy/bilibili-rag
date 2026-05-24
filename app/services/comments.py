@@ -147,10 +147,14 @@ async def fetch_douyin_comments(
             "Referer": douyin_cfg["headers"]["Referer"],
             "Cookie": cookie,  # Use user's runtime cookie, not config.yaml's
         }
-        proxies = {
-            "http://": douyin_cfg["proxies"].get("http") or "",
-            "https://": douyin_cfg["proxies"].get("https") or "",
-        }
+        # Only include non-empty proxy entries; empty strings cause httpx errors
+        proxy_http = douyin_cfg["proxies"].get("http") or ""
+        proxy_https = douyin_cfg["proxies"].get("https") or ""
+        proxies = {}
+        if proxy_http:
+            proxies["http://"] = proxy_http
+        if proxy_https:
+            proxies["https://"] = proxy_https
 
         params = PostComments(aweme_id=aweme_id, cursor=0, count=limit)
         logger.debug(f"[Comments] 生成 X-Bogus 签名 aweme_id={aweme_id}")

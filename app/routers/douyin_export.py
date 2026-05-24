@@ -306,32 +306,28 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
 
             task["current_video"] = title
 
-            # Skip if already exported (no semaphore needed for DB reads)
+            # Skip only if DB marks as completed AND file already exists WITH comments (if cookie available)
             async with get_db_context() as db:
                 proc_rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
                 await db.commit()
             if _proc_svc.is_completed(proc_rec):
                 md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
                 if md_path.exists():
-                    file_count += 1
-                    task["output_files"].append(str(md_path))
-                    task["file_count"] = file_count
-                    _log(f"⏭ 已完成，跳过：{title[:40]}")
-                    done_count += 1
-                    task["processed_videos"] = done_count
-                    task["progress"] = int(done_count / total * 95)
-                    return
+                    md_text = md_path.read_text(encoding="utf-8")
+                    # Re-process if we have a cookie but the MD has no comments section yet
+                    needs_comments = req.cookie.strip() and "## 热门评论" not in md_text
+                    if not needs_comments:
+                        file_count += 1
+                        task["output_files"].append(str(md_path))
+                        task["file_count"] = file_count
+                        _log(f"⏭ 已完成，跳过：{title[:40]}")
+                        done_count += 1
+                        task["processed_videos"] = done_count
+                        task["progress"] = int(done_count / total * 95)
+                        return
+                    _log(f"🔄 已完成但缺少评论，重新处理：{title[:40]}")
 
             md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
-            if md_path.exists():
-                file_count += 1
-                task["output_files"].append(str(md_path))
-                task["file_count"] = file_count
-                _log(f"⏭ 文件已存在，跳过：{title[:40]}")
-                done_count += 1
-                task["processed_videos"] = done_count
-                task["progress"] = int(done_count / total * 95)
-                return
 
             _log(f"🔄 开始处理：{title[:50]}")
             task["message"] = f"🔊 转写中: {title[:30]}..."

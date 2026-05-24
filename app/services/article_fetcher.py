@@ -286,21 +286,36 @@ class ArticleFetcher:
         if not found_body:
             return "", ""
 
-        # ── 保留行内图片位置：用占位符替换 <img>，trafilatura 处理后还原 ──
-        # trafilatura 会把图片收集到末尾；改为先用占位文本顶住位置，
-        # 再把占位符换回 ![alt](src) Markdown，保持原始排列顺序。
+        # ── 保留图片位置：将 <figure>/<img> 替换成 <p> 占位符 ──
+        # trafilatura 会丢弃 <figure> 但保留 <p>；用此方式保留图片原始位置。
         try:
-            from bs4 import BeautifulSoup
+            from bs4 import BeautifulSoup, NavigableString
             soup = BeautifulSoup(found_body, "html.parser")
             img_map: dict[str, str] = {}  # placeholder → markdown
-            for i, tag in enumerate(soup.find_all("img")):
-                src = tag.get("src", "")
-                alt = tag.get("alt", "")
+            idx = 0
+            # 优先替换整个 <figure>（常见于 CMS 富文本）
+            for figure in soup.find_all("figure"):
+                img_tag = figure.find("img")
+                if not img_tag:
+                    continue
+                src = img_tag.get("src", "")
+                alt = img_tag.get("alt", "") or ""
                 if not src:
                     continue
-                placeholder = f"IMGPLACEHOLDER{i}END"
+                placeholder = f"IMGPLACEHOLDER{idx}END"
                 img_map[placeholder] = f"![{alt}]({src})"
-                tag.replace_with(soup.new_string(f" {placeholder} "))
+                figure.replace_with(BeautifulSoup(f"<p>{placeholder}</p>", "html.parser"))
+                idx += 1
+            # 处理不在 <figure> 里的裸 <img>
+            for img_tag in soup.find_all("img"):
+                src = img_tag.get("src", "")
+                alt = img_tag.get("alt", "") or ""
+                if not src:
+                    continue
+                placeholder = f"IMGPLACEHOLDER{idx}END"
+                img_map[placeholder] = f"![{alt}]({src})"
+                img_tag.replace_with(NavigableString(f" {placeholder} "))
+                idx += 1
             processed_html = str(soup)
         except Exception:
             processed_html = found_body
@@ -314,7 +329,7 @@ class ArticleFetcher:
                 include_comments=False,
                 include_tables=True,
                 include_links=True,
-                include_images=False,   # 行内图片已用占位符处理
+                include_images=False,
                 favor_precision=False,
             ) or ""
         except Exception:
@@ -325,8 +340,15 @@ class ArticleFetcher:
         for placeholder, md_img in img_map.items():
             text = text.replace(placeholder, md_img)
 
-        # 追加独立图片字段（封面/缩略图等，去重，排除正文中已有的 URL）
-        extra_imgs = [u for u in dict.fromkeys(found_images) if u not in text]
+        # 独立图片字段（cover / images[]）：跳过已通过 <img> 出现的图（按 URL 基础部分去重）
+        def _base_url(u: str) -> str:
+            return re.sub(r"\?.*$", "", u)
+
+        in_text_bases = {_base_url(u) for u in re.findall(r"https?://[^\s)\"']+", text)}
+        extra_imgs = [
+            u for u in dict.fromkeys(found_images)
+            if _base_url(u) not in in_text_bases
+        ]
         if extra_imgs:
             img_md = "\n".join(f"![]({u})" for u in extra_imgs)
             text = f"{text}\n\n{img_md}" if text else img_md

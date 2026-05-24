@@ -33,6 +33,7 @@ class XiaoyuzhouEpisodeContent:
     content: str = ""
     content_source: str = "basic_info"  # "asr" | "basic_info"
     summary_block: str = ""
+    asr_raw_text: str = ""  # 纠错前的原始 ASR 文本，供重试使用
 
 
 class XiaoyuzhouContentFetcher:
@@ -120,7 +121,9 @@ class XiaoyuzhouContentFetcher:
             transcript = await self._extract_and_transcribe(tmp_audio, episode_id, title)
             if transcript:
                 self.storage_manager.write_work_text("xiaoyuzhou", storage_title, "asr_raw.txt", transcript.strip())
+                raw_asr = transcript.strip()
                 base.content = await self._postprocess_asr_text(episode_id, transcript, title=title)
+                base.asr_raw_text = raw_asr
                 self.storage_manager.write_work_text("xiaoyuzhou", storage_title, "asr_corrected.txt", base.content.strip())
                 base.content_source = "asr"
                 base.summary_block = await self._summarize_content(episode_id, base.content)

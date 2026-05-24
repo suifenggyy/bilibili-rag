@@ -111,6 +111,7 @@ class ContentFetcher:
             fail_on_asr_error=fail_on_asr_error,
         )
         if asr_text:
+            raw_asr = asr_text
             self._persist_text_artifact(title, "asr_raw.txt", asr_text)
             asr_text = await self._postprocess_asr_text(bvid, asr_text, title=title)
             self._persist_text_artifact(title, "asr_corrected.txt", asr_text)
@@ -122,6 +123,7 @@ class ContentFetcher:
                 content=asr_text,
                 source=ContentSource.ASR,
                 summary_block=summary_block,
+                asr_raw_text=raw_asr,
             )
         
         # ASR 失败时，补齐基础信息（避免遗漏简介）

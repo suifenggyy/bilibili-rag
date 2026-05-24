@@ -12,17 +12,19 @@ from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db, get_db_context
-from app.models import FavoriteFolder, FavoriteVideo, VideoCache, UserSession, ContentSource, VideoContent
+from app.models import FavoriteFolder, FavoriteVideo, VideoCache, UserSession, ContentSource, VideoContent, BiliCreator
 from app.services.bilibili import BilibiliService
 from app.services.content_fetcher import ContentFetcher
 from app.services.asr_factory import create_asr_service
 from app.services.rag import RAGService
+from app.services.processing_status import ProcessingStatusService
 from app.routers.auth import get_session
 
 router = APIRouter(prefix="/knowledge", tags=["知识库"])
 
 # 全局 RAG 服务实例
 _rag_service: Optional[RAGService] = None
+_proc_svc = ProcessingStatusService()
 
 # 构建任务状态
 build_tasks = {}
@@ -64,6 +66,21 @@ class FolderStatus(BaseModel):
 class SyncRequest(BaseModel):
     """同步请求"""
     folder_ids: Optional[List[int]] = None
+
+
+class CreatorRequest(BaseModel):
+    """添加 UP主请求"""
+    uid: str
+    nickname: Optional[str] = None
+    after_date: Optional[str] = None   # YYYY-MM-DD
+
+
+class CreatorResponse(BaseModel):
+    """UP主信息响应"""
+    id: int
+    uid: str
+    nickname: Optional[str] = None
+    after_date: Optional[str] = None
 
 
 class SyncResult(BaseModel):
@@ -298,6 +315,17 @@ async def _sync_folder(
     for bvid in targets:
         meta = video_map[bvid]
         
+        # Skip if already fully indexed
+        async with get_db_context() as db_proc:
+            proc_rec = await _proc_svc.get_or_create(db_proc, "bilibili", bvid, meta.get("title"))
+            await db_proc.commit()
+        if _proc_svc.is_completed(proc_rec):
+            logger.info(f"[{bvid}] 已完成索引，跳过")
+            processed_targets += 1
+            if progress_callback:
+                progress_callback("跳过（已完成）", processed_targets, total_targets)
+            continue
+
         # 尝试添加到向量库（可能失败，但不影响记录入库）
         try:
             global_count = await db.scalar(
@@ -367,10 +395,30 @@ async def _sync_folder(
                     logger.warning(f"删除旧向量失败 [{bvid}]: {e}")
                 chunks = rag.add_video_content(content)
                 logger.info(f"[{bvid}] 向量化完成，块数={chunks}")
+                # Mark processing stages
+                try:
+                    async with get_db_context() as db_s:
+                        r_s = await _proc_svc.get_or_create(db_s, "bilibili", bvid, meta.get("title"))
+                        if content.asr_raw_text:
+                            await _proc_svc.mark_asr_done(db_s, r_s, content.asr_raw_text)
+                            await _proc_svc.mark_correction_done(db_s, r_s, content.content or "")
+                        if content.summary_block:
+                            await _proc_svc.mark_summary_done(db_s, r_s, content.summary_block)
+                        await _proc_svc.mark_completed(db_s, r_s)
+                        await db_s.commit()
+                except Exception as _e:
+                    logger.warning(f"[{bvid}] 处理状态记录失败（非关键）: {_e}")
             else:
                 logger.info(f"[{bvid}] 内容未变化或无需升级，跳过向量化")
         except Exception as e:
             logger.warning(f"添加向量失败 [{bvid}]: {e} (仍会记录到数据库)")
+            try:
+                async with get_db_context() as db_err:
+                    r_err = await _proc_svc.get_or_create(db_err, "bilibili", bvid)
+                    await _proc_svc.mark_failed(db_err, r_err, "index", str(e))
+                    await db_err.commit()
+            except Exception:
+                pass
         
         # 无论向量是否添加成功，都写入 FavoriteVideo 记录
         try:
@@ -732,3 +780,246 @@ async def delete_video_from_knowledge(bvid: str):
     except Exception as e:
         logger.error(f"删除视频失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== UP主创作者管理 ====================
+
+@router.post("/creators", response_model=CreatorResponse)
+async def add_creator(
+    request: CreatorRequest,
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """添加 UP主（创作者）配置"""
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+
+    uid = request.uid.strip()
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid 不能为空")
+
+    # 若未提供昵称，尝试从 B站 API 获取
+    nickname = request.nickname
+    if not nickname:
+        cookies = session.get("cookies", {})
+        bili = BilibiliService(
+            sessdata=cookies.get("SESSDATA"),
+            bili_jct=cookies.get("bili_jct"),
+            dedeuserid=cookies.get("DedeUserID"),
+        )
+        try:
+            info = await bili.get_creator_info(uid)
+            nickname = info.get("name") or uid
+        except Exception as e:
+            logger.warning(f"[Bilibili] 获取 UP主信息失败: {e}")
+            nickname = uid
+        finally:
+            await bili.close()
+
+    # 已存在则更新，否则新建
+    result = await db.execute(
+        select(BiliCreator).where(
+            BiliCreator.session_id == session_id,
+            BiliCreator.uid == uid,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        existing.nickname = nickname
+        existing.after_date = request.after_date
+        await db.commit()
+        await db.refresh(existing)
+        return CreatorResponse(id=existing.id, uid=existing.uid, nickname=existing.nickname, after_date=existing.after_date)
+
+    creator = BiliCreator(
+        session_id=session_id,
+        uid=uid,
+        nickname=nickname,
+        after_date=request.after_date,
+    )
+    db.add(creator)
+    await db.commit()
+    await db.refresh(creator)
+    return CreatorResponse(id=creator.id, uid=creator.uid, nickname=creator.nickname, after_date=creator.after_date)
+
+
+@router.get("/creators", response_model=List[CreatorResponse])
+async def list_creators(
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取已配置的 UP主列表"""
+    result = await db.execute(
+        select(BiliCreator).where(BiliCreator.session_id == session_id)
+    )
+    creators = result.scalars().all()
+    return [CreatorResponse(id=c.id, uid=c.uid, nickname=c.nickname, after_date=c.after_date) for c in creators]
+
+
+@router.delete("/creators/{creator_id}")
+async def delete_creator(
+    creator_id: int,
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除 UP主配置"""
+    result = await db.execute(
+        select(BiliCreator).where(
+            BiliCreator.id == creator_id,
+            BiliCreator.session_id == session_id,
+        )
+    )
+    creator = result.scalar_one_or_none()
+    if not creator:
+        raise HTTPException(status_code=404, detail="未找到该 UP主配置")
+    await db.delete(creator)
+    await db.commit()
+    return {"message": "已删除"}
+
+
+@router.post("/creators/sync")
+async def sync_creator_videos(
+    background_tasks: BackgroundTasks,
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """同步所有已配置 UP主的作品到知识库（后台任务）"""
+    session = await get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+
+    result = await db.execute(
+        select(BiliCreator).where(BiliCreator.session_id == session_id)
+    )
+    creators = result.scalars().all()
+    if not creators:
+        raise HTTPException(status_code=400, detail="尚未配置任何 UP主")
+
+    creator_list = [
+        {"id": c.id, "uid": c.uid, "nickname": c.nickname, "after_date": c.after_date}
+        for c in creators
+    ]
+
+    import uuid
+    task_id = str(uuid.uuid4())
+    build_tasks[task_id] = {
+        "status": "pending",
+        "progress": 0,
+        "current_step": "初始化中...",
+        "total_videos": 0,
+        "processed_videos": 0,
+        "message": "",
+    }
+
+    background_tasks.add_task(
+        _sync_creators_task,
+        task_id,
+        session_id,
+        session,
+        creator_list,
+    )
+
+    return {"task_id": task_id, "message": "UP主作品同步任务已启动"}
+
+
+async def _sync_creators_task(
+    task_id: str,
+    session_id: str,
+    session: dict,
+    creator_list: list,
+):
+    """后台任务：同步多个 UP主的全部作品到知识库"""
+    cookies = session.get("cookies", {})
+    bili = BilibiliService(
+        sessdata=cookies.get("SESSDATA"),
+        bili_jct=cookies.get("bili_jct"),
+        dedeuserid=cookies.get("DedeUserID"),
+    )
+    asr_service = create_asr_service()
+    content_fetcher = ContentFetcher(bili, asr_service)
+    rag = get_rag_service()
+
+    try:
+        build_tasks[task_id]["status"] = "running"
+        total_indexed = 0
+
+        for ci, creator in enumerate(creator_list, start=1):
+            uid = creator["uid"]
+            nickname = creator.get("nickname") or uid
+            after_date = creator.get("after_date")
+
+            build_tasks[task_id]["current_step"] = f"获取 UP主 {nickname} 的作品列表..."
+            logger.info(f"[Creator Sync] 开始同步 UP主 {nickname} (uid={uid}), after_date={after_date}")
+
+            try:
+                videos = await bili.get_all_creator_videos(uid, after_date=after_date)
+            except Exception as e:
+                logger.error(f"[Creator Sync] 获取 UP主 {uid} 视频列表失败: {e}")
+                continue
+
+            logger.info(f"[Creator Sync] UP主 {nickname} 共 {len(videos)} 个视频")
+            build_tasks[task_id]["total_videos"] = build_tasks[task_id].get("total_videos", 0) + len(videos)
+
+            async with get_db_context() as db:
+                for vi, video in enumerate(videos, start=1):
+                    bvid = video.get("bvid")
+                    title = video.get("title") or bvid
+                    if not bvid:
+                        continue
+
+                    build_tasks[task_id]["current_step"] = f"处理: {title[:30]}"
+
+                    try:
+                        # 检查是否已处理过
+                        res = await db.execute(select(VideoCache).where(VideoCache.bvid == bvid))
+                        cache = res.scalar_one_or_none()
+                        if cache and cache.is_processed:
+                            build_tasks[task_id]["processed_videos"] = build_tasks[task_id].get("processed_videos", 0) + 1
+                            continue
+
+                        # 获取内容并入库
+                        video_info = {
+                            "bvid": bvid,
+                            "title": title,
+                            "intro": video.get("description") or "",
+                            "owner_name": video.get("author") or nickname,
+                            "owner_mid": uid,
+                            "duration": video.get("length"),
+                            "cover": video.get("pic"),
+                        }
+                        await _upsert_video_cache(db, bvid, video_info)
+                        await db.commit()
+
+                        content_result = await content_fetcher.fetch_content(bvid)
+                        if content_result:
+                            await rag.add_video(bvid, title, content_result)
+                            res2 = await db.execute(select(VideoCache).where(VideoCache.bvid == bvid))
+                            cache2 = res2.scalar_one_or_none()
+                            if cache2:
+                                cache2.is_processed = True
+                                cache2.content = content_result[:5000]
+                                await db.commit()
+                            total_indexed += 1
+
+                    except Exception as e:
+                        logger.error(f"[Creator Sync] 处理视频 {bvid} 失败: {e}")
+
+                    build_tasks[task_id]["processed_videos"] = build_tasks[task_id].get("processed_videos", 0) + 1
+                    total = build_tasks[task_id].get("total_videos", 1)
+                    proc = build_tasks[task_id].get("processed_videos", 0)
+                    build_tasks[task_id]["progress"] = min(99, int(proc / max(total, 1) * 100))
+
+        build_tasks[task_id]["status"] = "completed"
+        build_tasks[task_id]["progress"] = 100
+        build_tasks[task_id]["current_step"] = "完成"
+        build_tasks[task_id]["message"] = f"UP主作品同步完成，入库 {total_indexed} 个视频"
+        logger.info(f"[Creator Sync] 完成，共入库 {total_indexed} 个视频")
+
+    except Exception as e:
+        logger.error(f"[Creator Sync] 任务失败: {e}")
+        build_tasks[task_id]["status"] = "failed"
+        build_tasks[task_id]["message"] = str(e)
+    finally:
+        await bili.close()
+

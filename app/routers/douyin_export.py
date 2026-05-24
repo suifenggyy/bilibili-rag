@@ -34,11 +34,13 @@ from app.database import get_db, get_db_context
 from app.models import DouyinSession, DouyinCreator
 from app.services.content_summary import append_summary_section
 from app.services.content_storage import ContentStorageManager
+from app.services.processing_status import ProcessingStatusService
 
 router = APIRouter(prefix="/douyin-export", tags=["抖音导出"])
 
 # 任务状态（内存存储，重启后清空）
 douyin_export_tasks: dict[str, dict] = {}
+_proc_svc = ProcessingStatusService()
 
 # ==================== QR 登录模型 ====================
 
@@ -284,6 +286,18 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
             task["processed_videos"] = idx
             task["progress"] = int(idx / total * 95)
 
+            # Skip if already exported
+            async with get_db_context() as db:
+                proc_rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
+                await db.commit()
+            if _proc_svc.is_completed(proc_rec):
+                md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
+                if md_path.exists():
+                    file_count += 1
+                    task["output_files"].append(str(md_path))
+                    task["file_count"] = file_count
+                    continue
+
             md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
 
             if md_path.exists():
@@ -303,6 +317,19 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                     f"[DouyinExport] [{idx+1}/{total}] ✅ "
                     f"{title[:40]} ({vc.content_source})"
                 )
+                # Track processing stages
+                try:
+                    async with get_db_context() as db:
+                        r = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
+                        if vc.asr_raw_text:
+                            await _proc_svc.mark_asr_done(db, r, vc.asr_raw_text)
+                            await _proc_svc.mark_correction_done(db, r, vc.content or "")
+                        if vc.summary_block:
+                            await _proc_svc.mark_summary_done(db, r, vc.summary_block)
+                        await _proc_svc.mark_completed(db, r)
+                        await db.commit()
+                except Exception as _e:
+                    logger.warning(f"[DouyinExport] 处理状态记录失败（非关键）[{aweme_id}]: {_e}")
             except Exception as e:
                 logger.error(f"[DouyinExport] [{idx+1}/{total}] ❌ {aweme_id}: {e}")
 

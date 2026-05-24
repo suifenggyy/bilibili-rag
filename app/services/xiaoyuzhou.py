@@ -216,10 +216,9 @@ class XiaoyuzhouService:
 
         url = f"{self.API_BASE}/v1/subscription/list"
         body = {
-            "limit": str(limit),
+            "limit": limit,
             "sortOrder": "desc",
             "sortBy": "subscribedAt",
-            "loadMoreKey": {},
         }
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, json=body, headers=self._build_headers())

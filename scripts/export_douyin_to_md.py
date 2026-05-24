@@ -59,6 +59,8 @@ sys.path.insert(0, str(ROOT_DIR))
 from dotenv import load_dotenv
 from loguru import logger
 from app.services.content_summary import append_summary_section
+from app.services.processing_status import ProcessingStatusService
+from app.database import get_db_context
 
 load_dotenv(ROOT_DIR / ".env")
 
@@ -213,6 +215,7 @@ async def export_videos(
 
     success, failed = 0, 0
     total = len(videos)
+    _proc_svc = ProcessingStatusService()
 
     for i, raw_video in enumerate(videos, 1):
         video_info = DouyinService.parse_video_info(raw_video)
@@ -222,7 +225,22 @@ async def export_videos(
         safe_title = _safe_filename(title)
         md_path = output_dir / f"{safe_title}_{aweme_id}.md"
 
-        if md_path.exists():
+        # 检查 DB 状态
+        already_done = False
+        try:
+            async with get_db_context() as db:
+                proc_rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
+                await db.commit()
+                already_done = _proc_svc.is_completed(proc_rec)
+        except Exception as _db_err:
+            logger.debug(f"DB 状态检查失败（跳过）: {_db_err}")
+
+        if already_done and md_path.exists():
+            print(f"  [{i:3d}/{total}] ⏭️  已完成，跳过：{title[:50]}")
+            success += 1
+            continue
+
+        if md_path.exists() and not already_done:
             print(f"  [{i:3d}/{total}] ⏭️  已存在，跳过：{title[:50]}")
             success += 1
             continue
@@ -238,10 +256,31 @@ async def export_videos(
             print(f"  → {status}")
             success += 1
 
+            try:
+                async with get_db_context() as db:
+                    rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
+                    if getattr(vc, "asr_raw_text", None):
+                        await _proc_svc.mark_asr_done(db, rec, vc.asr_raw_text)
+                    if vc.content:
+                        await _proc_svc.mark_correction_done(db, rec, vc.content)
+                    if getattr(vc, "summary_block", None):
+                        await _proc_svc.mark_summary_done(db, rec, vc.summary_block)
+                    await _proc_svc.mark_completed(db, rec)
+                    await db.commit()
+            except Exception as _db_err:
+                logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
+
         except Exception as e:
             logger.error(f"处理视频失败 [{aweme_id}]: {e}")
             print(f"  → ❌ 失败: {e}")
             failed += 1
+            try:
+                async with get_db_context() as db:
+                    rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
+                    await _proc_svc.mark_failed(db, rec, "asr", str(e))
+                    await db.commit()
+            except Exception as _db_err:
+                logger.debug(f"DB 失败状态写入失败（不影响导出）: {_db_err}")
 
         await asyncio.sleep(0.3)
 
@@ -355,6 +394,8 @@ async def main():
     from app.services.douyin import DouyinService
     from app.services.content_storage import ContentStorageManager
     from app.services.douyin_fetcher import DouyinContentFetcher
+    from app.database import init_db
+    await init_db()
 
     storage_manager = ContentStorageManager(export_root=args.output_dir)
     output_dir = storage_manager.get_export_dir("douyin")

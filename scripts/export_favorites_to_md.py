@@ -42,6 +42,8 @@ sys.path.insert(0, str(ROOT_DIR))
 from dotenv import load_dotenv
 from loguru import logger
 from app.services.content_summary import append_summary_section
+from app.services.processing_status import ProcessingStatusService
+from app.database import get_db_context
 
 load_dotenv(ROOT_DIR / ".env")
 
@@ -376,6 +378,8 @@ async def export_folder(
     if invalid_count:
         print(f"   ⚠️  过滤掉 {invalid_count} 个失效视频")
 
+    _proc_svc = ProcessingStatusService()
+
     for i, video in enumerate(valid_videos, 1):
         bvid = video.get("bvid") or video.get("bv_id") or ""
         title = video.get("title") or bvid
@@ -385,8 +389,23 @@ async def export_folder(
         safe_title = _safe_filename(title)
         md_path = output_dir / f"{safe_title}_{bvid}.md"
 
-        # 已存在则跳过
-        if md_path.exists():
+        # 检查 DB 状态，已完成则跳过
+        already_done = False
+        try:
+            async with get_db_context() as db:
+                proc_rec = await _proc_svc.get_or_create(db, "bilibili", bvid, title)
+                await db.commit()
+                already_done = _proc_svc.is_completed(proc_rec)
+        except Exception as _db_err:
+            logger.debug(f"DB 状态检查失败（跳过）: {_db_err}")
+
+        if already_done and md_path.exists():
+            print(f"   [{i}/{len(valid_videos)}] ⏭️  已完成，跳过：{title[:40]}")
+            success += 1
+            continue
+
+        # 文件存在但 DB 无记录时也跳过（兼容旧数据）
+        if md_path.exists() and not already_done:
             print(f"   [{i}/{len(valid_videos)}] ⏭️  已存在，跳过：{title[:40]}")
             success += 1
             continue
@@ -408,7 +427,7 @@ async def export_folder(
                 video_content.content,
                 source,
                 folder_title,
-                getattr(video_content, "summary_block", ""),
+                getattr(video_content, "summary_block", "") or "",
             )
 
             md_path.write_text(md_content, encoding="utf-8")
@@ -416,10 +435,34 @@ async def export_folder(
             print(f"  → {source_label}")
             success += 1
 
+            # 更新处理状态
+            try:
+                async with get_db_context() as db:
+                    rec = await _proc_svc.get_or_create(db, "bilibili", bvid, title)
+                    asr_raw = getattr(video_content, "asr_raw_text", None)
+                    if asr_raw:
+                        await _proc_svc.mark_asr_done(db, rec, asr_raw)
+                    if video_content.content:
+                        await _proc_svc.mark_correction_done(db, rec, video_content.content)
+                    summary = getattr(video_content, "summary_block", None)
+                    if summary:
+                        await _proc_svc.mark_summary_done(db, rec, summary)
+                    await _proc_svc.mark_completed(db, rec)
+                    await db.commit()
+            except Exception as _db_err:
+                logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
+
         except Exception as e:
             logger.error(f"处理视频失败 [{bvid}]: {e}")
             print(f"  → ❌ 失败: {e}")
             failed += 1
+            try:
+                async with get_db_context() as db:
+                    rec = await _proc_svc.get_or_create(db, "bilibili", bvid, title)
+                    await _proc_svc.mark_failed(db, rec, "asr", str(e))
+                    await db.commit()
+            except Exception as _db_err:
+                logger.debug(f"DB 失败状态写入失败（不影响导出）: {_db_err}")
 
         # 控制请求速率
         await asyncio.sleep(0.5)
@@ -580,6 +623,8 @@ async def main():
 
     from app.services.content_storage import ContentStorageManager
     from app.services.content_fetcher import ContentFetcher
+    from app.database import init_db
+    await init_db()
 
     storage_manager = ContentStorageManager(export_root=args.output_dir)
     output_dir = storage_manager.get_export_dir("bilibili")

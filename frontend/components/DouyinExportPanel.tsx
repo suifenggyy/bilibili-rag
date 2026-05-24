@@ -190,7 +190,9 @@ export default function DouyinExportPanel({ sessionId }: Props) {
       startPollingQR(data.token);
     } catch (err: unknown) {
       setQrStatus("error");
-      setQrMessage((err as Error).message || "生成二维码失败");
+      const msg = (err as Error).message || "生成二维码失败";
+      // Strip backend prefix if present, keep the user-facing message
+      setQrMessage(msg.replace(/^.*?QR_LOGIN_UNAVAILABLE:\s*/, "QR_LOGIN_UNAVAILABLE: "));
     }
   };
 
@@ -401,10 +403,26 @@ export default function DouyinExportPanel({ sessionId }: Props) {
               {qrStatus === "error" && (
                 <div style={{ textAlign: "center", padding: "16px 0" }}>
                   <p style={{ color: "#ef4444", marginBottom: 4, fontSize: 13 }}>❌ {qrMessage}</p>
-                  <p className="ollama-hint" style={{ marginBottom: 8 }}>
-                    提示：此功能依赖抖音 SSO 接口，网络不稳定时可能失败，可改用手动 Cookie
-                  </p>
-                  <button className="btn btn-primary" onClick={startQRLogin}>重试</button>
+                  {qrMessage.includes("QR_LOGIN_UNAVAILABLE") || qrMessage.includes("安全验证") ? (
+                    <>
+                      <p className="ollama-hint" style={{ marginBottom: 10 }}>
+                        抖音安全拦截了扫码请求（需要浏览器环境），请切换为「手动 Cookie」模式。
+                      </p>
+                      <button
+                        className="btn btn-primary"
+                        onClick={() => setCookieMode("manual")}
+                      >
+                        切换为手动 Cookie
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <p className="ollama-hint" style={{ marginBottom: 8 }}>
+                        提示：此功能依赖抖音 SSO 接口，网络不稳定时可能失败，可改用手动 Cookie
+                      </p>
+                      <button className="btn btn-primary" onClick={startQRLogin}>重试</button>
+                    </>
+                  )}
                 </div>
               )}
             </div>

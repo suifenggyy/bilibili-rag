@@ -14,6 +14,8 @@ class DouyinAuthServiceQRCodeTests(unittest.IsolatedAsyncioTestCase):
 
         mock_response = MagicMock()
         mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.text = '{"error_code":0}'
         mock_response.json.return_value = {
             "error_code": 0,
             "data": {
@@ -42,12 +44,15 @@ class DouyinAuthServiceQRCodeTests(unittest.IsolatedAsyncioTestCase):
 
         mock_response = MagicMock()
         mock_response.status_code = 200
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.text = '{"error_code":1001}'
         mock_response.json.return_value = {
             "error_code": 1001,
             "description": "频率限制",
         }
 
         mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=MagicMock(cookies=MagicMock(get=lambda k, d=None: "fake_ttwid")))
         mock_client.get = AsyncMock(return_value=mock_response)
         mock_client.aclose = AsyncMock()
 

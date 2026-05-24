@@ -63,6 +63,13 @@ def _cookies_to_str(jar: httpx.Cookies) -> str:
     return "; ".join(f"{k}={v}" for k, v in jar.items())
 
 
+_TTWID_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
+_TTWID_DATA = (
+    '{"region":"cn","aid":1768,"needFid":false,"service":"www.ixigua.com",'
+    '"migrate_info":{"ticket":"","source":"node"},"cbUrlProtocol":"https","union":true}'
+)
+
+
 class DouyinAuthService:
     """抖音网页端 QR 扫码登录。"""
 
@@ -72,6 +79,24 @@ class DouyinAuthService:
             headers=_BROWSER_HEADERS,
             follow_redirects=True,
         )
+
+    async def _ensure_ttwid(self) -> None:
+        """获取 ttwid cookie（Douyin SSO 需要此 cookie，否则返回 HTML 挑战页）。"""
+        try:
+            resp = await self._client.post(
+                _TTWID_URL,
+                content=_TTWID_DATA,
+                headers={"Content-Type": "application/json"},
+            )
+            ttwid = resp.cookies.get("ttwid")
+            if ttwid:
+                self._client.cookies.set("ttwid", ttwid, domain=".douyin.com")
+                self._client.cookies.set("ttwid", ttwid, domain=".sso.douyin.com")
+                logger.debug("[DouyinAuth] ttwid 已获取")
+            else:
+                logger.warning("[DouyinAuth] ttwid 未在响应中找到，继续尝试")
+        except Exception as e:
+            logger.warning("[DouyinAuth] 获取 ttwid 失败（将继续）: {}", e)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -95,6 +120,7 @@ class DouyinAuthService:
                 "qrcode_image_base64": str,     # data:image/png;base64,…
             }
         """
+        await self._ensure_ttwid()
         resp = await self._client.get(
             f"{_SSO_BASE}/get_qrcode/",
             params={
@@ -108,6 +134,15 @@ class DouyinAuthService:
             },
         )
         resp.raise_for_status()
+
+        # Detect bot-challenge HTML response (Douyin WAF returns HTML when cookies are insufficient)
+        ct = resp.headers.get("content-type", "")
+        if "text/html" in ct or resp.text.lstrip().startswith("<!"):
+            raise RuntimeError(
+                "QR_LOGIN_UNAVAILABLE: 抖音安全验证拦截了请求（需要浏览器环境）。"
+                "请切换为「手动 Cookie」模式，从浏览器开发者工具中复制 Cookie 粘贴到此处。"
+            )
+
         data = resp.json()
 
         error_code = data.get("error_code") or data.get("errorCode") or 0

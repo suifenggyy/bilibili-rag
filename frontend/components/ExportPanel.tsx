@@ -33,6 +33,14 @@ export default function ExportPanel({ sessionId }: Props) {
   const [error, setError] = useState<string | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const logRef = useRef<HTMLDivElement | null>(null);
+
+  // 日志自动滚动
+  useEffect(() => {
+    if (logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [jobStatus?.logs?.length]);
 
   // 加载收藏夹列表
   useEffect(() => {
@@ -338,6 +346,29 @@ export default function ExportPanel({ sessionId }: Props) {
                 <div className="progress-current">
                   <span className="current-label">当前：</span>
                   <span className="current-name">{jobStatus.current_video}</span>
+                </div>
+              )}
+
+              {/* 日志区域 */}
+              {jobStatus.logs && jobStatus.logs.length > 0 && (
+                <div
+                  ref={logRef}
+                  className="export-log-box"
+                  style={{
+                    maxHeight: 200,
+                    overflowY: "auto",
+                    background: "var(--color-surface-alt, #1a1a2e)",
+                    borderRadius: 6,
+                    padding: "8px 10px",
+                    fontSize: 12,
+                    fontFamily: "monospace",
+                    marginTop: 8,
+                    color: "var(--color-text-secondary, #aaa)",
+                  }}
+                >
+                  {jobStatus.logs.slice(-50).map((line, i) => (
+                    <div key={i} style={{ lineHeight: 1.6 }}>{line}</div>
+                  ))}
                 </div>
               )}
 

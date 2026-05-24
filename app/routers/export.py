@@ -53,6 +53,7 @@ class ExportStatus(BaseModel):
     created_at: str
     completed_at: Optional[str] = None
     file_count: int = 0
+    logs: list[str] = []
 
 
 # ==================== 工具函数 ====================
@@ -124,6 +125,12 @@ def _build_asr_service(req: ExportRequest):
     )
 
 
+def _append_log(task: dict, entry: str) -> None:
+    task["logs"].append(entry)
+    if len(task["logs"]) > 200:
+        task["logs"] = task["logs"][-200:]
+
+
 # ==================== 后台导出任务 ====================
 
 async def _run_export(job_id: str, req: ExportRequest, cookies: dict):
@@ -190,6 +197,7 @@ async def _run_export(job_id: str, req: ExportRequest, cookies: dict):
             if md_path.exists():
                 file_count += 1
                 task["output_files"].append(str(md_path))
+                _append_log(task, f"[{idx+1}/{total}] ⏭️ 跳过（已存在）：{title[:40]}")
                 continue
 
             try:
@@ -210,8 +218,10 @@ async def _run_export(job_id: str, req: ExportRequest, cookies: dict):
                     f.write(md_content)
                 file_count += 1
                 task["output_files"].append(str(md_path))
+                _append_log(task, f"[{idx+1}/{total}] ✅ {title[:40]} ({source})")
                 logger.info(f"[Export] [{idx+1}/{total}] ✅ {title[:40]} ({source})")
             except Exception as e:
+                _append_log(task, f"[{idx+1}/{total}] ❌ {bvid}: {e}")
                 logger.error(f"[Export] [{idx+1}/{total}] ❌ {bvid}: {e}")
 
             task["file_count"] = file_count
@@ -286,6 +296,7 @@ async def start_export(
         "message": "任务已创建，等待启动...",
         "file_count": 0,
         "output_files": [],
+        "logs": [],
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
     }

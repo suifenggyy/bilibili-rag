@@ -180,6 +180,7 @@ export interface ExportJobStatus {
     created_at: string;
     completed_at?: string;
     file_count: number;
+    logs?: string[];
 }
 
 // ==================== API 函数 ====================

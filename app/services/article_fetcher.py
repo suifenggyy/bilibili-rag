@@ -286,24 +286,46 @@ class ArticleFetcher:
         if not found_body:
             return "", ""
 
-        # 将 HTML 转换为 Markdown（trafilatura，含行内图片；回退到简单标签剥离）
+        # ── 保留行内图片位置：用占位符替换 <img>，trafilatura 处理后还原 ──
+        # trafilatura 会把图片收集到末尾；改为先用占位文本顶住位置，
+        # 再把占位符换回 ![alt](src) Markdown，保持原始排列顺序。
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(found_body, "html.parser")
+            img_map: dict[str, str] = {}  # placeholder → markdown
+            for i, tag in enumerate(soup.find_all("img")):
+                src = tag.get("src", "")
+                alt = tag.get("alt", "")
+                if not src:
+                    continue
+                placeholder = f"IMGPLACEHOLDER{i}END"
+                img_map[placeholder] = f"![{alt}]({src})"
+                tag.replace_with(soup.new_string(f" {placeholder} "))
+            processed_html = str(soup)
+        except Exception:
+            processed_html = found_body
+            img_map = {}
+
         try:
             import trafilatura
             text = trafilatura.extract(
-                f"<html><body>{found_body}</body></html>",
+                f"<html><body>{processed_html}</body></html>",
                 output_format="markdown",
                 include_comments=False,
                 include_tables=True,
                 include_links=True,
-                include_images=True,
+                include_images=False,   # 行内图片已用占位符处理
                 favor_precision=False,
             ) or ""
         except Exception:
-            # 简单 tag 剥离回退
-            text = re.sub(r"<[^>]+>", " ", found_body)
+            text = re.sub(r"<[^>]+>", " ", processed_html)
             text = re.sub(r"\s+", " ", text).strip()
 
-        # 追加封面/独立图片（去重，排除已出现在 body 文本中的 URL）
+        # 把占位符还原为 Markdown 图片（保持原始位置）
+        for placeholder, md_img in img_map.items():
+            text = text.replace(placeholder, md_img)
+
+        # 追加独立图片字段（封面/缩略图等，去重，排除正文中已有的 URL）
         extra_imgs = [u for u in dict.fromkeys(found_images) if u not in text]
         if extra_imgs:
             img_md = "\n".join(f"![]({u})" for u in extra_imgs)

@@ -4,6 +4,7 @@ Bilibili RAG 知识库系统
 知识库路由 - 构建和管理知识库
 """
 from datetime import datetime
+import asyncio
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Depends
 from loguru import logger
 from typing import List, Optional, Callable
@@ -11,6 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, func, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db, get_db_context
 from app.models import FavoriteFolder, FavoriteVideo, VideoCache, UserSession, ContentSource, VideoContent, BiliCreator
 from app.services.bilibili import BilibiliService
@@ -312,9 +314,12 @@ async def _sync_folder(
     processed_targets = 0
     if progress_callback:
         progress_callback("准备处理", processed_targets, total_targets)
+
+    # ── Phase 1 (sequential): read cache state for each video ───────────────
+    fetch_infos: list[dict] = []
     for bvid in targets:
         meta = video_map[bvid]
-        
+
         # Skip if already fully indexed
         async with get_db_context() as db_proc:
             proc_rec = await _proc_svc.get_or_create(db_proc, "bilibili", bvid, meta.get("title"))
@@ -324,29 +329,74 @@ async def _sync_folder(
             processed_targets += 1
             if progress_callback:
                 progress_callback("跳过（已完成）", processed_targets, total_targets)
+            # Still write FavoriteVideo record
+            try:
+                exists_row = await db.execute(
+                    select(FavoriteVideo.id).where(
+                        FavoriteVideo.folder_id == folder.id,
+                        FavoriteVideo.bvid == bvid,
+                    )
+                )
+                if exists_row.scalar_one_or_none() is None:
+                    db.add(FavoriteVideo(folder_id=folder.id, bvid=bvid, is_selected=True))
+            except Exception as e:
+                logger.error(f"写入数据库失败 [{bvid}]: {e}")
             continue
+
+        global_count = await db.scalar(
+            select(func.count()).select_from(FavoriteVideo).where(FavoriteVideo.bvid == bvid)
+        )
+        result = await db.execute(select(VideoCache).where(VideoCache.bvid == bvid))
+        cache = result.scalar_one_or_none()
+        old_content = (cache.content or "").strip() if cache else ""
+        old_source = cache.content_source if cache else None
+
+        fetch_infos.append({
+            "bvid": bvid,
+            "meta": meta,
+            "cache": cache,
+            "global_count": global_count,
+            "old_content": old_content,
+            "old_source": old_source,
+            "needs_fetch": _should_refresh_cache(cache),
+        })
+
+    # ── Phase 2 (concurrent): fetch content for videos that need it ─────────
+    concurrency = getattr(settings, "asr_concurrency", 2)
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _fetch_one(info: dict):
+        bvid = info["bvid"]
+        meta = info["meta"]
+        if not info["needs_fetch"]:
+            return None
+        try:
+            async with sem:
+                return await content_fetcher.fetch_content(
+                    bvid, cid=meta["cid"], title=meta["title"]
+                )
+        except Exception as e:
+            logger.warning(f"[{bvid}] 并发 fetch 失败: {e}")
+            return None
+
+    fetched_contents: list = await asyncio.gather(*[_fetch_one(i) for i in fetch_infos])
+
+    # ── Phase 3 (sequential): save results, update vectors, write DB ─────────
+    for info, content in zip(fetch_infos, fetched_contents):
+        bvid = info["bvid"]
+        meta = info["meta"]
+        cache = info["cache"]
+        global_count = info["global_count"]
+        old_content = info["old_content"]
+        old_source = info["old_source"]
 
         # 尝试添加到向量库（可能失败，但不影响记录入库）
         try:
-            global_count = await db.scalar(
-                select(func.count()).select_from(FavoriteVideo).where(FavoriteVideo.bvid == bvid)
-            )
-            # 检查缓存内容是否缺失
-            result = await db.execute(select(VideoCache).where(VideoCache.bvid == bvid))
-            cache = result.scalar_one_or_none()
-            old_content = (cache.content or "").strip() if cache else ""
-            old_source = cache.content_source if cache else None
-
-            needs_fetch = _should_refresh_cache(cache)
-            content = None
             should_update_cache = False
             should_reindex = False
 
-            if needs_fetch:
-                content = await content_fetcher.fetch_content(
-                    bvid, cid=meta["cid"], title=meta["title"]
-                )
-                new_text = (content.content or "").strip() if content else ""
+            if content is not None:
+                new_text = (content.content or "").strip()
                 new_source = content.source.value if content else None
 
                 if not old_content:
@@ -419,7 +469,7 @@ async def _sync_folder(
                     await db_err.commit()
             except Exception:
                 pass
-        
+
         # 无论向量是否添加成功，都写入 FavoriteVideo 记录
         try:
             exists_row = await db.execute(

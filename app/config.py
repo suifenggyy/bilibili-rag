@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     asr_timeout: int = Field(default=600, env="ASR_TIMEOUT")
     asr_model_local: str = Field(default="paraformer-realtime-v2", env="ASR_MODEL_LOCAL")
     asr_input_format: str = Field(default="pcm", env="ASR_INPUT_FORMAT")
+    # 并发处理时 DashScope 同时请求数（其他阶段不受此限制）
+    asr_concurrency: int = Field(default=2, env="ASR_CONCURRENCY")
 
     # Ollama 本地 ASR（Whisper）
     ollama_base_url: str = Field(default="http://localhost:11434", env="OLLAMA_BASE_URL")

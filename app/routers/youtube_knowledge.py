@@ -3,6 +3,7 @@ YouTube 知识库路由
 
 提供 YouTube 视频/播放列表的来源管理和知识库构建端点。
 """
+import asyncio
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db, get_db_context
 from app.models import (
     PlatformContentCache,
@@ -381,11 +383,15 @@ async def _run_build(
         task["current_step"] = f"共 {total} 个视频，开始处理"
         _log(f"共找到 {total} 个视频，开始处理...")
 
-        for i, video_info in enumerate(all_videos):
+        done_count = 0
+        concurrency = getattr(settings, "asr_concurrency", 2)
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _process_video(i: int, video_info: dict) -> None:
+            nonlocal done_count
             video_id = video_info.get("video_id", "")
             title = video_info.get("title", video_id)
             task["current_step"] = f"处理: {title[:40]}"
-            task["progress"] = int((i / max(total, 1)) * 90)
 
             try:
                 # Skip if already fully indexed
@@ -393,16 +399,18 @@ async def _run_build(
                     proc_rec = await _proc_svc.get_or_create(db, "youtube", video_id, title)
                     await db.commit()
                 if _proc_svc.is_completed(proc_rec):
-                    task["processed_videos"] += 1
-                    _log(f"[{i+1}/{total}] ⏭ 已完成，跳过：{title[:40]}")
-                    continue
+                    done_count += 1
+                    task["processed_videos"] = done_count
+                    task["progress"] = int((done_count / max(total, 1)) * 90)
+                    _log(f"⏭ 已完成，跳过：{title[:40]}")
+                    return
 
-                _log(f"[{i+1}/{total}] 🔊 ASR 转写中：{title[:50]}")
-                task["message"] = f"[{i+1}/{total}] 转写: {title[:30]}..."
-                # 获取内容（ASR）
-                content = await fetcher.fetch_content(video_info)
+                _log(f"🔊 ASR 转写中：{title[:50]}")
+                task["message"] = f"转写: {title[:30]}..."
+                async with sem:
+                    content = await fetcher.fetch_content(video_info)
                 source_label = "ASR ✅" if content.content_source == "asr" else "基本信息 ⚠️"
-                _log(f"[{i+1}/{total}] ✅ 完成（{source_label}）：{title[:40]}")
+                _log(f"✅ 完成（{source_label}）：{title[:40]}")
 
                 async with get_db_context() as db:
                     result = await db.execute(
@@ -458,7 +466,7 @@ async def _run_build(
                     logger.warning(f"[YouTube] 处理状态记录失败（非关键）[{video_id}]: {_e}")
 
             except Exception as e:
-                _log(f"[{i+1}/{total}] ❌ 失败：{title[:40]} — {str(e)[:80]}")
+                _log(f"❌ 失败：{title[:40]} — {str(e)[:80]}")
                 logger.error(f"[YouTube] 处理视频失败 [{video_id}]: {e}")
                 try:
                     async with get_db_context() as db_err:
@@ -468,7 +476,11 @@ async def _run_build(
                 except Exception:
                     pass
 
-            task["processed_videos"] = i + 1
+            done_count += 1
+            task["processed_videos"] = done_count
+            task["progress"] = int((done_count / max(total, 1)) * 90)
+
+        await asyncio.gather(*[_process_video(i, v) for i, v in enumerate(all_videos)])
 
         task["status"] = "completed"
         task["progress"] = 100

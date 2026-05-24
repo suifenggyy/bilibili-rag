@@ -30,6 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.config import settings
 from app.database import get_db, get_db_context
 from app.models import DouyinSession, DouyinCreator
 from app.services.content_summary import append_summary_section
@@ -290,17 +291,19 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
             return
 
         file_count = 0
+        done_count = 0
+        concurrency = getattr(settings, "asr_concurrency", 2)
+        sem = asyncio.Semaphore(concurrency)
 
-        for idx, raw_video in enumerate(all_videos):
+        async def _process_video(idx: int, raw_video: dict) -> None:
+            nonlocal file_count, done_count
             video_info = DouyinService.parse_video_info(raw_video)
             aweme_id = video_info["aweme_id"]
             title = video_info["title"]
 
             task["current_video"] = title
-            task["processed_videos"] = idx
-            task["progress"] = int(idx / total * 95)
 
-            # Skip if already exported
+            # Skip if already exported (no semaphore needed for DB reads)
             async with get_db_context() as db:
                 proc_rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
                 await db.commit()
@@ -310,32 +313,37 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                     file_count += 1
                     task["output_files"].append(str(md_path))
                     task["file_count"] = file_count
-                    _log(f"[{idx+1}/{total}] ⏭ 已完成，跳过：{title[:40]}")
-                    continue
+                    _log(f"⏭ 已完成，跳过：{title[:40]}")
+                    done_count += 1
+                    task["processed_videos"] = done_count
+                    task["progress"] = int(done_count / total * 95)
+                    return
 
             md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
-
             if md_path.exists():
                 file_count += 1
                 task["output_files"].append(str(md_path))
                 task["file_count"] = file_count
-                _log(f"[{idx+1}/{total}] ⏭ 文件已存在，跳过：{title[:40]}")
-                continue
+                _log(f"⏭ 文件已存在，跳过：{title[:40]}")
+                done_count += 1
+                task["processed_videos"] = done_count
+                task["progress"] = int(done_count / total * 95)
+                return
 
-            _log(f"[{idx+1}/{total}] 🔄 开始处理：{title[:50]}")
-            task["message"] = f"[{idx+1}/{total}] 🔊 转写中: {title[:30]}..."
+            _log(f"🔄 开始处理：{title[:50]}")
+            task["message"] = f"🔊 转写中: {title[:30]}..."
 
             try:
-                _log(f"[{idx+1}/{total}] 🎵 下载音频并进行 ASR 转写...")
-                vc = await fetcher.fetch_content(video_info)
+                _log(f"🎵 下载音频并进行 ASR 转写：{title[:50]}")
+                async with sem:
+                    vc = await fetcher.fetch_content(video_info)
                 source_label = "ASR ✅" if vc.content_source == "asr" else "基本信息 ⚠️"
-                _log(f"[{idx+1}/{total}] ✅ 转写完成（{source_label}）：{title[:40]}")
+                _log(f"✅ 转写完成（{source_label}）：{title[:40]}")
                 md_content = _build_markdown(vc, vc.content_source)
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(md_content)
                 file_count += 1
                 task["output_files"].append(str(md_path))
-                # Track processing stages
                 try:
                     async with get_db_context() as db:
                         r = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
@@ -349,11 +357,16 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                 except Exception as _e:
                     logger.warning(f"[DouyinExport] 处理状态记录失败（非关键）[{aweme_id}]: {_e}")
             except Exception as e:
-                _log(f"[{idx+1}/{total}] ❌ 失败：{title[:40]} — {str(e)[:80]}")
-                logger.error(f"[DouyinExport] [{idx+1}/{total}] ❌ {aweme_id}: {e}")
+                _log(f"❌ 失败：{title[:40]} — {str(e)[:80]}")
+                logger.error(f"[DouyinExport] ❌ {aweme_id}: {e}")
 
+            file_count = len(task["output_files"])
             task["file_count"] = file_count
-            await asyncio.sleep(0.3)
+            done_count += 1
+            task["processed_videos"] = done_count
+            task["progress"] = int(done_count / total * 95)
+
+        await asyncio.gather(*[_process_video(i, v) for i, v in enumerate(all_videos)])
 
         task.update({
             "status": "completed",

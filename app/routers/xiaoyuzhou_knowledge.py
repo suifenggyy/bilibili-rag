@@ -3,6 +3,7 @@
 
 提供小宇宙登录、订阅管理和知识库构建端点。
 """
+import asyncio
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db, get_db_context
 from app.models import (
     PlatformContentCache,
@@ -463,11 +465,15 @@ async def _run_build(
         task["current_step"] = f"共 {total} 集，开始处理"
         _log(f"共 {total} 集，开始处理...")
 
-        for i, (ep, podcast_title) in enumerate(all_episodes):
+        done_count = 0
+        concurrency = getattr(settings, "asr_concurrency", 2)
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _process_episode(i: int, ep: dict, podcast_title: str) -> None:
+            nonlocal done_count
             episode_id = ep.get("episode_id", "")
             ep_title = ep.get("title", episode_id)
             task["current_step"] = f"处理: {ep_title[:40]}"
-            task["progress"] = int((i / max(total, 1)) * 90)
 
             try:
                 # Skip if already fully indexed
@@ -476,15 +482,18 @@ async def _run_build(
                     proc_rec = await _proc_svc.get_or_create(db, "xiaoyuzhou", episode_id, full_title_check)
                     await db.commit()
                 if _proc_svc.is_completed(proc_rec):
-                    task["processed_episodes"] += 1
-                    _log(f"[{i+1}/{total}] ⏭ 已完成，跳过：{ep_title[:40]}")
-                    continue
+                    done_count += 1
+                    task["processed_episodes"] = done_count
+                    task["progress"] = int((done_count / max(total, 1)) * 90)
+                    _log(f"⏭ 已完成，跳过：{ep_title[:40]}")
+                    return
 
-                _log(f"[{i+1}/{total}] 🔊 ASR 转写中：{ep_title[:50]}")
-                task["message"] = f"[{i+1}/{total}] 转写: {ep_title[:30]}..."
-                content = await fetcher.fetch_content(ep, podcast_title=podcast_title)
+                _log(f"🔊 ASR 转写中：{ep_title[:50]}")
+                task["message"] = f"转写: {ep_title[:30]}..."
+                async with sem:
+                    content = await fetcher.fetch_content(ep, podcast_title=podcast_title)
                 source_label = "ASR ✅" if content.content_source == "asr" else "基本信息 ⚠️"
-                _log(f"[{i+1}/{total}] ✅ 完成（{source_label}）：{ep_title[:40]}")
+                _log(f"✅ 完成（{source_label}）：{ep_title[:40]}")
 
                 async with get_db_context() as db:
                     result = await db.execute(
@@ -541,7 +550,7 @@ async def _run_build(
                     logger.warning(f"[Xiaoyuzhou] 处理状态记录失败（非关键）[{episode_id}]: {_e}")
 
             except Exception as e:
-                _log(f"[{i+1}/{total}] ❌ 失败：{ep_title[:40]} — {str(e)[:80]}")
+                _log(f"❌ 失败：{ep_title[:40]} — {str(e)[:80]}")
                 logger.error(f"[Xiaoyuzhou] 处理集数失败 [{episode_id}]: {e}")
                 try:
                     async with get_db_context() as db_err:
@@ -551,7 +560,11 @@ async def _run_build(
                 except Exception:
                     pass
 
-            task["processed_episodes"] = i + 1
+            done_count += 1
+            task["processed_episodes"] = done_count
+            task["progress"] = int((done_count / max(total, 1)) * 90)
+
+        await asyncio.gather(*[_process_episode(i, ep, pt) for i, (ep, pt) in enumerate(all_episodes)])
 
         task["status"] = "completed"
         task["progress"] = 100

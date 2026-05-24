@@ -18,6 +18,7 @@ from loguru import logger
 
 from app.services.content_storage import ContentStorageManager
 from app.services.content_summary import ContentSummaryService
+from app.services.comments import fetch_douyin_comments, format_comments_section
 from app.services.text_postprocessor import TextPostProcessor
 from app.services.text_postprocessor_factory import create_text_postprocessor
 
@@ -64,14 +65,17 @@ class DouyinContentFetcher:
         text_postprocessor: Optional[TextPostProcessor] = None,
         summary_service: Optional[ContentSummaryService] = None,
         storage_manager: Optional[ContentStorageManager] = None,
+        cookie: str = "",
     ):
         """
         Args:
             asr_service:  ASR 服务实例（需实现 transcribe_url / transcribe_local_file）
             tmp_dir:      临时文件目录
+            cookie:       用户抖音 Cookie 字符串，用于获取热门评论（可选）
         """
         self.asr = asr_service
         self.tmp_dir = tmp_dir
+        self.cookie = cookie
         self.text_postprocessor = text_postprocessor or create_text_postprocessor()
         self.summary_service = summary_service or ContentSummaryService()
         self.storage_manager = storage_manager or ContentStorageManager()
@@ -129,6 +133,13 @@ class DouyinContentFetcher:
                     base.asr_raw_text = raw_asr
                     self.storage_manager.write_work_text("douyin", title, "asr_corrected.txt", base.content.strip())
                     base.content_source = "asr"
+
+                    # Append top-20 hot comments (best-effort, non-blocking)
+                    if self.cookie:
+                        comments = await fetch_douyin_comments(aweme_id, self.cookie)
+                        if comments:
+                            base.content += format_comments_section(comments)
+
                     base.summary_block = await self._summarize_content(aweme_id, base.content)
                     return base
 

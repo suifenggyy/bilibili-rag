@@ -766,6 +766,52 @@ class BilibiliService:
 
         return all_videos
 
+    async def get_video_comments(self, aid: int, limit: int = 20) -> List[Dict[str, Any]]:
+        """
+        获取视频热门评论（无需登录，按热度排序）。
+
+        Args:
+            aid:   视频 av 号（整数）
+            limit: 最多返回评论数，默认 20
+
+        Returns:
+            [{"author": str, "content": str, "likes": int}, ...]
+            抓取失败时返回空列表
+        """
+        url = f"{self.BASE_URL}/x/v2/reply"
+        params = {
+            "type": 1,   # 视频评论
+            "oid": aid,
+            "sort": 2,   # 按热度排序
+            "ps": limit,
+            "pn": 1,
+        }
+        try:
+            response = await self.client.get(url, params=params)
+            data = response.json()
+
+            if data.get("code") != 0:
+                logger.debug(
+                    f"[Bilibili] 评论接口返回错误 aid={aid}: {data.get('message')}"
+                )
+                return []
+
+            replies = (data.get("data") or {}).get("replies") or []
+            result: List[Dict[str, Any]] = []
+            for r in replies[:limit]:
+                author = (r.get("member") or {}).get("uname", "匿名")
+                content = (r.get("content") or {}).get("message", "").strip()
+                likes = r.get("like", 0)
+                if content:
+                    result.append({"author": author, "content": content, "likes": likes})
+
+            logger.info(f"[Bilibili] 获取热门评论 aid={aid}: {len(result)} 条")
+            return result
+
+        except Exception as e:
+            logger.warning(f"[Bilibili] 获取评论失败 aid={aid}: {e}")
+            return []
+
     async def download_audio_to_file(
         self,
         audio_url: str,

@@ -254,6 +254,7 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
     fetcher = DouyinContentFetcher(
         asr_service=asr,
         storage_manager=storage_manager,
+        cookie=req.cookie,
     )
 
     def _log(msg: str) -> None:

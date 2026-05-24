@@ -16,6 +16,7 @@ from loguru import logger
 from app.models import VideoContent, ContentSource
 from app.services.bilibili import BilibiliService
 from app.services.asr import ASRService
+from app.services.comments import fetch_bilibili_comments, format_comments_section
 from app.services.content_storage import ContentStorageManager
 from app.services.asr_temp_file_manager import ASRTempFileManager
 from app.services.content_summary import ContentSummaryService
@@ -115,6 +116,14 @@ class ContentFetcher:
             self._persist_text_artifact(title, "asr_raw.txt", asr_text)
             asr_text = await self._postprocess_asr_text(bvid, asr_text, title=title)
             self._persist_text_artifact(title, "asr_corrected.txt", asr_text)
+
+            # Append top-20 hot comments (best-effort, non-blocking)
+            aid = (video_info or {}).get("aid")
+            if aid:
+                comments = await fetch_bilibili_comments(aid)
+                if comments:
+                    asr_text += format_comments_section(comments)
+
             summary_block = await self._summarize_content(bvid, asr_text)
             logger.info(f"[{bvid}] 使用 ASR 文本")
             return VideoContent(

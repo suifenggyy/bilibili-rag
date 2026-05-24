@@ -7,11 +7,15 @@ from pydantic_settings import BaseSettings
 from pydantic import Field, AliasChoices
 from typing import Optional
 import os
+import importlib.util
 
-from app.services.text_model_prompts import (
-    DEFAULT_TEXT_MODEL_CORRECTION_PROMPT,
-    DEFAULT_TEXT_MODEL_SUMMARY_PROMPT,
-)
+# Load text_model_prompts directly to avoid triggering services/__init__.py (circular import)
+_prompts_path = os.path.join(os.path.dirname(__file__), "services", "text_model_prompts.py")
+_spec = importlib.util.spec_from_file_location("text_model_prompts", _prompts_path)
+_prompts_mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+_spec.loader.exec_module(_prompts_mod)  # type: ignore[union-attr]
+DEFAULT_TEXT_MODEL_CORRECTION_PROMPT: str = _prompts_mod.DEFAULT_TEXT_MODEL_CORRECTION_PROMPT
+DEFAULT_TEXT_MODEL_SUMMARY_PROMPT: str = _prompts_mod.DEFAULT_TEXT_MODEL_SUMMARY_PROMPT
 
 
 class Settings(BaseSettings):

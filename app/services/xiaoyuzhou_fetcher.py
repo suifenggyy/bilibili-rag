@@ -57,12 +57,14 @@ class XiaoyuzhouContentFetcher:
         text_postprocessor: Optional[TextPostProcessor] = None,
         summary_service: Optional[ContentSummaryService] = None,
         storage_manager: Optional[ContentStorageManager] = None,
+        xyz_service=None,  # XiaoyuzhouService，用于获取官方字幕（可选）
     ):
         self.asr = asr_service
         self.tmp_dir = tmp_dir
         self.text_postprocessor = text_postprocessor or create_text_postprocessor()
         self.summary_service = summary_service or ContentSummaryService()
         self.storage_manager = storage_manager or ContentStorageManager()
+        self.xyz_service = xyz_service  # 有则优先用官方字幕，省去 ASR
         if hasattr(self.asr, "temp_file_manager"):
             self.asr.temp_file_manager.source = "xiaoyuzhou"
             self.asr.temp_file_manager.storage_manager = self.storage_manager
@@ -98,6 +100,19 @@ class XiaoyuzhouContentFetcher:
             logger.warning(f"[XiaoyuzhouFetcher] 单集无音频 URL: {episode_id}")
             base.content = self._build_basic_content(base)
             return base
+
+        # 优先尝试官方字幕（有字幕则跳过 ASR）
+        if self.xyz_service and episode_id:
+            try:
+                transcript_text = await self.xyz_service.get_transcript(episode_id)
+                if transcript_text:
+                    logger.info(f"[XiaoyuzhouFetcher] 使用官方字幕: {episode_id}")
+                    base.content = transcript_text
+                    base.content_source = "transcript"
+                    base.summary_block = await self._summarize_content(episode_id, base.content)
+                    return base
+            except Exception as e:
+                logger.debug(f"[XiaoyuzhouFetcher] 官方字幕获取失败，改用 ASR: {e}")
 
         if self.asr is None:
             logger.warning(f"[XiaoyuzhouFetcher] 未配置 ASR 服务，仅保存基本信息: {episode_id}")

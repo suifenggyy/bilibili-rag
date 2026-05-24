@@ -1,8 +1,8 @@
 """
 小宇宙播客 → Markdown 导出工具
 
-从小宇宙订阅的播客中获取单集，将音频通过 ASR 转写为文字，保存为 Markdown 文件。
-不依赖 RAG 或向量数据库，独立运行。
+从小宇宙订阅/收件箱/收藏夹中获取单集，优先使用官方字幕，无字幕时通过 ASR 转写，
+保存为 Markdown 文件。不依赖 RAG 或向量数据库，独立运行。
 
 【认证方式】
 方式一：通过 .env 配置 Token（推荐，无需重复登录）：
@@ -14,18 +14,27 @@
 
 Token 登录成功后会自动保存到 .xiaoyuzhou_session.json，下次无需重新登录。
 
-【播客来源】
-默认使用已订阅的播客（需登录），也可手动指定 RSS URL：
+【内容来源】
+默认：收件箱（所有订阅的最新单集合流）
+    python scripts/export_xiaoyuzhou_to_md.py
+
+收藏夹：
+    python scripts/export_xiaoyuzhou_to_md.py --favorites
+
+RSS URL：
     python scripts/export_xiaoyuzhou_to_md.py --rss https://feeds.xiaoyuzhoufm.com/podcast/xxx
 
 用法:
-    # 交互式导出订阅中的播客
+    # 导出收件箱最新单集
     python scripts/export_xiaoyuzhou_to_md.py
+
+    # 导出收藏夹
+    python scripts/export_xiaoyuzhou_to_md.py --favorites
 
     # 指定 RSS URL
     python scripts/export_xiaoyuzhou_to_md.py --rss https://feeds.xiaoyuzhoufm.com/podcast/xxx
 
-    # 每个播客最多导出 N 集
+    # 最多导出 N 集
     python scripts/export_xiaoyuzhou_to_md.py --limit 10
 
     # 导出所有集（不弹出交互选择）
@@ -347,6 +356,11 @@ async def main():
         help="手动指定一个或多个播客 RSS URL（不用登录）",
     )
     parser.add_argument(
+        "--favorites",
+        action="store_true",
+        help="导出收藏夹内容（而非收件箱/订阅）",
+    )
+    parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
         help=f"输出目录（默认: {DEFAULT_OUTPUT_DIR}）",
@@ -426,7 +440,7 @@ async def main():
             print(f" ❌ 失败：{e}")
             sys.exit(1)
 
-        if not subscriptions:
+        if not subscriptions and not args.favorites:
             print("⚠️  订阅列表为空，请通过 --rss 手动指定 RSS URL")
             sys.exit(0)
 
@@ -434,13 +448,31 @@ async def main():
     print("\n📥 获取单集列表...", flush=True)
     all_episodes: list[tuple[dict, str]] = []
 
-    if xyz.access_token and subscriptions and not any(s["podcast_id"].startswith("rss_") for s in subscriptions):
-        # 已登录且是 API 订阅 → 优先用收件箱合流接口（一次获取全部最新）
+    if xyz.access_token and args.favorites:
+        # ── 收藏夹模式 ──
+        try:
+            fetch_limit = args.limit if args.limit > 0 else 100
+            fav_result = await xyz.get_favorites(limit=fetch_limit)
+            fav_eps = fav_result.get("episodes", [])
+            while fav_result.get("load_more_key") and (args.limit <= 0 or len(fav_eps) < args.limit):
+                fav_result = await xyz.get_favorites(
+                    limit=fetch_limit, load_more_key=fav_result["load_more_key"]
+                )
+                fav_eps.extend(fav_result.get("episodes", []))
+            print(f"   ⭐ 收藏夹共 {len(fav_eps)} 集")
+            for ep in fav_eps:
+                podcast_title = ep.pop("podcast_title", "") or "未知播客"
+                all_episodes.append((ep, podcast_title))
+        except Exception as e:
+            print(f"   ❌ 收藏夹获取失败: {e}")
+            sys.exit(1)
+
+    elif xyz.access_token and subscriptions and not any(s["podcast_id"].startswith("rss_") for s in subscriptions):
+        # ── 已登录 → 优先用收件箱合流接口 ──
         try:
             fetch_limit = args.limit if args.limit > 0 else 100
             inbox_result = await xyz.get_inbox_list(limit=fetch_limit)
             inbox_eps = inbox_result.get("episodes", [])
-            # 分页补充直到够用
             while inbox_result.get("load_more_key") and (args.limit <= 0 or len(inbox_eps) < args.limit):
                 inbox_result = await xyz.get_inbox_list(
                     limit=fetch_limit, load_more_key=inbox_result["load_more_key"]
@@ -452,9 +484,7 @@ async def main():
                 all_episodes.append((ep, podcast_title))
         except Exception as e:
             logger.warning(f"[Xiaoyuzhou] 收件箱获取失败，改用逐播客模式: {e}")
-            inbox_eps = []
 
-        # 如果收件箱为空，回退到逐播客
         if not all_episodes:
             print("   收件箱为空，改用逐播客获取...")
             for sub in subscriptions:
@@ -469,7 +499,7 @@ async def main():
                 except Exception as e:
                     print(f"   ⚠️  「{podcast_title}」获取失败: {e}")
     else:
-        # RSS-only 模式（--rss 指定）
+        # ── RSS-only 模式 ──
         for sub in subscriptions:
             rss_url = sub.get("rss_url") or ""
             podcast_title = sub.get("title", sub.get("podcast_id", ""))
@@ -529,7 +559,11 @@ async def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     asr = await _build_asr_service(args)
-    fetcher = XiaoyuzhouContentFetcher(asr_service=asr, storage_manager=storage_manager)
+    fetcher = XiaoyuzhouContentFetcher(
+        asr_service=asr,
+        storage_manager=storage_manager,
+        xyz_service=xyz if xyz.access_token else None,  # 有 token 时传入，优先用官方字幕
+    )
     print(f"🔀 并发度：{args.concurrency}（可通过 --concurrency 或 ASR_CONCURRENCY 配置）")
     print(f"\n🚀 开始导出 {len(all_episodes)} 集 → {output_dir.resolve()}\n")
 

@@ -314,6 +314,129 @@ class XiaoyuzhouService:
         logger.info(f"[Xiaoyuzhou] 收件箱获取成功，共 {len(episodes)} 集")
         return {"episodes": episodes, "load_more_key": next_key}
 
+    async def get_favorites(
+        self, limit: int = 50, load_more_key: Optional[dict] = None
+    ) -> dict:
+        """
+        获取用户收藏的单集列表（需要登录）
+
+        Returns:
+            {"episodes": [...], "load_more_key": {...} or None}
+        """
+        if not self.access_token:
+            raise RuntimeError("未登录小宇宙，请先调用 login_with_sms()")
+
+        # 尝试已知收藏夹端点
+        candidates = [
+            f"{self.API_BASE}/v1/starred-episode/list",
+            f"{self.API_BASE}/v1/favorite/list",
+            f"{self.API_BASE}/v1/collect/list",
+        ]
+        body: dict = {}
+        if load_more_key:
+            body["loadMoreKey"] = load_more_key
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            for url in candidates:
+                resp = await client.post(url, json=body, headers=self._build_headers())
+                if resp.status_code == 401:
+                    if await self.refresh_access_token():
+                        return await self.get_favorites(limit, load_more_key)
+                    raise RuntimeError("小宇宙 Token 已过期，请重新登录")
+                if resp.status_code == 200:
+                    break
+                logger.debug(f"[Xiaoyuzhou] 收藏夹端点 {url} 返回 {resp.status_code}，尝试下一个")
+            else:
+                logger.warning(f"[Xiaoyuzhou] 所有收藏夹端点均失败，最后状态: {resp.status_code} {resp.text[:200]}")
+                return {"episodes": [], "load_more_key": None}
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"[Xiaoyuzhou] 解析收藏夹响应失败: {e}")
+            return {"episodes": [], "load_more_key": None}
+
+        raw_items = data.get("data") or data.get("list") or data.get("episodes") or []
+        episodes = []
+        for item in raw_items:
+            raw_ep = item.get("episode") or item
+            ep = self._normalize_episode(raw_ep)
+            podcast = item.get("podcast") or {}
+            ep["podcast_title"] = podcast.get("title") or podcast.get("name") or ""
+            episodes.append(ep)
+            if limit > 0 and len(episodes) >= limit:
+                break
+
+        next_key = data.get("loadMoreKey") or data.get("nextKey")
+        logger.info(f"[Xiaoyuzhou] 收藏夹获取成功，共 {len(episodes)} 集")
+        return {"episodes": episodes, "load_more_key": next_key}
+
+    async def get_transcript(self, episode_id: str, media_id: str = "") -> Optional[str]:
+        """
+        获取单集字幕/文字稿（需要登录）
+        有字幕时直接返回文本，无需 ASR 转写。
+
+        Returns:
+            字幕文本（纯文字），或 None（无字幕/失败）
+        """
+        if not self.access_token:
+            return None
+
+        url = f"{self.API_BASE}/v1/episode-transcript/get"
+        body: dict = {"eid": episode_id}
+        if media_id:
+            body["mediaId"] = media_id
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(url, json=body, headers=self._build_headers())
+
+            if resp.status_code == 401:
+                if await self.refresh_access_token():
+                    return await self.get_transcript(episode_id, media_id)
+                return None
+
+            if resp.status_code != 200:
+                logger.debug(f"[Xiaoyuzhou] 获取字幕失败: {resp.status_code} eid={episode_id}")
+                return None
+
+            data = resp.json()
+            transcript_url = (data.get("data") or {}).get("transcriptUrl") or data.get("transcriptUrl")
+            if not transcript_url:
+                return None
+
+            # 下载字幕内容
+            async with httpx.AsyncClient(timeout=60) as client:
+                tr = await client.get(transcript_url)
+            tr.raise_for_status()
+            # 字幕通常是 JSON 格式的时间轴，提取纯文字
+            return self._parse_transcript_content(tr.text)
+
+        except Exception as e:
+            logger.debug(f"[Xiaoyuzhou] 获取字幕异常: {e} eid={episode_id}")
+            return None
+
+    @staticmethod
+    def _parse_transcript_content(raw: str) -> Optional[str]:
+        """解析字幕内容，提取纯文字"""
+        try:
+            import json as _json
+            data = _json.loads(raw)
+            # 常见格式：{"utterances": [{"text": "...", "start": 0, ...}]}
+            utterances = data.get("utterances") or data.get("sentences") or data.get("segments") or []
+            if utterances:
+                return " ".join(u.get("text") or u.get("content") or "" for u in utterances if u)
+            # 直接文本
+            if isinstance(data, str):
+                return data
+        except Exception:
+            pass
+        # 非 JSON，直接当文本返回
+        if raw and len(raw) > 10:
+            return raw.strip()
+        return None
+
+
     async def get_episodes_by_api(
         self, podcast_id: str, limit: int = 20, load_more_key: Optional[dict] = None
     ) -> dict:

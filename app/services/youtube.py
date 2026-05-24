@@ -6,12 +6,41 @@ YouTube 服务模块
 """
 import asyncio
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
+
+
+def _detect_js_runtime() -> Optional[dict]:
+    """检测系统中可用的 JS 运行时，返回 yt-dlp js_runtimes 配置字典。"""
+    nvm_node_dirs = []
+    nvm_root = os.path.expanduser("~/.nvm/versions/node")
+    if os.path.isdir(nvm_root):
+        nvm_node_dirs = [
+            os.path.join(nvm_root, d, "bin", "node")
+            for d in sorted(os.listdir(nvm_root), reverse=True)  # 最新版优先
+        ]
+
+    candidates = [
+        ("node", ["node", "/usr/local/bin/node", "/opt/homebrew/bin/node"] + nvm_node_dirs),
+        ("deno", ["deno", "/usr/local/bin/deno", "/opt/homebrew/bin/deno"]),
+        ("bun",  ["bun",  "/usr/local/bin/bun",  "/opt/homebrew/bin/bun"]),
+    ]
+    for runtime, paths in candidates:
+        found = shutil.which(runtime)
+        if not found:
+            for p in paths:
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    found = p
+                    break
+        if found:
+            logger.debug(f"[YouTube] 使用 JS 运行时: {runtime} → {found}")
+            return {runtime: {"executable": found}}
+    return None
 
 
 def _browser_cookies_to_netscape(cookie_str: str, domain: str = ".youtube.com") -> str:
@@ -81,6 +110,10 @@ class YouTubeService:
             "no_warnings": True,
             "extract_flat": not download,
         }
+        # 配置 JS 运行时（yt-dlp 2026+ 需要 JS 解密格式 URL）
+        js_runtime = _detect_js_runtime()
+        if js_runtime:
+            opts["js_runtimes"] = js_runtime
         if self.cookie_file and os.path.exists(self.cookie_file):
             opts["cookiefile"] = self.cookie_file
         if download and output_path:

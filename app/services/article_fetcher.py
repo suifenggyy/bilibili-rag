@@ -2,13 +2,15 @@
 文章正文提取服务。
 
 抓取链路：
-    1. requests 下载 HTML + trafilatura 提取
-    2. Playwright 渲染页面 + trafilatura 提取
-    3. 仅保留标题 + URL
+    1. __NEXT_DATA__ JSON 提取（Next.js SPA，包含 geo-block 页面）
+    2. requests 下载 HTML + trafilatura 提取
+    3. Playwright 渲染页面 + trafilatura 提取
+    4. 仅保留标题 + URL
 """
 
 import asyncio
 import json
+import re
 from typing import Optional
 
 from loguru import logger
@@ -99,6 +101,19 @@ class ArticleFetcher:
         if not self._trafilatura_available:
             self._persist_metadata(title or "未知标题", base_result)
             return base_result
+
+        # ── 优先：__NEXT_DATA__ 提取（处理 geo-block 的 Next.js 页面） ──
+        text, extracted_title = await asyncio.to_thread(self._extract_from_next_data, url)
+        if self._is_valid_extraction(text, extracted_title):
+            result = self._build_success_result(title, extracted_title, text, url)
+            result["source"] = "next_data"
+            result["summary_block"] = await self._summarize_content(url, result["text"])
+            logger.info(
+                f"[ArticleFetcher] __NEXT_DATA__ 提取成功: {len(result['text'])}chars, "
+                f"title='{result['title'][:30]}', url={url[:50]}"
+            )
+            self._persist_result(title or extracted_title or "未知标题", result)
+            return result
 
         text, extracted_title = await asyncio.to_thread(self._extract_with_requests, url)
         if self._is_valid_extraction(text, extracted_title):
@@ -198,6 +213,79 @@ class ArticleFetcher:
             "metadata.json",
             json.dumps(metadata, ensure_ascii=False, indent=2),
         )
+
+    def _extract_from_next_data(self, url: str) -> tuple[str, str]:
+        """从 Next.js __NEXT_DATA__ JSON 提取正文（适用于 geo-block 等渲染屏蔽场景）。"""
+        try:
+            import requests
+            from html.parser import HTMLParser
+        except ImportError:
+            return "", ""
+
+        try:
+            resp = requests.get(url, headers=self.REQUEST_HEADERS, timeout=self.FETCH_TIMEOUT)
+            resp.raise_for_status()
+            html = resp.text
+        except Exception as e:
+            logger.debug(f"[ArticleFetcher] __NEXT_DATA__ 请求失败: {e}")
+            return "", ""
+
+        # 提取 __NEXT_DATA__ JSON
+        m = re.search(
+            r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
+            html, re.S
+        )
+        if not m:
+            return "", ""
+
+        try:
+            data = json.loads(m.group(1))
+        except Exception:
+            return "", ""
+
+        # 递归搜索包含正文 HTML 的字段
+        BODY_KEYS = ("body", "content", "articleBody", "text", "html", "richText")
+        TITLE_KEYS = ("title", "headline", "name")
+        found_body: str = ""
+        found_title: str = ""
+
+        def _search(obj, depth: int = 0) -> None:
+            nonlocal found_body, found_title
+            if depth > 8 or (found_body and found_title):
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if not found_title and k in TITLE_KEYS and isinstance(v, str) and len(v) > 2:
+                        found_title = v
+                    if not found_body and k in BODY_KEYS and isinstance(v, str) and len(v) > 200:
+                        found_body = v
+                    _search(v, depth + 1)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _search(item, depth + 1)
+
+        _search(data.get("props", {}))
+
+        if not found_body:
+            return "", ""
+
+        # 将 HTML 转换为纯文本（先用 trafilatura，回退到简单标签剥离）
+        try:
+            import trafilatura
+            text = trafilatura.extract(
+                f"<html><body>{found_body}</body></html>",
+                output_format="markdown",
+                include_comments=False,
+                include_tables=True,
+                include_links=True,
+                favor_precision=False,
+            ) or ""
+        except Exception:
+            # 简单 tag 剥离回退
+            text = re.sub(r"<[^>]+>", " ", found_body)
+            text = re.sub(r"\s+", " ", text).strip()
+
+        return text, found_title
 
     def _extract_with_requests(self, url: str) -> tuple[str, str]:
         try:

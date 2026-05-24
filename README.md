@@ -193,7 +193,7 @@ WHISPER_LANGUAGE=zh                  # 语言提示，留空则自动检测
 # ── 抖音导出 ──────────────────────────────────────────────
 # 浏览器手动复制：Chrome → douyin.com → F12 → Application → Cookies
 DOUYIN_COOKIE=
-DOUYIN_EVIL0CTAL_URL=http://localhost:2333
+# DOUYIN_EVIL0CTAL_URL 已废弃：Evil0ctal 已作为 git submodule 集成，无需单独部署
 
 # ── Instapaper 导出 ────────────────────────────────────────
 # 申请 API Key：https://www.instapaper.com/main/request_oauth_consumer_token
@@ -376,12 +376,14 @@ $COLLECTION_OUTPUT_DIR/
 
 ### 前提条件
 
-**1. 部署 Evil0ctal API 中间层**（处理抖音动态签名 A-Bogus）
+**1. 初始化子模块**（Evil0ctal API 已作为 git submodule 集成，无需单独部署）
 
 ```bash
-git clone https://github.com/Evil0ctal/Douyin_TikTok_Download_API
-cd Douyin_TikTok_Download_API && pip install -r requirements.txt
-python main.py   # 默认监听 http://localhost:2333
+# 首次克隆时
+git submodule update --init
+
+# 更新子模块至最新版本
+git submodule update --remote douyin_tiktok_download_api
 ```
 
 **2. 获取抖音 Cookie**（抖音不提供扫码 API，需手动复制）
@@ -396,7 +398,6 @@ python main.py   # 默认监听 http://localhost:2333
 ```bash
 # .env
 DOUYIN_COOKIE=ttwid=xxx; sessionid=xxx; odin_tt=xxx; msToken=xxx; ...
-DOUYIN_EVIL0CTAL_URL=http://localhost:2333   # Evil0ctal API 地址
 COLLECTION_OUTPUT_DIR=/path/to/collection    # B站/抖音 Markdown 统一输出目录
 ```
 
@@ -426,9 +427,6 @@ python scripts/export_douyin_to_md.py --asr-backend ollama
 
 # 使用更高精度的 Whisper 模型
 python scripts/export_douyin_to_md.py --asr-backend ollama --ollama-model whisper:large
-
-# 指定 Evil0ctal 服务地址（非默认端口时使用）
-python scripts/export_douyin_to_md.py --evil0ctal-url http://192.168.1.100:2333
 ```
 
 ### 输出文件结构
@@ -449,7 +447,7 @@ $COLLECTION_OUTPUT_DIR/
 | 维度 | B站 | 抖音 |
 |------|-----|------|
 | 登录方式 | 扫码（官方 API） | 手动复制 Cookie |
-| 中间层 | 无需 | 需部署 Evil0ctal API |
+| 中间层 | 无需 | 无需（git submodule 直接集成） |
 | 收藏组织 | 按收藏夹分目录 | 统一输出目录 |
 | ASR 复用 | ✅ DashScope / Ollama / openai-whisper | ✅ 完全相同 |
 

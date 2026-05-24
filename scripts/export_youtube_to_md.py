@@ -1,16 +1,23 @@
 """
 YouTube → Markdown 导出工具
 
-从 YouTube 频道、播放列表或单视频抓取内容，将音频通过 ASR 转写为文字，保存为 Markdown 文件。
+从 YouTube 频道、播放列表、点赞视频或单视频抓取内容，通过 ASR 转写为文字，保存为 Markdown 文件。
 不依赖 RAG 或向量数据库，独立运行。
 
 【前提条件】
 需要安装 yt-dlp：
     pip install yt-dlp
 
-对于受限内容（会员专属、私有播放列表等），需要提供 cookies 文件。
+对于私有内容（点赞视频、稍后观看、会员专属等），需要提供 cookies 文件：
+    浏览器安装 "Get cookies.txt LOCALLY" 插件 → 访问 youtube.com → 导出 cookies.txt
 
 用法:
+    # 导出点赞视频（收藏夹）
+    python scripts/export_youtube_to_md.py --liked --cookie-file /path/to/cookies.txt
+
+    # 导出稍后观看
+    python scripts/export_youtube_to_md.py --watch-later --cookie-file /path/to/cookies.txt
+
     # 导出频道最新视频
     python scripts/export_youtube_to_md.py --url https://www.youtube.com/@ChannelName
 
@@ -272,6 +279,16 @@ async def main():
         help="YouTube 频道/播放列表/视频 URL（可指定多个）",
     )
     parser.add_argument(
+        "--liked",
+        action="store_true",
+        help="导出点赞视频（需要 --cookie-file）",
+    )
+    parser.add_argument(
+        "--watch-later",
+        action="store_true",
+        help="导出稍后观看（需要 --cookie-file）",
+    )
+    parser.add_argument(
         "--after-date",
         default=_get_env("YOUTUBE_AFTER_DATE"),
         metavar="YYYY-MM-DD",
@@ -314,6 +331,12 @@ async def main():
     )
     args = parser.parse_args()
 
+    # ── 解析 URL 来源 ─────────────────────────────────────────────────────
+    if args.liked:
+        args.url = (args.url or []) + ["https://www.youtube.com/playlist?list=LL"]
+    if args.watch_later:
+        args.url = (args.url or []) + ["https://www.youtube.com/playlist?list=WL"]
+
     if not args.url:
         # 尝试从环境变量读取
         env_urls = _get_env("YOUTUBE_SOURCES")
@@ -324,9 +347,25 @@ async def main():
                 "❌ 未指定 YouTube 来源！\n"
                 "   请通过以下方式提供：\n"
                 "   1. --url https://www.youtube.com/@ChannelName\n"
-                "   2. 在 .env 中设置 YOUTUBE_SOURCES=URL1,URL2"
+                "   2. --liked（导出点赞视频，需要 --cookie-file）\n"
+                "   3. --watch-later（导出稍后观看，需要 --cookie-file）\n"
+                "   4. 在 .env 中设置 YOUTUBE_SOURCES=URL1,URL2"
             )
             sys.exit(1)
+
+    # 点赞/稍后观看需要 cookie
+    private_lists = {"LL", "WL"}
+    needs_cookie = any(
+        any(pl in u for pl in [f"list={p}" for p in private_lists])
+        for u in args.url
+    )
+    if needs_cookie and not args.cookie_file:
+        print(
+            "❌ 点赞视频/稍后观看是私有播放列表，需要提供 --cookie-file\n"
+            "   导出方法：浏览器安装 Get cookies.txt 插件 → 导出 youtube.com cookies\n"
+            "   然后：python scripts/export_youtube_to_md.py --liked --cookie-file /path/to/cookies.txt"
+        )
+        sys.exit(1)
 
     # ── 初始化数据库 ─────────────────────────────────────────────────────
     from app.database import init_db
@@ -373,6 +412,19 @@ async def main():
     if total == 0:
         print("⚠️  未找到任何视频")
         sys.exit(0)
+
+    # ── 展示前 20 条标题预览 ──────────────────────────────────────────────
+    preview_n = min(20, total)
+    print(f"\n📋 前 {preview_n} 个视频标题预览：")
+    for idx, v in enumerate(all_videos[:preview_n], 1):
+        title = v.get("title", "（无标题）")
+        channel = v.get("channel") or v.get("uploader") or ""
+        date = (v.get("upload_date") or "")[:10]
+        channel_str = f"  [{channel}]" if channel else ""
+        date_str = f"  {date}" if date else ""
+        print(f"  {idx:>2}.{channel_str} {title}{date_str}")
+    if total > preview_n:
+        print(f"  ... 共 {total} 个")
 
     # ── 决定导出数量 ──────────────────────────────────────────────────────
     if args.limit > 0 and total > args.limit:

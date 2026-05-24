@@ -423,24 +423,165 @@ class XiaoyuzhouService:
             return None
 
     @staticmethod
+    def _ms_to_timestamp(ms: int) -> str:
+        s = ms // 1000
+        h, rem = divmod(s, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+    @staticmethod
+    def _detect_speaker(text: str, known_speakers: dict, current_label: str) -> str:
+        """
+        检测说话人：
+        1. 文本中含有自我介绍关键词 → 提取姓名/称呼
+        2. 否则沿用当前说话人
+        """
+        patterns = [
+            r'我是([^\s，。！？、,\.]{2,6})(?:[，,。！？\s]|$)',
+            r'大家好[，,]?我是([^\s，。！？、,\.]{2,6})',
+            r'Hello[，,]?\s*(?:大家好[，,]?\s*)?我是([^\s，。！？、,\.]{2,6})',
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                name = m.group(1).strip()
+                # 记录已知说话人
+                if name not in known_speakers.values():
+                    idx = len(known_speakers) + 1
+                    known_speakers[f"S{idx}"] = name
+                return name
+        return current_label
+
+    @staticmethod
+    def _extract_key_dialogues(segments: list[dict], max_items: int = 8) -> list[str]:
+        """
+        从分段中提取关键对话：
+        - 含问句的段落（疑问词 / 问号）
+        - 含观点性词汇的段落（我认为/其实/关键/重要/核心/本质）
+        """
+        key_patterns = re.compile(
+            r'[？?]|为什么|怎么|如何|是否|难道|其实|关键|核心|本质|重要|问题是|我认为|我觉得|值得注意'
+        )
+        results = []
+        for seg in segments:
+            text = seg.get("text", "")
+            if key_patterns.search(text) and len(text) >= 20:
+                ts = seg.get("timestamp", "")
+                label = seg.get("speaker", "")
+                prefix = f"[{ts}] **{label}**: " if ts and label else ""
+                # 截取前120字
+                snippet = text[:120] + ("…" if len(text) > 120 else "")
+                results.append(prefix + snippet)
+            if len(results) >= max_items:
+                break
+        return results
+
+    @staticmethod
     def _parse_transcript_content(raw: str) -> Optional[str]:
-        """解析字幕内容，提取纯文字"""
+        """解析字幕 JSON，返回带说话人标注和时间戳的 Markdown 格式文本"""
+        import json as _json
+        import re as _re
+
         try:
-            import json as _json
             data = _json.loads(raw)
-            # 常见格式：{"utterances": [{"text": "...", "start": 0, ...}]}
-            utterances = data.get("utterances") or data.get("sentences") or data.get("segments") or []
-            if utterances:
-                return " ".join(u.get("text") or u.get("content") or "" for u in utterances if u)
-            # 直接文本
-            if isinstance(data, str):
-                return data
         except Exception:
-            pass
-        # 非 JSON，直接当文本返回
-        if raw and len(raw) > 10:
-            return raw.strip()
-        return None
+            # 非 JSON 直接返回原文
+            return raw.strip() if raw and len(raw) > 10 else None
+
+        # 提取 utterances/sentences 列表，兼容多种字段名
+        utterances = (
+            data.get("utterances")
+            or data.get("sentences")
+            or data.get("segments")
+            or []
+        )
+        if not utterances:
+            text = data.get("text") or data.get("content") or ""
+            return text.strip() if text else None
+
+        # ── 按说话人+长度分段 ──────────────────────────────────────────
+        MAX_CHARS = 300
+        known_speakers: dict = {}
+        current_label = "说话人"
+        current_speaker_id = None
+        segment_text = ""
+        segment_start = 0
+        char_count = 0
+        output_segments: list[dict] = []
+
+        def flush_segment():
+            if segment_text.strip():
+                ts = XiaoyuzhouService._ms_to_timestamp(segment_start)
+                output_segments.append({
+                    "speaker": current_label,
+                    "timestamp": ts,
+                    "text": segment_text.strip(),
+                })
+
+        for utt in utterances:
+            text = utt.get("text") or utt.get("content") or ""
+            if not text:
+                continue
+            start_ms = (
+                utt.get("startTime")
+                or utt.get("start_time")
+                or utt.get("begin_time")
+                or utt.get("start")
+                or 0
+            )
+            spk_id = utt.get("speaker_id") or utt.get("speaker") or utt.get("spk")
+
+            # 说话人切换检测
+            if spk_id is not None and spk_id != current_speaker_id:
+                flush_segment()
+                current_speaker_id = spk_id
+                # 分配标签（S1/S2/...）
+                if spk_id not in known_speakers:
+                    idx = len(known_speakers) + 1
+                    known_speakers[spk_id] = f"说话人{chr(64+idx)}"  # A/B/C...
+                current_label = known_speakers[spk_id]
+                segment_text = ""
+                segment_start = start_ms
+                char_count = 0
+            else:
+                # 无 speaker_id 时用文本自我介绍识别
+                detected = XiaoyuzhouService._detect_speaker(text, {}, current_label)
+                if detected != current_label:
+                    flush_segment()
+                    current_label = detected
+                    segment_text = ""
+                    segment_start = start_ms
+                    char_count = 0
+
+            segment_text += text
+            char_count += len(text)
+
+            # 超过 MAX_CHARS 强制换段
+            if char_count >= MAX_CHARS:
+                flush_segment()
+                segment_text = ""
+                segment_start = start_ms
+                char_count = 0
+
+        flush_segment()
+
+        if not output_segments:
+            return None
+
+        # ── 生成 Markdown ───────────────────────────────────────────────
+        md_lines: list[str] = []
+        for seg in output_segments:
+            md_lines.append(f"\n**{seg['speaker']}** [{seg['timestamp']}]\n")
+            md_lines.append(seg["text"] + "\n")
+
+        # 关键对话区块
+        key_items = XiaoyuzhouService._extract_key_dialogues(output_segments)
+        if key_items:
+            md_lines.append("\n---\n\n### 🔑 关键对话\n")
+            for item in key_items:
+                md_lines.append(f"\n> {item}\n")
+
+        return "".join(md_lines).strip()
 
 
     async def get_episodes_by_api(

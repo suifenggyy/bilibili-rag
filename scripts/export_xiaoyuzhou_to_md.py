@@ -97,6 +97,7 @@ def _build_markdown(ec, source: str) -> str:
     """构建 Markdown 文件内容"""
     source_label = {
         "asr": "ASR 语音转写",
+        "transcript": "官方字幕（说话人分段）",
         "basic_info": "播客基本信息（ASR 未成功）",
     }.get(source, source)
 

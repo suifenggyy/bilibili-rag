@@ -6,6 +6,7 @@ YouTube 服务模块
 """
 import asyncio
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -22,12 +23,30 @@ class YouTubeService:
         "subscriptions": ":ytsubs",
     }
 
-    def __init__(self, cookie_file: Optional[str] = None):
+    def __init__(self, cookie_file: Optional[str] = None, cookie_text: Optional[str] = None):
         """
         Args:
             cookie_file: Netscape 格式 Cookie 文件路径（访问私人列表时需要）
+            cookie_text: Netscape 格式 Cookie 文本内容（会写入临时文件），优先级高于 cookie_file
         """
-        self.cookie_file = cookie_file
+        self._tmp_cookie_file: Optional[tempfile.NamedTemporaryFile] = None
+        if cookie_text and cookie_text.strip():
+            self._tmp_cookie_file = tempfile.NamedTemporaryFile(
+                mode="w", suffix=".txt", prefix="yt_cookies_", delete=False
+            )
+            self._tmp_cookie_file.write(cookie_text)
+            self._tmp_cookie_file.flush()
+            self.cookie_file = self._tmp_cookie_file.name
+            logger.debug(f"[YouTube] Cookie 文本已写入临时文件: {self.cookie_file}")
+        else:
+            self.cookie_file = cookie_file
+
+    def __del__(self):
+        if self._tmp_cookie_file is not None:
+            try:
+                os.unlink(self._tmp_cookie_file.name)
+            except Exception:
+                pass
 
     def _build_ydl_opts(self, download: bool = False, output_path: Optional[str] = None) -> dict:
         opts: dict = {

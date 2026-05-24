@@ -359,11 +359,13 @@ async def main():
         any(pl in u for pl in [f"list={p}" for p in private_lists])
         for u in args.url
     )
-    if needs_cookie and not args.cookie_file:
+    cookie_text = _get_env("YOUTUBE_COOKIES")
+    if needs_cookie and not args.cookie_file and not cookie_text:
         print(
-            "❌ 点赞视频/稍后观看是私有播放列表，需要提供 --cookie-file\n"
-            "   导出方法：浏览器安装 Get cookies.txt 插件 → 导出 youtube.com cookies\n"
-            "   然后：python scripts/export_youtube_to_md.py --liked --cookie-file /path/to/cookies.txt"
+            "❌ 点赞视频/稍后观看是私有播放列表，需要提供 Cookie\n"
+            "   方式一：在 .env 中配置 YOUTUBE_COOKIES=<Netscape 格式 Cookie 文本>\n"
+            "   方式二：浏览器安装 Get cookies.txt 插件 → 导出 cookies.txt\n"
+            "          python scripts/export_youtube_to_md.py --liked --cookie-file /path/to/cookies.txt"
         )
         sys.exit(1)
 
@@ -379,7 +381,8 @@ async def main():
         print(f"⚠️  Cookie 文件不存在：{cookie_file}，将不使用 Cookie")
         cookie_file = None
 
-    yt_service = YouTubeService(cookie_file=cookie_file)
+    # YOUTUBE_COOKIES 文本优先于文件路径
+    yt_service = YouTubeService(cookie_file=cookie_file, cookie_text=cookie_text or None)
 
     # ── 收集视频列表 ──────────────────────────────────────────────────────
     print(f"\n📥 收集视频列表（共 {len(args.url)} 个来源）...", flush=True)

@@ -1,7 +1,7 @@
 """
 小宇宙播客 → Markdown 导出工具
 
-从小宇宙订阅/收件箱/收藏夹中获取单集，优先使用官方字幕，无字幕时通过 ASR 转写，
+从小宇宙收藏夹/收件箱/订阅中获取单集，优先使用官方字幕，无字幕时通过 ASR 转写，
 保存为 Markdown 文件。不依赖 RAG 或向量数据库，独立运行。
 
 【认证方式】
@@ -15,21 +15,21 @@
 Token 登录成功后会自动保存到 .xiaoyuzhou_session.json，下次无需重新登录。
 
 【内容来源】
-默认：收件箱（所有订阅的最新单集合流）
+默认：收藏夹（已登录时）
     python scripts/export_xiaoyuzhou_to_md.py
 
-收藏夹：
-    python scripts/export_xiaoyuzhou_to_md.py --favorites
+收件箱（所有订阅的最新更新）：
+    python scripts/export_xiaoyuzhou_to_md.py --inbox
 
-RSS URL：
+RSS URL（无需登录）：
     python scripts/export_xiaoyuzhou_to_md.py --rss https://feeds.xiaoyuzhoufm.com/podcast/xxx
 
 用法:
-    # 导出收件箱最新单集
+    # 导出收藏夹（默认）
     python scripts/export_xiaoyuzhou_to_md.py
 
-    # 导出收藏夹
-    python scripts/export_xiaoyuzhou_to_md.py --favorites
+    # 导出收件箱
+    python scripts/export_xiaoyuzhou_to_md.py --inbox
 
     # 指定 RSS URL
     python scripts/export_xiaoyuzhou_to_md.py --rss https://feeds.xiaoyuzhoufm.com/podcast/xxx
@@ -358,7 +358,13 @@ async def main():
     parser.add_argument(
         "--favorites",
         action="store_true",
-        help="导出收藏夹内容（而非收件箱/订阅）",
+        default=True,
+        help="导出收藏夹内容（默认）",
+    )
+    parser.add_argument(
+        "--inbox",
+        action="store_true",
+        help="导出收件箱（所有订阅的最新更新）",
     )
     parser.add_argument(
         "--output-dir",
@@ -432,24 +438,25 @@ async def main():
 
         xyz = XiaoyuzhouService(access_token=args.access_token, refresh_token=args.refresh_token)
 
-        print("📋 获取订阅播客列表...", end="", flush=True)
-        try:
-            subscriptions = await xyz.get_subscriptions(limit=200)
-            print(f" ✅ 共 {len(subscriptions)} 个订阅")
-        except Exception as e:
-            print(f" ❌ 失败：{e}")
-            sys.exit(1)
-
-        if not subscriptions and not args.favorites:
-            print("⚠️  订阅列表为空，请通过 --rss 手动指定 RSS URL")
-            sys.exit(0)
+        # 仅 inbox/RSS 模式需要获取订阅列表
+        if args.inbox:
+            print("📋 获取订阅播客列表...", end="", flush=True)
+            try:
+                subscriptions = await xyz.get_subscriptions(limit=200)
+                print(f" ✅ 共 {len(subscriptions)} 个订阅")
+            except Exception as e:
+                print(f" ❌ 失败：{e}")
+                sys.exit(1)
+            if not subscriptions:
+                print("⚠️  订阅列表为空，请通过 --rss 手动指定 RSS URL")
+                sys.exit(0)
 
     # ── 收集单集 ─────────────────────────────────────────────────────────
     print("\n📥 获取单集列表...", flush=True)
     all_episodes: list[tuple[dict, str]] = []
 
-    if xyz.access_token and args.favorites:
-        # ── 收藏夹模式 ──
+    if xyz.access_token and not args.rss and not args.inbox:
+        # ── 收藏夹模式（默认）──
         try:
             fetch_limit = args.limit if args.limit > 0 else 100
             fav_result = await xyz.get_favorites(limit=fetch_limit)
@@ -467,7 +474,7 @@ async def main():
             print(f"   ❌ 收藏夹获取失败: {e}")
             sys.exit(1)
 
-    elif xyz.access_token and subscriptions and not any(s["podcast_id"].startswith("rss_") for s in subscriptions):
+    elif xyz.access_token and args.inbox and subscriptions and not any(s["podcast_id"].startswith("rss_") for s in subscriptions):
         # ── 已登录 → 优先用收件箱合流接口 ──
         try:
             fetch_limit = args.limit if args.limit > 0 else 100
@@ -517,6 +524,17 @@ async def main():
     if total == 0:
         print("⚠️  未找到任何单集")
         sys.exit(0)
+
+    # ── 展示前 20 条标题 ──────────────────────────────────────────────────
+    preview_n = min(20, total)
+    print(f"\n📋 前 {preview_n} 集标题预览：")
+    for idx, (ep, pt) in enumerate(all_episodes[:preview_n], 1):
+        title = ep.get("title", "（无标题）")
+        pub = ep.get("pub_date", "")[:10]
+        date_str = f"  {pub}" if pub else ""
+        print(f"  {idx:>2}. [{pt}] {title}{date_str}")
+    if total > preview_n:
+        print(f"  ... 共 {total} 集")
 
     # ── 决定导出数量 ──────────────────────────────────────────────────────
     if args.limit > 0:

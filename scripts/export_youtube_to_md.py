@@ -343,15 +343,8 @@ async def main():
         if env_urls:
             args.url = [u.strip() for u in env_urls.split(",") if u.strip()]
         else:
-            print(
-                "❌ 未指定 YouTube 来源！\n"
-                "   请通过以下方式提供：\n"
-                "   1. --url https://www.youtube.com/@ChannelName\n"
-                "   2. --liked（导出点赞视频，需要 --cookie-file）\n"
-                "   3. --watch-later（导出稍后观看，需要 --cookie-file）\n"
-                "   4. 在 .env 中设置 YOUTUBE_SOURCES=URL1,URL2"
-            )
-            sys.exit(1)
+            # 默认：导出点赞视频
+            args.url = ["https://www.youtube.com/playlist?list=LL"]
 
     # 点赞/稍后观看需要 cookie
     private_lists = {"LL", "WL"}

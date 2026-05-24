@@ -260,6 +260,60 @@ class XiaoyuzhouService:
 
     # ==================== 单集列表（API）====================
 
+    async def get_inbox_list(
+        self, limit: int = 50, load_more_key: Optional[dict] = None
+    ) -> dict:
+        """
+        获取收件箱单集列表（所有订阅播客的最新单集合流，需要登录）
+
+        Returns:
+            {"episodes": [...], "load_more_key": {...} or None}
+            每个 episode 附带 podcast_title 字段
+        """
+        if not self.access_token:
+            raise RuntimeError("未登录小宇宙，请先调用 login_with_sms()")
+
+        url = f"{self.API_BASE}/v1/inbox/list"
+        body: dict = {}
+        if load_more_key:
+            body["loadMoreKey"] = load_more_key
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=body, headers=self._build_headers())
+
+        if resp.status_code == 401:
+            if await self.refresh_access_token():
+                return await self.get_inbox_list(limit, load_more_key)
+            raise RuntimeError("小宇宙 Token 已过期，请重新登录")
+
+        if resp.status_code != 200:
+            logger.warning(f"[Xiaoyuzhou] 获取收件箱失败: {resp.status_code} {resp.text[:300]}")
+            return {"episodes": [], "load_more_key": None}
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.warning(f"[Xiaoyuzhou] 解析收件箱响应失败: {e}")
+            return {"episodes": [], "load_more_key": None}
+
+        raw_items = data.get("data") or data.get("list") or []
+        episodes = []
+        for item in raw_items:
+            # inbox 条目包含 episode + podcast 两层
+            raw_ep = item.get("episode") or item
+            ep = self._normalize_episode(raw_ep)
+            podcast = item.get("podcast") or {}
+            ep["podcast_title"] = (
+                podcast.get("title") or podcast.get("name") or ""
+            )
+            episodes.append(ep)
+            if limit > 0 and len(episodes) >= limit:
+                break
+
+        next_key = data.get("loadMoreKey") or data.get("nextKey")
+        logger.info(f"[Xiaoyuzhou] 收件箱获取成功，共 {len(episodes)} 集")
+        return {"episodes": episodes, "load_more_key": next_key}
+
     async def get_episodes_by_api(
         self, podcast_id: str, limit: int = 20, load_more_key: Optional[dict] = None
     ) -> dict:

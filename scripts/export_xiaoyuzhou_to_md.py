@@ -431,28 +431,57 @@ async def main():
             sys.exit(0)
 
     # ── 收集单集 ─────────────────────────────────────────────────────────
-    print("\n📥 获取各播客单集列表...", flush=True)
+    print("\n📥 获取单集列表...", flush=True)
     all_episodes: list[tuple[dict, str]] = []
-    for sub in subscriptions:
-        podcast_id = sub.get("podcast_id", "")
-        rss_url = sub.get("rss_url") or ""
-        podcast_title = sub.get("title", podcast_id)
-        episodes: list[dict] = []
+
+    if xyz.access_token and subscriptions and not any(s["podcast_id"].startswith("rss_") for s in subscriptions):
+        # 已登录且是 API 订阅 → 优先用收件箱合流接口（一次获取全部最新）
         try:
-            # 优先用 API（已登录），RSS 作为兜底
-            if xyz.access_token and podcast_id and not podcast_id.startswith("rss_"):
-                result = await xyz.get_episodes_by_api(podcast_id, limit=args.limit or 50)
-                episodes = result.get("episodes", [])
-                # 如果 API 返回结果过少且有 RSS URL，补充 RSS
-                if not episodes and rss_url:
-                    episodes = await xyz.get_episodes_from_rss(rss_url, limit=args.limit or 0)
-            elif rss_url:
-                episodes = await xyz.get_episodes_from_rss(rss_url, limit=args.limit or 0)
-            print(f"   「{podcast_title}」: {len(episodes)} 集")
-            for ep in episodes:
+            fetch_limit = args.limit if args.limit > 0 else 100
+            inbox_result = await xyz.get_inbox_list(limit=fetch_limit)
+            inbox_eps = inbox_result.get("episodes", [])
+            # 分页补充直到够用
+            while inbox_result.get("load_more_key") and (args.limit <= 0 or len(inbox_eps) < args.limit):
+                inbox_result = await xyz.get_inbox_list(
+                    limit=fetch_limit, load_more_key=inbox_result["load_more_key"]
+                )
+                inbox_eps.extend(inbox_result.get("episodes", []))
+            print(f"   收件箱共 {len(inbox_eps)} 集（来自所有订阅）")
+            for ep in inbox_eps:
+                podcast_title = ep.pop("podcast_title", "") or "未知播客"
                 all_episodes.append((ep, podcast_title))
         except Exception as e:
-            print(f"   ⚠️  「{podcast_title}」获取失败: {e}")
+            logger.warning(f"[Xiaoyuzhou] 收件箱获取失败，改用逐播客模式: {e}")
+            inbox_eps = []
+
+        # 如果收件箱为空，回退到逐播客
+        if not all_episodes:
+            print("   收件箱为空，改用逐播客获取...")
+            for sub in subscriptions:
+                podcast_id = sub.get("podcast_id", "")
+                podcast_title = sub.get("title", podcast_id)
+                try:
+                    result = await xyz.get_episodes_by_api(podcast_id, limit=args.limit or 50)
+                    episodes = result.get("episodes", [])
+                    print(f"   「{podcast_title}」: {len(episodes)} 集")
+                    for ep in episodes:
+                        all_episodes.append((ep, podcast_title))
+                except Exception as e:
+                    print(f"   ⚠️  「{podcast_title}」获取失败: {e}")
+    else:
+        # RSS-only 模式（--rss 指定）
+        for sub in subscriptions:
+            rss_url = sub.get("rss_url") or ""
+            podcast_title = sub.get("title", sub.get("podcast_id", ""))
+            if not rss_url:
+                continue
+            try:
+                episodes = await xyz.get_episodes_from_rss(rss_url, limit=args.limit or 0)
+                print(f"   「{podcast_title}」: {len(episodes)} 集")
+                for ep in episodes:
+                    all_episodes.append((ep, podcast_title))
+            except Exception as e:
+                print(f"   ⚠️  「{podcast_title}」获取失败: {e}")
 
     total = len(all_episodes)
     if total == 0:

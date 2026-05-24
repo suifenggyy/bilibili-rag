@@ -421,6 +421,11 @@ async def main():
         default=_get_env("COLLECTION_OUTPUT_DIR", DEFAULT_COLLECTION_OUTPUT_DIR),
         help="输出目录（默认读取 COLLECTION_OUTPUT_DIR）",
     )
+    parser.add_argument(
+        "--after-date",
+        default=_get_env("EXPORT_AFTER_DATE", "2026-01-01"),
+        help="只导出该日期（含）之后保存的书签，格式 YYYY-MM-DD（默认 2026-01-01；留空则不限制）",
+    )
     args = parser.parse_args()
 
     # ── 参数校验 ─────────────────────────────────────────────────────
@@ -499,6 +504,25 @@ async def main():
         print("⚠️  未找到任何书签")
         await svc.close()
         sys.exit(0)
+
+    # ── 按保存时间过滤 ────────────────────────────────────────────────
+    if args.after_date and args.after_date.strip():
+        try:
+            after_ts = int(datetime.strptime(args.after_date.strip(), "%Y-%m-%d").timestamp())
+            before = len(all_bookmarks)
+            all_bookmarks = [(bm, ft) for bm, ft in all_bookmarks if (bm.get("time") or 0) >= after_ts]
+            filtered = before - len(all_bookmarks)
+            if filtered:
+                print(f"🗓️  日期过滤：跳过 {filtered} 篇 {args.after_date} 前的书签（剩余 {len(all_bookmarks)} 篇）")
+        except ValueError:
+            print(f"⚠️  --after-date 格式无效: {args.after_date}，将导出全部书签")
+
+    if len(all_bookmarks) == 0:
+        print("⚠️  过滤后无可导出书签")
+        await svc.close()
+        sys.exit(0)
+
+    total = len(all_bookmarks)  # 更新为过滤后数量
 
     # ── 展示前 20 条标题预览 ──────────────────────────────────────────
     preview_n = min(20, total)

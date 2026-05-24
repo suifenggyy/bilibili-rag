@@ -135,6 +135,7 @@ def _build_markdown(vc, asr_text: str, source: str) -> str:
     # Render comments as a separate section (stored in vc.comments_section)
     comments_section = getattr(vc, "comments_section", "")
     if comments_section and comments_section.strip():
+        lines.append("")
         lines.append(comments_section.strip())
 
     lines += [
@@ -432,6 +433,11 @@ async def main():
         default=int(_get_env("ASR_CONCURRENCY", "2")),
         help="并发处理数（默认读取 ASR_CONCURRENCY，默认值 2）",
     )
+    parser.add_argument(
+        "--after-date",
+        default=_get_env("EXPORT_AFTER_DATE", "2026-01-01"),
+        help="只导出该日期（含）之后收藏的视频，格式 YYYY-MM-DD（默认 2026-01-01；留空则不限制）",
+    )
     args = parser.parse_args()
 
     # ── 参数校验 ─────────────────────────────────────────────────────────
@@ -501,18 +507,36 @@ async def main():
         total = len(all_videos)
         print(f"✅ 共找到 {total} 个收藏视频（耗时 {elapsed:.1f}s）")
 
+        # ── 按收藏时间过滤 ───────────────────────────────────────────────
+        after_ts: Optional[int] = None
+        if args.after_date and args.after_date.strip():
+            try:
+                after_ts = int(datetime.strptime(args.after_date.strip(), "%Y-%m-%d").timestamp())
+                before = len(all_videos)
+                all_videos = [v for v in all_videos if (v.get("create_time") or 0) >= after_ts]
+                filtered = before - len(all_videos)
+                if filtered:
+                    print(f"🗓️  日期过滤：跳过 {filtered} 个 {args.after_date} 前的视频（剩余 {len(all_videos)} 个）")
+            except ValueError:
+                print(f"⚠️  --after-date 格式无效: {args.after_date}，将导出全部视频")
+
         if total == 0:
             print("⚠️  收藏夹为空，无视频可导出")
             sys.exit(0)
 
+        if len(all_videos) == 0:
+            print("⚠️  过滤后无可导出视频")
+            sys.exit(0)
+
         # ── 决定要处理的视频范围 ─────────────────────────────────────────
+        filtered_total = len(all_videos)
         if args.limit > 0:
             selected = all_videos[:args.limit]
-            print(f"📌 限制导出最新 {args.limit} 个（共 {total} 个）")
+            print(f"📌 限制导出最新 {args.limit} 个（共 {filtered_total} 个）")
         elif args.all:
             selected = all_videos
         else:
-            limit = await interactive_select_limit(total)
+            limit = await interactive_select_limit(filtered_total)
             selected = all_videos[:limit]
             print(f"📌 将导出最新 {len(selected)} 个视频")
 

@@ -210,6 +210,12 @@ async def _build_asr_service(args):
     return asr
 
 
+def _is_token_error(exc: Exception) -> bool:
+    """判断异常是否是 Token 失效/过期引起的。"""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in ("token", "过期", "失效", "登录", "auth", "401", "unauthorized"))
+
+
 async def interactive_login() -> Optional[dict]:
     """交互式短信登录，返回 {access_token, refresh_token}"""
     from app.services.xiaoyuzhou import XiaoyuzhouService
@@ -427,15 +433,12 @@ async def main():
                 print("🔐 使用已保存的 Token 登录")
 
         if not args.access_token:
-            print(
-                "❌ 未提供小宇宙 Token！\n"
-                "   请通过以下方式之一认证：\n"
-                "   1. 在 .env 中设置 XIAOYUZHOU_ACCESS_TOKEN\n"
-                "   2. 运行 python scripts/export_xiaoyuzhou_to_md.py --login\n"
-                "   3. 传入 --access-token <token>\n"
-                "   4. 使用 --rss <url> 直接指定 RSS URL（无需登录）"
-            )
-            sys.exit(1)
+            print("🔑 未找到有效 Token，需要先登录")
+            result = await interactive_login()
+            if not result:
+                sys.exit(1)
+            args.access_token = result["access_token"]
+            args.refresh_token = result.get("refresh_token", "")
 
         xyz = XiaoyuzhouService(access_token=args.access_token, refresh_token=args.refresh_token)
 
@@ -446,8 +449,24 @@ async def main():
                 subscriptions = await xyz.get_subscriptions(limit=200)
                 print(f" ✅ 共 {len(subscriptions)} 个订阅")
             except Exception as e:
-                print(f" ❌ 失败：{e}")
-                sys.exit(1)
+                if _is_token_error(e):
+                    print(f" ❌ Token 失效，需要重新登录")
+                    result = await interactive_login()
+                    if not result:
+                        sys.exit(1)
+                    xyz = XiaoyuzhouService(
+                        access_token=result["access_token"],
+                        refresh_token=result.get("refresh_token", ""),
+                    )
+                    try:
+                        subscriptions = await xyz.get_subscriptions(limit=200)
+                        print(f" ✅ 共 {len(subscriptions)} 个订阅")
+                    except Exception as e2:
+                        print(f" ❌ 失败：{e2}")
+                        sys.exit(1)
+                else:
+                    print(f" ❌ 失败：{e}")
+                    sys.exit(1)
             if not subscriptions:
                 print("⚠️  订阅列表为空，请通过 --rss 手动指定 RSS URL")
                 sys.exit(0)
@@ -472,8 +491,33 @@ async def main():
                 podcast_title = ep.pop("podcast_title", "") or "未知播客"
                 all_episodes.append((ep, podcast_title))
         except Exception as e:
-            print(f"   ❌ 收藏夹获取失败: {e}")
-            sys.exit(1)
+            if _is_token_error(e):
+                print(f"   ❌ Token 失效，需要重新登录")
+                result = await interactive_login()
+                if not result:
+                    sys.exit(1)
+                xyz = XiaoyuzhouService(
+                    access_token=result["access_token"],
+                    refresh_token=result.get("refresh_token", ""),
+                )
+                try:
+                    fav_result = await xyz.get_favorites(limit=fetch_limit)
+                    fav_eps = fav_result.get("episodes", [])
+                    while fav_result.get("load_more_key") and (args.limit <= 0 or len(fav_eps) < args.limit):
+                        fav_result = await xyz.get_favorites(
+                            limit=fetch_limit, load_more_key=fav_result["load_more_key"]
+                        )
+                        fav_eps.extend(fav_result.get("episodes", []))
+                    print(f"   ⭐ 收藏夹共 {len(fav_eps)} 集")
+                    for ep in fav_eps:
+                        podcast_title = ep.pop("podcast_title", "") or "未知播客"
+                        all_episodes.append((ep, podcast_title))
+                except Exception as e2:
+                    print(f"   ❌ 收藏夹获取失败: {e2}")
+                    sys.exit(1)
+            else:
+                print(f"   ❌ 收藏夹获取失败: {e}")
+                sys.exit(1)
 
     elif xyz.access_token and args.inbox and subscriptions and not any(s["podcast_id"].startswith("rss_") for s in subscriptions):
         # ── 已登录 → 优先用收件箱合流接口 ──

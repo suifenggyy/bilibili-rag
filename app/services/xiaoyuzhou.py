@@ -35,6 +35,7 @@ class XiaoyuzhouService:
         self.access_token = access_token
         self.refresh_token = refresh_token
         self._device_id: Optional[str] = None
+        self._favorites_url: Optional[str] = None  # 缓存有效的收藏夹端点
 
     # ==================== 设备 ID ====================
 
@@ -326,12 +327,14 @@ class XiaoyuzhouService:
         if not self.access_token:
             raise RuntimeError("未登录小宇宙，请先调用 login_with_sms()")
 
-        # 尝试已知收藏夹端点
-        candidates = [
-            f"{self.API_BASE}/v1/starred-episode/list",
-            f"{self.API_BASE}/v1/favorite/list",
-            f"{self.API_BASE}/v1/collect/list",
-        ]
+        # 优先使用已探测到的有效端点，避免每次分页重试
+        candidates = (
+            [self._favorites_url] if self._favorites_url else [
+                f"{self.API_BASE}/v1/starred-episode/list",
+                f"{self.API_BASE}/v1/favorite/list",
+                f"{self.API_BASE}/v1/collect/list",
+            ]
+        )
         body: dict = {}
         if load_more_key:
             body["loadMoreKey"] = load_more_key
@@ -344,6 +347,9 @@ class XiaoyuzhouService:
                         return await self.get_favorites(limit, load_more_key)
                     raise RuntimeError("小宇宙 Token 已过期，请重新登录")
                 if resp.status_code == 200:
+                    if self._favorites_url != url:
+                        self._favorites_url = url
+                        logger.info(f"[Xiaoyuzhou] 收藏夹端点: {url}")
                     break
                 logger.debug(f"[Xiaoyuzhou] 收藏夹端点 {url} 返回 {resp.status_code}，尝试下一个")
             else:

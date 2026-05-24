@@ -109,6 +109,8 @@ class YouTubeService:
             "quiet": True,
             "no_warnings": True,
             "extract_flat": not download,
+            # EJS remote component 解决 YouTube n-challenge（格式解密）
+            "remote_components": ["ejs:github"],
         }
         # 配置 JS 运行时（yt-dlp 2026+ 需要 JS 解密格式 URL）
         js_runtime = _detect_js_runtime()

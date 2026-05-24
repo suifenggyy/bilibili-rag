@@ -246,12 +246,16 @@ class ArticleFetcher:
         # 递归搜索包含正文 HTML 的字段
         BODY_KEYS = ("body", "content", "articleBody", "text", "html", "richText")
         TITLE_KEYS = ("title", "headline", "name")
+        # 独立图片字段（封面 / 图片列表）
+        IMAGE_KEYS = ("image", "images", "cover", "coverImage", "thumbnail", "banner",
+                      "featuredImage", "pic", "picUrl", "imgUrl")
         found_body: str = ""
         found_title: str = ""
+        found_images: list[str] = []
 
         def _search(obj, depth: int = 0) -> None:
             nonlocal found_body, found_title
-            if depth > 8 or (found_body and found_title):
+            if depth > 8:
                 return
             if isinstance(obj, dict):
                 for k, v in obj.items():
@@ -259,6 +263,19 @@ class ArticleFetcher:
                         found_title = v
                     if not found_body and k in BODY_KEYS and isinstance(v, str) and len(v) > 200:
                         found_body = v
+                    # 收集独立图片 URL
+                    if k in IMAGE_KEYS:
+                        if isinstance(v, str) and v.startswith("http"):
+                            found_images.append(v)
+                        elif isinstance(v, list):
+                            for img in v:
+                                if isinstance(img, str) and img.startswith("http"):
+                                    found_images.append(img)
+                                elif isinstance(img, dict):
+                                    for url_key in ("url", "src", "href", "path"):
+                                        if url_key in img and isinstance(img[url_key], str):
+                                            found_images.append(img[url_key])
+                                            break
                     _search(v, depth + 1)
             elif isinstance(obj, list):
                 for item in obj:
@@ -269,7 +286,7 @@ class ArticleFetcher:
         if not found_body:
             return "", ""
 
-        # 将 HTML 转换为纯文本（先用 trafilatura，回退到简单标签剥离）
+        # 将 HTML 转换为 Markdown（trafilatura，含行内图片；回退到简单标签剥离）
         try:
             import trafilatura
             text = trafilatura.extract(
@@ -278,12 +295,19 @@ class ArticleFetcher:
                 include_comments=False,
                 include_tables=True,
                 include_links=True,
+                include_images=True,
                 favor_precision=False,
             ) or ""
         except Exception:
             # 简单 tag 剥离回退
             text = re.sub(r"<[^>]+>", " ", found_body)
             text = re.sub(r"\s+", " ", text).strip()
+
+        # 追加封面/独立图片（去重，排除已出现在 body 文本中的 URL）
+        extra_imgs = [u for u in dict.fromkeys(found_images) if u not in text]
+        if extra_imgs:
+            img_md = "\n".join(f"![]({u})" for u in extra_imgs)
+            text = f"{text}\n\n{img_md}" if text else img_md
 
         return text, found_title
 

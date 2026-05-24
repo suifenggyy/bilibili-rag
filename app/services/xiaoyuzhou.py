@@ -60,7 +60,7 @@ class XiaoyuzhouService:
 
     async def send_sms_code(self, phone: str) -> bool:
         """发送短信验证码"""
-        url = f"{self.PODCASTER_BASE}/v1/auth/send-sms"
+        url = f"{self.PODCASTER_BASE}/v1/auth/send-code"
         body = {"areaCode": "+86", "mobilePhoneNumber": phone}
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(url, json=body, headers=self._build_headers())

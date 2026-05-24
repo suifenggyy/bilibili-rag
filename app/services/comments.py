@@ -101,18 +101,7 @@ async def fetch_douyin_comments(
     """
     获取抖音视频热门评论（需要有效 Cookie）。
 
-    Uses BogusManager from the Evil0ctal submodule to sign the request URL,
-    but overrides the Cookie with the user's runtime cookie instead of the
-    config.yaml hardcoded value.
-
-    Args:
-        aweme_id: 抖音视频 aweme_id
-        cookie:   用户登录 Cookie 字符串；为空时直接返回 []
-        limit:    最多返回评论数，默认 20
-
-    Returns:
-        [{"author": str, "content": str, "likes": int}, ...]
-        抓取失败时返回空列表
+    直接使用 httpx 请求，绕过 BaseCrawler，完整打印请求/响应用于调试。
     """
     if not cookie:
         logger.info(
@@ -123,17 +112,12 @@ async def fetch_douyin_comments(
     logger.info(f"[Comments] 开始获取抖音热门评论 aweme_id={aweme_id}，最多 {limit} 条")
 
     try:
-        import yaml  # noqa: PLC0415 — intentionally deferred
+        import yaml  # noqa: PLC0415
 
-        from crawlers.base_crawler import BaseCrawler  # noqa: PLC0415
         from crawlers.douyin.web.endpoints import DouyinAPIEndpoints  # noqa: PLC0415
         from crawlers.douyin.web.models import PostComments  # noqa: PLC0415
         from crawlers.douyin.web.utils import BogusManager  # noqa: PLC0415
 
-        logger.debug(f"[Comments] 子模块导入成功，构建请求参数 aweme_id={aweme_id}")
-
-        # Read stable header fields (User-Agent / Referer / Accept-Language)
-        # from submodule config.yaml, but override Cookie with the user's value.
         _config_path = (
             _SUBMODULE_ROOT / "crawlers" / "douyin" / "web" / "config.yaml"
         )
@@ -145,9 +129,8 @@ async def fetch_douyin_comments(
             "Accept-Language": douyin_cfg["headers"]["Accept-Language"],
             "User-Agent": douyin_cfg["headers"]["User-Agent"],
             "Referer": douyin_cfg["headers"]["Referer"],
-            "Cookie": cookie,  # Use user's runtime cookie, not config.yaml's
+            "Cookie": cookie,
         }
-        # Only include non-empty proxy entries; empty strings cause httpx errors
         proxy_http = douyin_cfg["proxies"].get("http") or ""
         proxy_https = douyin_cfg["proxies"].get("https") or ""
         proxies = {}
@@ -157,34 +140,64 @@ async def fetch_douyin_comments(
             proxies["https://"] = proxy_https
 
         params = PostComments(aweme_id=aweme_id, cursor=0, count=limit)
-        logger.debug(f"[Comments] 生成 X-Bogus 签名 aweme_id={aweme_id}")
         endpoint = BogusManager.xb_model_2_endpoint(
             DouyinAPIEndpoints.POST_COMMENT,
             params.dict(),
             headers["User-Agent"],
         )
-        logger.debug(f"[Comments] 请求端点生成成功 aweme_id={aweme_id}: {endpoint[:80]}...")
 
-        base_crawler = BaseCrawler(proxies=proxies, crawler_headers=headers)
-        async with base_crawler as crawler:
-            response = await crawler.fetch_get_json(endpoint)
+        # Log full request details (mask most of the cookie for privacy)
+        cookie_preview = cookie[:20] + "..." if len(cookie) > 20 else cookie
+        logger.info(
+            f"[Comments] 接口: POST_COMMENT = {DouyinAPIEndpoints.POST_COMMENT}\n"
+            f"  Cookie（前20字符）: {cookie_preview}\n"
+            f"  User-Agent: {headers['User-Agent'][:60]}\n"
+            f"  完整请求 URL: {endpoint}"
+        )
 
-        if not response:
-            logger.warning(f"[Comments] 抖音评论接口返回空响应 aweme_id={aweme_id}")
+        async with httpx.AsyncClient(
+            timeout=20.0,
+            follow_redirects=True,
+            headers=headers,
+            proxies=proxies or None,
+        ) as client:
+            resp = await client.get(endpoint)
+
+        logger.info(
+            f"[Comments] 响应状态码: {resp.status_code}，"
+            f"Content-Type: {resp.headers.get('content-type', '未知')}，"
+            f"响应长度: {len(resp.content)} 字节"
+        )
+        logger.info(
+            f"[Comments] 响应正文（前500字符）: {resp.text[:500]}"
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"[Comments] HTTP 错误 status={resp.status_code} aweme_id={aweme_id}")
             return []
 
-        # status_code 0 or missing both indicate success
-        status = response.get("status_code")
+        if not resp.text.strip():
+            logger.warning(f"[Comments] 响应正文为空 aweme_id={aweme_id}（Cookie 可能已失效或被风控）")
+            return []
+
+        try:
+            data = resp.json()
+        except Exception as json_err:
+            logger.warning(f"[Comments] JSON 解析失败 aweme_id={aweme_id}: {json_err}，原始: {resp.text[:200]}")
+            return []
+
+        # status_code 0 or missing = success
+        status = data.get("status_code")
         if status not in (0, None):
             logger.warning(
-                f"[Comments] 抖音评论接口返回非零状态码 status={status} aweme_id={aweme_id}，"
-                f"响应 keys={list(response.keys())[:5]}"
+                f"[Comments] API 返回非零状态 status_code={status} aweme_id={aweme_id}，"
+                f"响应 keys={list(data.keys())[:8]}"
             )
             return []
 
-        comment_list = response.get("comments") or []
+        comment_list = data.get("comments") or []
         logger.info(
-            f"[Comments] 抖音评论接口响应成功 aweme_id={aweme_id}，原始评论数={len(comment_list)}"
+            f"[Comments] API 成功 aweme_id={aweme_id}，返回 {len(comment_list)} 条评论"
         )
         result: list[dict] = []
         for c in comment_list[:limit]:
@@ -196,7 +209,7 @@ async def fetch_douyin_comments(
                 result.append({"author": author, "content": content, "likes": likes})
 
         logger.info(
-            f"[Comments] 获取抖音热门评论完成 aweme_id={aweme_id}: {len(result)} 条有效评论"
+            f"[Comments] 获取完成 aweme_id={aweme_id}: {len(result)} 条有效评论"
         )
         return result
 

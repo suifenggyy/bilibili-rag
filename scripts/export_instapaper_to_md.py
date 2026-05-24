@@ -168,6 +168,81 @@ async def ensure_logged_in(
 
 # ==================== 导出核心 ====================
 
+async def _export_single_bookmark(
+    svc,
+    fetcher,
+    bookmark: dict,
+    folder_title: str,
+    output_dir: Path,
+    idx: int = 0,
+    total: int = 0,
+) -> tuple[int, int]:
+    """处理单条书签，返回 (success, failed)。"""
+    from app.services.article_fetcher import ArticleFetcher
+
+    bm_id = str(bookmark.get("bookmark_id", ""))
+    title = bookmark.get("title") or bookmark.get("url", "未知标题")
+    url = bookmark.get("url", "")
+    safe_title = _safe_filename(title)
+    md_path = output_dir / f"{safe_title}_{bm_id}.md"
+    _proc_svc = ProcessingStatusService()
+    pos = f"[{idx:3d}/{total}] " if idx and total else ""
+
+    already_done = False
+    try:
+        async with get_db_context() as db:
+            proc_rec = await _proc_svc.get_or_create(db, "instapaper", bm_id, title)
+            await db.commit()
+            already_done = _proc_svc.is_completed(proc_rec)
+    except Exception as _db_err:
+        logger.debug(f"DB 状态检查失败（跳过）: {_db_err}")
+
+    if already_done and md_path.exists():
+        print(f"   {pos}⏭️  已完成，跳过：{title[:50]}")
+        return 1, 0
+
+    if md_path.exists() and not already_done:
+        print(f"   {pos}⏭️  已存在，跳过：{title[:50]}")
+        return 1, 0
+
+    print(f"   {pos}🔄 {title[:55]}", end="", flush=True)
+
+    try:
+        content = await fetcher.fetch_content(url, title)
+        md_text = ArticleFetcher.build_markdown(bookmark, content)
+        md_path.write_text(md_text, encoding="utf-8")
+
+        source_label = "✅ trafilatura" if content["source"] == "trafilatura" else "⚠️ 仅基本信息"
+        print(f"  → {source_label}")
+
+        try:
+            async with get_db_context() as db:
+                rec = await _proc_svc.get_or_create(db, "instapaper", bm_id, title)
+                corrected = content.get("content") or content.get("text") or ""
+                if corrected:
+                    await _proc_svc.mark_correction_done(db, rec, corrected)
+                await _proc_svc.mark_completed(db, rec)
+                await db.commit()
+        except Exception as _db_err:
+            logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
+
+        await asyncio.sleep(0.2)
+        return 1, 0
+
+    except Exception as e:
+        logger.error(f"处理失败 [{bm_id}]: {e}")
+        print(f"  → ❌ {e}")
+        try:
+            async with get_db_context() as db:
+                rec = await _proc_svc.get_or_create(db, "instapaper", bm_id, title)
+                await _proc_svc.mark_failed(db, rec, "correction", str(e))
+                await db.commit()
+        except Exception as _db_err:
+            logger.debug(f"DB 失败状态写入失败（不影响导出）: {_db_err}")
+        await asyncio.sleep(0.2)
+        return 0, 1
+
+
 async def export_folder(
     svc,
     fetcher,
@@ -321,8 +396,8 @@ async def main():
     parser.add_argument(
         "--folders",
         nargs="+",
-        default=["starred"],
-        help="要导出的文件夹 ID（默认: starred）。可多选：--folders unread starred archive",
+        default=["unread"],
+        help="要导出的文件夹 ID（默认: unread）。可多选：--folders unread starred archive",
     )
     parser.add_argument(
         "--list-folders",
@@ -334,7 +409,12 @@ async def main():
         "--limit",
         type=int,
         default=0,
-        help="每个文件夹最多导出条数（0=全部）",
+        help="每个文件夹最多导出条数（0=不限制，触发交互选择）",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="导出所有书签（不弹出交互选择）",
     )
     parser.add_argument(
         "--output-dir",
@@ -396,15 +476,80 @@ async def main():
     except Exception:
         pass
 
-    # ── 开始导出 ──────────────────────────────────────────────────────
-    print(f"\n🚀 开始导出 {len(args.folders)} 个文件夹 → {output_dir.resolve()}")
-    total_success, total_failed = 0, 0
+    # ── 收集所有书签（预览阶段，先抓 front 20） ───────────────────────
+    print(f"\n📥 获取书签列表（共 {len(args.folders)} 个文件夹）...", flush=True)
+    all_bookmarks: list[tuple[dict, str]] = []  # (bookmark, folder_title)
 
     try:
         for folder_id in args.folders:
             folder_title = folder_name_map.get(folder_id, folder_id)
-            s, f = await export_folder(
-                svc, fetcher, folder_id, folder_title, output_dir, args.limit
+            print(f"   📁 {folder_title}...", end="", flush=True)
+            try:
+                bms = await svc.get_all_bookmarks(folder_id)
+                print(f" ✅ {len(bms)} 篇")
+                for bm in bms:
+                    all_bookmarks.append((bm, folder_title))
+            except Exception as e:
+                print(f" ❌ 失败: {e}")
+    finally:
+        pass  # svc closed later
+
+    total = len(all_bookmarks)
+    if total == 0:
+        print("⚠️  未找到任何书签")
+        await svc.close()
+        sys.exit(0)
+
+    # ── 展示前 20 条标题预览 ──────────────────────────────────────────
+    preview_n = min(20, total)
+    print(f"\n📋 前 {preview_n} 条标题预览：")
+    for idx, (bm, ft) in enumerate(all_bookmarks[:preview_n], 1):
+        title = bm.get("title") or bm.get("url", "（无标题）")
+        print(f"  {idx:>2}. [{ft}] {title}")
+    if total > preview_n:
+        print(f"  ... 共 {total} 篇")
+
+    # ── 决定导出数量 ──────────────────────────────────────────────────
+    if args.limit > 0:
+        all_bookmarks = all_bookmarks[:args.limit]
+        print(f"\n📌 限制导出最新 {args.limit} 篇（共 {total} 篇）")
+    elif args.all:
+        print(f"\n📌 导出全部 {total} 篇")
+    else:
+        print(f"\n📦 共找到 {total} 篇书签")
+        print("  [1] 最新 20 篇\n  [2] 最新 50 篇\n  [3] 全部\n  [4] 自定义")
+        while True:
+            raw = input("请选择 [1/2/3/4]：").strip()
+            if raw == "1":
+                all_bookmarks = all_bookmarks[:20]
+                break
+            if raw == "2":
+                all_bookmarks = all_bookmarks[:50]
+                break
+            if raw == "3":
+                break
+            if raw == "4":
+                try:
+                    n = int(input(f"请输入数量（1~{total}）：").strip())
+                    if 1 <= n <= total:
+                        all_bookmarks = all_bookmarks[:n]
+                        break
+                    print(f"  ⚠️  请输入 1~{total} 之间的数字")
+                except ValueError:
+                    print("  ⚠️  请输入有效数字")
+            else:
+                print("  ⚠️  请输入 1、2、3 或 4")
+
+    export_total = len(all_bookmarks)
+    print(f"\n🚀 开始导出 {export_total} 篇 → {output_dir.resolve()}")
+
+    # ── 开始导出 ──────────────────────────────────────────────────────
+    total_success, total_failed = 0, 0
+
+    try:
+        for i, (bm, folder_title) in enumerate(all_bookmarks, 1):
+            s, f = await _export_single_bookmark(
+                svc, fetcher, bm, folder_title, output_dir, idx=i, total=export_total
             )
             total_success += s
             total_failed += f

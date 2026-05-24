@@ -132,6 +132,11 @@ def _build_markdown(vc, asr_text: str, source: str) -> str:
     else:
         lines.append("_（未获取到有效内容）_")
 
+    # Render comments as a separate section (stored in vc.comments_section)
+    comments_section = getattr(vc, "comments_section", "")
+    if comments_section and comments_section.strip():
+        lines.append(comments_section.strip())
+
     lines += [
         "",
         "---",
@@ -200,32 +205,47 @@ async def _build_asr_service(args):
 
 
 async def export_videos(
-    douyin,
     fetcher,
     videos: list,
     output_dir: Path,
+    cookie: str = "",
+    concurrency: int = 2,
 ) -> tuple[int, int]:
     """
-    批量处理并导出视频到 Markdown 文件。
+    批量并发处理并导出视频到 Markdown 文件。
+
+    Args:
+        fetcher:     DouyinContentFetcher 实例（应已携带 cookie）
+        videos:      原始视频 dict 列表
+        output_dir:  输出目录
+        cookie:      抖音 Cookie（用于已完成视频的快速评论补充）
+        concurrency: 并发度（限制同时进行 DashScope/ASR 调用数）
 
     Returns:
         (成功数, 失败数)
     """
     from app.services.douyin import DouyinService
+    from app.services.comments import fetch_douyin_comments, format_comments_section
 
-    success, failed = 0, 0
+    success_count = 0
+    failed_count = 0
     total = len(videos)
     _proc_svc = ProcessingStatusService()
+    sem = asyncio.Semaphore(concurrency)
+    # Lock to safely update shared counters
+    counter_lock = asyncio.Lock()
 
-    for i, raw_video in enumerate(videos, 1):
+    async def _process_one(i: int, raw_video: dict) -> None:
+        nonlocal success_count, failed_count
+
         video_info = DouyinService.parse_video_info(raw_video)
         aweme_id = video_info["aweme_id"]
         title = video_info["title"]
-
         safe_title = _safe_filename(title)
         md_path = output_dir / f"{safe_title}_{aweme_id}.md"
 
-        # 检查 DB 状态
+        # Check DB completion status
+        proc_rec = None
         already_done = False
         try:
             async with get_db_context() as db:
@@ -235,26 +255,53 @@ async def export_videos(
         except Exception as _db_err:
             logger.debug(f"DB 状态检查失败（跳过）: {_db_err}")
 
+        # Fast-path: already completed, check if comments need to be added
         if already_done and md_path.exists():
-            print(f"  [{i:3d}/{total}] ⏭️  已完成，跳过：{title[:50]}")
-            success += 1
-            continue
+            md_text = md_path.read_text(encoding="utf-8")
+            needs_comments = cookie.strip() and "## 热门评论" not in md_text
+            if not needs_comments:
+                print(f"  [{i:3d}/{total}] ⏭️  已完成，跳过：{title[:50]}")
+                async with counter_lock:
+                    success_count += 1
+                return
 
-        if md_path.exists() and not already_done:
-            print(f"  [{i:3d}/{total}] ⏭️  已存在，跳过：{title[:50]}")
-            success += 1
-            continue
+            # Use cached corrected text — only fetch comments, no re-ASR
+            if proc_rec and proc_rec.corrected_text:
+                print(f"  [{i:3d}/{total}] 💬 补充评论（无需重新转写）：{title[:50]}", flush=True)
+                comments = await fetch_douyin_comments(aweme_id, cookie)
+                if comments:
+                    cs = format_comments_section(comments)
+                    md_path.write_text(
+                        md_text.rstrip() + "\n\n" + cs.strip() + "\n", encoding="utf-8"
+                    )
+                    print(f"       ✅ 评论已补充（{len(comments)} 条）")
+                else:
+                    print(f"       ℹ️  无评论数据（接口未返回，可能无评论或 Cookie 权限不足）")
+                async with counter_lock:
+                    success_count += 1
+                return
 
-        print(f"  [{i:3d}/{total}] 🔄 处理中：{title[:55]}", end="", flush=True)
+            print(f"  [{i:3d}/{total}] 🔄 无缓存文本，重新处理：{title[:50]}", flush=True)
 
+        elif md_path.exists():
+            # File exists but not marked complete in DB — let it re-process
+            print(f"  [{i:3d}/{total}] 🔄 重新处理（DB 未标记完成）：{title[:50]}", flush=True)
+
+        else:
+            print(f"  [{i:3d}/{total}] 🔄 处理中：{title[:50]}", flush=True)
+
+        # Full processing: download + ASR + comments (via fetcher.cookie)
         try:
-            vc = await fetcher.fetch_content(video_info)
+            async with sem:
+                vc = await fetcher.fetch_content(video_info)
+
             md_content = _build_markdown(vc, vc.content, vc.content_source)
             md_path.write_text(md_content, encoding="utf-8")
 
+            has_comments = bool(getattr(vc, "comments_section", ""))
             status = "ASR ✅" if vc.content_source == "asr" else "仅基本信息 ⚠️"
-            print(f"  → {status}")
-            success += 1
+            comment_tag = f" 💬{len(vc.comments_section.splitlines())-2}条评论" if has_comments else " (无评论)"
+            print(f"       → {status}{comment_tag}")
 
             try:
                 async with get_db_context() as db:
@@ -270,21 +317,24 @@ async def export_videos(
             except Exception as _db_err:
                 logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
 
+            async with counter_lock:
+                success_count += 1
+
         except Exception as e:
             logger.error(f"处理视频失败 [{aweme_id}]: {e}")
-            print(f"  → ❌ 失败: {e}")
-            failed += 1
+            print(f"       ❌ 失败: {e}")
             try:
                 async with get_db_context() as db:
                     rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
                     await _proc_svc.mark_failed(db, rec, "asr", str(e))
                     await db.commit()
             except Exception as _db_err:
-                logger.debug(f"DB 失败状态写入失败（不影响导出）: {_db_err}")
+                logger.debug(f"DB 失败状态写入失败: {_db_err}")
+            async with counter_lock:
+                failed_count += 1
 
-        await asyncio.sleep(0.3)
-
-    return success, failed
+    await asyncio.gather(*[_process_one(i, v) for i, v in enumerate(videos, 1)])
+    return success_count, failed_count
 
 
 async def interactive_select_limit(total: int) -> int:
@@ -376,6 +426,12 @@ async def main():
         default=_get_env("OLLAMA_ASR_LANGUAGE", "zh"),
         help="转写语言提示（默认: zh，留空则自动检测）",
     )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=int(_get_env("ASR_CONCURRENCY", "2")),
+        help="并发处理数（默认读取 ASR_CONCURRENCY，默认值 2）",
+    )
     args = parser.parse_args()
 
     # ── 参数校验 ─────────────────────────────────────────────────────────
@@ -424,7 +480,12 @@ async def main():
         print(" ✅")
 
     asr = await _build_asr_service(args)
-    fetcher = DouyinContentFetcher(asr_service=asr, storage_manager=storage_manager)
+    fetcher = DouyinContentFetcher(
+        asr_service=asr,
+        storage_manager=storage_manager,
+        cookie=args.cookie,   # ← pass cookie so comments are fetched
+    )
+    print(f"🔀 并发度：{args.concurrency}（可通过 --concurrency 或 ASR_CONCURRENCY 配置）")
 
     try:
         # ── 获取收藏夹视频列表 ───────────────────────────────────────────
@@ -457,7 +518,13 @@ async def main():
 
         # ── 开始导出 ─────────────────────────────────────────────────────
         print(f"\n🚀 开始导出 {len(selected)} 个视频 → {output_dir.resolve()}\n")
-        s, f = await export_videos(douyin, fetcher, selected, output_dir)
+        s, f = await export_videos(
+            fetcher,
+            selected,
+            output_dir,
+            cookie=args.cookie,
+            concurrency=args.concurrency,
+        )
 
         print(f"\n{'='*60}")
         print(f"✅ 导出完成！成功：{s} 个，失败：{f} 个")

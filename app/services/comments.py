@@ -115,10 +115,12 @@ async def fetch_douyin_comments(
         抓取失败时返回空列表
     """
     if not cookie:
-        logger.debug(
-            f"[Comments] 无抖音 Cookie，跳过评论抓取 aweme_id={aweme_id}"
+        logger.info(
+            f"[Comments] 未配置抖音 Cookie，跳过评论抓取 aweme_id={aweme_id}"
         )
         return []
+
+    logger.info(f"[Comments] 开始获取抖音热门评论 aweme_id={aweme_id}，最多 {limit} 条")
 
     try:
         import yaml  # noqa: PLC0415 — intentionally deferred
@@ -127,6 +129,8 @@ async def fetch_douyin_comments(
         from crawlers.douyin.web.endpoints import DouyinAPIEndpoints  # noqa: PLC0415
         from crawlers.douyin.web.models import PostComments  # noqa: PLC0415
         from crawlers.douyin.web.utils import BogusManager  # noqa: PLC0415
+
+        logger.debug(f"[Comments] 子模块导入成功，构建请求参数 aweme_id={aweme_id}")
 
         # Read stable header fields (User-Agent / Referer / Accept-Language)
         # from submodule config.yaml, but override Cookie with the user's value.
@@ -149,28 +153,35 @@ async def fetch_douyin_comments(
         }
 
         params = PostComments(aweme_id=aweme_id, cursor=0, count=limit)
+        logger.debug(f"[Comments] 生成 X-Bogus 签名 aweme_id={aweme_id}")
         endpoint = BogusManager.xb_model_2_endpoint(
             DouyinAPIEndpoints.POST_COMMENT,
             params.dict(),
             headers["User-Agent"],
         )
+        logger.debug(f"[Comments] 请求端点生成成功 aweme_id={aweme_id}: {endpoint[:80]}...")
 
         base_crawler = BaseCrawler(proxies=proxies, crawler_headers=headers)
         async with base_crawler as crawler:
             response = await crawler.fetch_get_json(endpoint)
 
         if not response:
+            logger.warning(f"[Comments] 抖音评论接口返回空响应 aweme_id={aweme_id}")
             return []
 
         # status_code 0 or missing both indicate success
         status = response.get("status_code")
         if status not in (0, None):
-            logger.debug(
-                f"[Comments] 抖音评论接口返回非零状态 {status} aweme_id={aweme_id}"
+            logger.warning(
+                f"[Comments] 抖音评论接口返回非零状态码 status={status} aweme_id={aweme_id}，"
+                f"响应 keys={list(response.keys())[:5]}"
             )
             return []
 
         comment_list = response.get("comments") or []
+        logger.info(
+            f"[Comments] 抖音评论接口响应成功 aweme_id={aweme_id}，原始评论数={len(comment_list)}"
+        )
         result: list[dict] = []
         for c in comment_list[:limit]:
             user = c.get("user") or {}
@@ -181,10 +192,12 @@ async def fetch_douyin_comments(
                 result.append({"author": author, "content": content, "likes": likes})
 
         logger.info(
-            f"[Comments] 获取抖音热门评论 aweme_id={aweme_id}: {len(result)} 条"
+            f"[Comments] 获取抖音热门评论完成 aweme_id={aweme_id}: {len(result)} 条有效评论"
         )
         return result
 
     except Exception as e:
-        logger.warning(f"[Comments] 获取抖音评论失败 aweme_id={aweme_id}: {e}")
+        logger.warning(
+            f"[Comments] 获取抖音评论失败 aweme_id={aweme_id}: {type(e).__name__}: {e}"
+        )
         return []

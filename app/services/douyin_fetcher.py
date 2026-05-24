@@ -38,6 +38,7 @@ class DouyinVideoContent:
     content_source: str = "basic_info"  # "asr" | "basic_info"
     summary_block: str = ""
     asr_raw_text: str = ""  # 纠错前的原始 ASR 文本，供重试使用
+    comments_section: str = ""  # 格式化后的热门评论 Markdown 块，单独存储
 
 
 class DouyinContentFetcher:
@@ -134,13 +135,27 @@ class DouyinContentFetcher:
                     self.storage_manager.write_work_text("douyin", title, "asr_corrected.txt", base.content.strip())
                     base.content_source = "asr"
 
-                    # Append top-20 hot comments (best-effort, non-blocking)
+                    # Fetch top-20 hot comments (best-effort, non-blocking)
                     if self.cookie:
+                        logger.info(f"[DouyinFetcher] 正在获取热门评论 aweme_id={aweme_id}...")
                         comments = await fetch_douyin_comments(aweme_id, self.cookie)
                         if comments:
-                            base.content += format_comments_section(comments)
+                            base.comments_section = format_comments_section(comments)
+                            logger.info(
+                                f"[DouyinFetcher] 评论获取成功 aweme_id={aweme_id}: {len(comments)} 条"
+                            )
+                        else:
+                            logger.info(
+                                f"[DouyinFetcher] 未获取到评论（可能需要有效 Cookie 或视频无评论）aweme_id={aweme_id}"
+                            )
+                    else:
+                        logger.info(f"[DouyinFetcher] 未配置 Cookie，跳过评论抓取 aweme_id={aweme_id}")
 
-                    base.summary_block = await self._summarize_content(aweme_id, base.content)
+                    # Combine ASR content and comments for summarization context
+                    summary_input = base.content
+                    if base.comments_section:
+                        summary_input += base.comments_section
+                    base.summary_block = await self._summarize_content(aweme_id, summary_input)
                     return base
 
             except Exception as e:

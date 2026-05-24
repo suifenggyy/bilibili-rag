@@ -224,7 +224,10 @@ def _build_markdown(vc, source: str) -> str:
         lines.append(vc.content.strip())
     else:
         lines.append("_（未获取到有效内容）_")
-    lines += ["", "---", f"", f"_导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"]
+    comments_section = getattr(vc, "comments_section", "")
+    if comments_section and comments_section.strip():
+        lines.append(comments_section.strip())
+    lines += ["", "---", "", f"_导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"]
     return "\n".join(lines)
 
 

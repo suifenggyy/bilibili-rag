@@ -1,0 +1,215 @@
+"""
+YouTube 服务模块
+
+使用 yt-dlp 提取视频元数据和下载音频。
+支持单视频、播放列表、频道，以及登录用户的点赞/稍后观看列表（需 Cookie）。
+"""
+import asyncio
+import os
+from pathlib import Path
+from typing import Optional
+
+from loguru import logger
+
+
+class YouTubeService:
+    """YouTube 内容服务（yt-dlp 封装）"""
+
+    # yt-dlp 虚拟 URL：需要 Cookie 才能访问
+    PRIVATE_URLS = {
+        "liked": ":ytfav",
+        "watch_later": ":ytwatchlater",
+        "subscriptions": ":ytsubs",
+    }
+
+    def __init__(self, cookie_file: Optional[str] = None):
+        """
+        Args:
+            cookie_file: Netscape 格式 Cookie 文件路径（访问私人列表时需要）
+        """
+        self.cookie_file = cookie_file
+
+    def _build_ydl_opts(self, download: bool = False, output_path: Optional[str] = None) -> dict:
+        opts: dict = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": not download,
+        }
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            opts["cookiefile"] = self.cookie_file
+        if download and output_path:
+            opts["outtmpl"] = output_path
+            opts["format"] = "bestaudio/best"
+            # 速率限制 ~2MB/s，防止被封
+            opts["ratelimit"] = 2_000_000
+        return opts
+
+    # ==================== 公共方法 ====================
+
+    async def extract_video_info(self, url: str) -> Optional[dict]:
+        """提取单个视频元数据（不下载）"""
+        try:
+            info = await asyncio.to_thread(self._extract_info_sync, url, False)
+            return self._normalize_info(info)
+        except Exception as e:
+            logger.warning(f"[YouTube] 提取视频信息失败 [{url}]: {e}")
+            return None
+
+    async def extract_playlist_videos(self, url: str, after_date: Optional[str] = None) -> list[dict]:
+        """
+        提取播放列表 / 频道 / 私人列表中的视频列表（不下载内容）
+
+        Args:
+            url: 播放列表 URL 或私人列表虚拟 URL（如 ':ytfav'）
+            after_date: 'YYYY-MM-DD' 格式，仅返回该日期之后上传的视频
+
+        Returns:
+            list of normalized video info dicts
+        """
+        try:
+            info = await asyncio.to_thread(self._extract_playlist_sync, url)
+            entries = info.get("entries") or []
+            results = []
+            # after_date filter: upload_date is 'YYYYMMDD' string in yt-dlp entries
+            after_yyyymmdd: Optional[str] = None
+            if after_date:
+                try:
+                    after_yyyymmdd = after_date.replace("-", "")  # "2024-01-15" → "20240115"
+                except Exception:
+                    pass
+            for entry in entries:
+                if not entry:
+                    continue
+                if after_yyyymmdd:
+                    upload_date = entry.get("upload_date") or ""
+                    if upload_date and upload_date < after_yyyymmdd:
+                        continue
+                results.append(self._normalize_info(entry))
+            logger.info(f"[YouTube] 提取列表完成：url={url}，共 {len(results)} 个视频（after_date={after_date}）")
+            return results
+        except Exception as e:
+            logger.warning(f"[YouTube] 提取列表失败 [{url}]: {e}")
+            return []
+
+    async def download_audio(self, url: str, dest_path: str) -> bool:
+        """
+        下载视频最佳音频到本地文件
+
+        Args:
+            url: 视频 URL
+            dest_path: 目标文件路径（yt-dlp 会自动追加扩展名）
+
+        Returns:
+            是否成功
+        """
+        try:
+            result = await asyncio.to_thread(
+                self._download_audio_sync, url, dest_path
+            )
+            return result
+        except Exception as e:
+            logger.warning(f"[YouTube] 音频下载失败 [{url}]: {e}")
+            return False
+
+    def get_private_url(self, list_type: str) -> Optional[str]:
+        """获取私人列表的 yt-dlp 虚拟 URL"""
+        return self.PRIVATE_URLS.get(list_type)
+
+    # ==================== 同步内部方法 ====================
+
+    def _extract_info_sync(self, url: str, download: bool) -> dict:
+        try:
+            import yt_dlp
+        except ImportError:
+            raise RuntimeError("未安装 yt-dlp，无法提取 YouTube 信息")
+
+        opts = self._build_ydl_opts(download=download)
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=download)
+
+    def _extract_playlist_sync(self, url: str) -> dict:
+        try:
+            import yt_dlp
+        except ImportError:
+            raise RuntimeError("未安装 yt-dlp，无法提取 YouTube 信息")
+
+        opts = self._build_ydl_opts(download=False)
+        opts["extract_flat"] = True  # 只列出条目，不深度解析
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    def _download_audio_sync(self, url: str, dest_path: str) -> bool:
+        try:
+            import yt_dlp
+        except ImportError:
+            raise RuntimeError("未安装 yt-dlp，无法下载 YouTube 音频")
+
+        target = Path(dest_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        opts = self._build_ydl_opts(download=True, output_path=str(target))
+        opts["extract_flat"] = False
+
+        version = "unknown"
+        try:
+            version = getattr(getattr(yt_dlp, "version", None), "__version__", "unknown")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+
+            # yt-dlp 可能追加扩展名，查找实际输出文件
+            actual = self._find_downloaded_file(target)
+            if actual and actual.exists() and actual.stat().st_size > 10 * 1024:
+                logger.info(
+                    f"[YouTube] yt-dlp({version}) 下载成功: "
+                    f"file={actual.name}, size={actual.stat().st_size // 1024}KB"
+                )
+                return True
+
+            logger.warning(f"[YouTube] yt-dlp({version}) 下载结果不存在或过小: {target}")
+            return False
+        except Exception as e:
+            logger.warning(f"[YouTube] yt-dlp({version}) 下载失败 [{url}]: {e}")
+            return False
+
+    # ==================== 工具方法 ====================
+
+    @staticmethod
+    def _find_downloaded_file(base_path: Path) -> Optional[Path]:
+        """查找 yt-dlp 实际输出的文件（可能追加了扩展名）"""
+        if base_path.exists():
+            return base_path
+        # 尝试常见音频扩展名
+        for ext in (".webm", ".m4a", ".mp3", ".opus", ".ogg", ".wav"):
+            candidate = base_path.with_suffix(ext)
+            if candidate.exists():
+                return candidate
+        # 通配符匹配
+        parent = base_path.parent
+        stem = base_path.stem
+        for f in parent.glob(f"{stem}*"):
+            if f.is_file():
+                return f
+        return None
+
+    @staticmethod
+    def _normalize_info(info: Optional[dict]) -> dict:
+        """将 yt-dlp 原始 info 规范化为统一字段"""
+        if not info:
+            return {}
+        video_id = info.get("id") or ""
+        title = info.get("title") or info.get("fulltitle") or video_id
+        webpage_url = info.get("webpage_url") or info.get("url") or ""
+        if video_id and not webpage_url:
+            webpage_url = f"https://www.youtube.com/watch?v={video_id}"
+        return {
+            "video_id": video_id,
+            "title": title,
+            "url": webpage_url,
+            "description": (info.get("description") or "")[:2000],
+            "duration": info.get("duration"),       # 秒
+            "channel": info.get("uploader") or info.get("channel") or "",
+            "channel_id": info.get("channel_id") or info.get("uploader_id") or "",
+            "thumbnail": info.get("thumbnail") or "",
+            "upload_date": info.get("upload_date") or "",  # YYYYMMDD
+            "view_count": info.get("view_count"),
+        }

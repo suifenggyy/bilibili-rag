@@ -78,6 +78,9 @@ class BuildStatus(BaseModel):
     total_videos: int
     processed_videos: int
     message: str
+    logs: list[str] = []
+
+    model_config = {"extra": "ignore"}
 
 
 class UploadCookieRequest(BaseModel):
@@ -295,6 +298,7 @@ async def build_knowledge(
         "total_videos": 0,
         "processed_videos": 0,
         "message": "",
+        "logs": [],
     }
 
     # 保存 Cookie 到临时文件供 yt-dlp 使用
@@ -335,13 +339,24 @@ async def _run_build(
     task = _build_tasks[task_id]
     task["status"] = "running"
 
+    def _log(msg: str) -> None:
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%H:%M:%S")
+        entry = f"[{ts}] {msg}"
+        logger.info(f"[YouTube] {msg}")
+        task["logs"].append(entry)
+        if len(task["logs"]) > 200:
+            task["logs"] = task["logs"][-200:]
+
     try:
+        _log(f"开始构建 YouTube 知识库，ASR 后端: {asr_backend}")
         yt_service = YouTubeService(cookie_file=cookie_file)
         asr = create_asr_service(asr_backend)
         fetcher = YouTubeContentFetcher(asr_service=asr, youtube_service=yt_service)
         rag = get_rag_service()
 
         # 收集所有视频
+        _log("收集视频列表...")
         all_videos: list[dict] = []
         for source in sources:
             source_type = source["source_type"]
@@ -359,10 +374,12 @@ async def _run_build(
                     all_videos.extend(videos)
             except Exception as e:
                 logger.warning(f"[YouTube] 来源 {source_url} 提取失败: {e}")
+                _log(f"⚠️ 来源 {source_url[:50]} 提取失败: {str(e)[:60]}")
 
         total = len(all_videos)
         task["total_videos"] = total
         task["current_step"] = f"共 {total} 个视频，开始处理"
+        _log(f"共找到 {total} 个视频，开始处理...")
 
         for i, video_info in enumerate(all_videos):
             video_id = video_info.get("video_id", "")
@@ -377,10 +394,15 @@ async def _run_build(
                     await db.commit()
                 if _proc_svc.is_completed(proc_rec):
                     task["processed_videos"] += 1
+                    _log(f"[{i+1}/{total}] ⏭ 已完成，跳过：{title[:40]}")
                     continue
 
+                _log(f"[{i+1}/{total}] 🔊 ASR 转写中：{title[:50]}")
+                task["message"] = f"[{i+1}/{total}] 转写: {title[:30]}..."
                 # 获取内容（ASR）
                 content = await fetcher.fetch_content(video_info)
+                source_label = "ASR ✅" if content.content_source == "asr" else "基本信息 ⚠️"
+                _log(f"[{i+1}/{total}] ✅ 完成（{source_label}）：{title[:40]}")
 
                 async with get_db_context() as db:
                     result = await db.execute(
@@ -436,6 +458,7 @@ async def _run_build(
                     logger.warning(f"[YouTube] 处理状态记录失败（非关键）[{video_id}]: {_e}")
 
             except Exception as e:
+                _log(f"[{i+1}/{total}] ❌ 失败：{title[:40]} — {str(e)[:80]}")
                 logger.error(f"[YouTube] 处理视频失败 [{video_id}]: {e}")
                 try:
                     async with get_db_context() as db_err:
@@ -451,9 +474,11 @@ async def _run_build(
         task["progress"] = 100
         task["current_step"] = "完成"
         task["message"] = f"成功处理 {task['processed_videos']} 个视频"
+        _log(f"🎉 任务完成，共处理 {task['processed_videos']} 个视频")
 
     except Exception as e:
         logger.error(f"[YouTube] 构建任务失败 [{task_id}]: {e}")
+        _log(f"❌ 任务失败: {str(e)[:100]}")
         task["status"] = "failed"
         task["message"] = str(e)
         task["current_step"] = "失败"

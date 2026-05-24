@@ -6,7 +6,10 @@ import {
   InstapaperExportRequest,
   InstapaperExportJobStatus,
   instapaperExportApi,
+  settingsApi,
 } from "@/lib/api";
+
+const INSTAPAPER_SESSION_KEY = "instapaper_session_id";
 
 // 内置文件夹（与后端保持一致）
 const BUILTIN_FOLDERS: InstapaperFolder[] = [
@@ -22,6 +25,8 @@ export default function InstapaperExportPanel() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [savedSessionId, setSavedSessionId] = useState<string | null>(null);
+  const [credsSaved, setCredsSaved] = useState(false);
 
   // 文件夹
   const [folders, setFolders] = useState<InstapaperFolder[]>(BUILTIN_FOLDERS);
@@ -38,6 +43,34 @@ export default function InstapaperExportPanel() {
   const [error, setError] = useState<string | null>(null);
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const logRef = useRef<HTMLDivElement | null>(null);
+
+  // 页面挂载时：尝试从 localStorage 恢复凭据
+  useEffect(() => {
+    const sid = localStorage.getItem(INSTAPAPER_SESSION_KEY);
+    if (!sid) return;
+    instapaperExportApi.getSession(sid).then((creds) => {
+      setConsumerKey(creds.consumer_key);
+      setConsumerSecret(creds.consumer_secret);
+      setEmail(creds.email);
+      setPassword(creds.password);
+      setSavedSessionId(sid);
+      setCredsSaved(true);
+    }).catch(() => {
+      localStorage.removeItem(INSTAPAPER_SESSION_KEY);
+    });
+  }, []);
+
+  // 从 .env 预填凭据（若字段为空）
+  useEffect(() => {
+    settingsApi.getPrefill().then((cfg) => {
+      if (cfg.instapaper_consumer_key && !consumerKey) setConsumerKey(cfg.instapaper_consumer_key);
+      if (cfg.instapaper_consumer_secret && !consumerSecret) setConsumerSecret(cfg.instapaper_consumer_secret);
+      if (cfg.instapaper_email && !email) setEmail(cfg.instapaper_email);
+      if (cfg.instapaper_password && !password) setPassword(cfg.instapaper_password);
+    }).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // 轮询任务状态
   useEffect(() => {
@@ -58,12 +91,47 @@ export default function InstapaperExportPanel() {
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [jobId]);
 
+  // 日志自动滚动到底部
+  useEffect(() => {
+    if (logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [jobStatus?.logs?.length]);
+
   const toggleFolder = (folderId: string) => {
     setSelectedFolders(prev => {
       const next = new Set(prev);
-      next.has(folderId) ? next.delete(folderId) : next.add(folderId);
+      if (next.has(folderId)) { next.delete(folderId); } else { next.add(folderId); }
       return next;
     });
+  };
+
+  const saveCredentials = async (sid: string) => {
+    try {
+      await instapaperExportApi.saveSession(sid, {
+        consumer_key: consumerKey,
+        consumer_secret: consumerSecret,
+        email,
+        password,
+      });
+      localStorage.setItem(INSTAPAPER_SESSION_KEY, sid);
+      setSavedSessionId(sid);
+      setCredsSaved(true);
+    } catch { /* non-critical, ignore */ }
+  };
+
+  const handleLogout = async () => {
+    if (savedSessionId) {
+      try { await instapaperExportApi.deleteSession(savedSessionId); } catch { /* ignore */ }
+      localStorage.removeItem(INSTAPAPER_SESSION_KEY);
+    }
+    setSavedSessionId(null);
+    setCredsSaved(false);
+    setConsumerKey("");
+    setConsumerSecret("");
+    setEmail("");
+    setPassword("");
+    setFolders(BUILTIN_FOLDERS);
   };
 
   const handleLoadFolders = async () => {
@@ -76,6 +144,9 @@ export default function InstapaperExportPanel() {
     try {
       const res = await instapaperExportApi.getFolders(consumerKey, consumerSecret, email, password);
       setFolders(res.folders);
+      // Save credentials on first successful verification
+      const sid = savedSessionId || crypto.randomUUID();
+      await saveCredentials(sid);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "加载文件夹失败，请检查凭据";
       setError(msg);
@@ -166,6 +237,18 @@ export default function InstapaperExportPanel() {
         <section className="export-step">
           <div className="export-step-title">
             <span className="step-badge">1</span> API 凭据
+            {credsSaved && (
+              <span style={{ marginLeft: "auto", fontSize: 12, color: "var(--accent)" }}>
+                ✅ 已保存
+                <button
+                  className="btn btn-ghost"
+                  style={{ fontSize: 11, marginLeft: 8, padding: "2px 8px", color: "#ef4444" }}
+                  onClick={handleLogout}
+                >
+                  退出
+                </button>
+              </span>
+            )}
           </div>
 
           <div className="instapaper-hint">
@@ -345,6 +428,27 @@ export default function InstapaperExportPanel() {
                 <div className="progress-current">
                   <span className="current-label">当前：</span>
                   <span className="current-name">{jobStatus.current_article}</span>
+                </div>
+              )}
+
+              {jobStatus.logs && jobStatus.logs.length > 0 && (
+                <div
+                  ref={logRef}
+                  style={{
+                    background: "#0f172a",
+                    borderRadius: 8,
+                    padding: "10px 14px",
+                    maxHeight: 200,
+                    overflowY: "auto",
+                    fontFamily: "monospace",
+                    fontSize: 12,
+                    color: "#94a3b8",
+                    marginTop: 12,
+                  }}
+                >
+                  {jobStatus.logs.slice(-50).map((line, i) => (
+                    <div key={i} style={{ lineHeight: 1.6 }}>{line}</div>
+                  ))}
                 </div>
               )}
 

@@ -292,6 +292,7 @@ class InstapaperWebExportStorageTests(unittest.IsolatedAsyncioTestCase):
                 "file_count": 0,
                 "created_at": datetime.now().isoformat(),
                 "completed_at": None,
+                "logs": [],
             }
 
             fake_service = type("FakeSvc", (), {})()

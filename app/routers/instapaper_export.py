@@ -19,12 +19,16 @@ import zipfile
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import get_db
+from app.models import InstapaperSession
 from app.services.content_storage import ContentStorageManager
 
 router = APIRouter(prefix="/instapaper-export", tags=["Instapaper导出"])
@@ -64,6 +68,74 @@ class InstapaperExportStatus(BaseModel):
     file_count: int
     created_at: str
     completed_at: Optional[str] = None
+    logs: list[str] = []
+
+    model_config = {"extra": "ignore"}
+
+
+class InstapaperCredentials(BaseModel):
+    """保存/恢复 Instapaper 凭据"""
+    consumer_key: str
+    consumer_secret: str
+    email: str
+    password: str
+
+
+# ==================== Session 存储端点 ====================
+
+@router.post("/session/{session_id}", response_model=InstapaperCredentials, status_code=201)
+async def save_instapaper_session(
+    session_id: str,
+    creds: InstapaperCredentials,
+    db: AsyncSession = Depends(get_db),
+):
+    """保存 Instapaper 凭据到数据库（刷新页面后可恢复）。"""
+    row = await db.scalar(
+        select(InstapaperSession).where(InstapaperSession.session_id == session_id)
+    )
+    if row:
+        row.consumer_key = creds.consumer_key
+        row.consumer_secret = creds.consumer_secret
+        row.email = creds.email
+        row.password = creds.password
+    else:
+        row = InstapaperSession(
+            session_id=session_id,
+            consumer_key=creds.consumer_key,
+            consumer_secret=creds.consumer_secret,
+            email=creds.email,
+            password=creds.password,
+        )
+        db.add(row)
+    await db.commit()
+    return creds
+
+
+@router.get("/session/{session_id}", response_model=InstapaperCredentials)
+async def get_instapaper_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    """根据 session_id 恢复已保存的 Instapaper 凭据。"""
+    row = await db.scalar(
+        select(InstapaperSession).where(InstapaperSession.session_id == session_id)
+    )
+    if not row or not row.email:
+        raise HTTPException(status_code=404, detail="凭据不存在")
+    return InstapaperCredentials(
+        consumer_key=row.consumer_key or "",
+        consumer_secret=row.consumer_secret or "",
+        email=row.email or "",
+        password=row.password or "",
+    )
+
+
+@router.delete("/session/{session_id}", status_code=204)
+async def delete_instapaper_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    """删除保存的 Instapaper 凭据（登出）。"""
+    row = await db.scalar(
+        select(InstapaperSession).where(InstapaperSession.session_id == session_id)
+    )
+    if row:
+        await db.delete(row)
+        await db.commit()
 
 
 # ==================== 工具函数 ====================
@@ -87,14 +159,25 @@ async def _run_instapaper_export(job_id: str, req: InstapaperExportRequest):
     storage_manager = ContentStorageManager()
     fetcher = ArticleFetcher(storage_manager=storage_manager)
 
+    def _log(msg: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        entry = f"[{ts}] {msg}"
+        logger.info(f"[InstapaperExport] {msg}")
+        task["logs"].append(entry)
+        if len(task["logs"]) > 200:
+            task["logs"] = task["logs"][-200:]
+
     try:
         task["status"] = "running"
         task["message"] = "正在登录 Instapaper..."
+        _log("登录 Instapaper...")
 
         await svc.login(req.email, req.password)
+        _log("登录成功")
 
         # 获取书签列表（所有选定文件夹）
         task["message"] = "正在获取书签列表..."
+        _log("获取书签列表...")
         all_bookmarks: list[tuple[dict, str]] = []  # (bookmark, folder_title)
 
         # 获取自定义文件夹名称映射
@@ -113,6 +196,7 @@ async def _run_instapaper_export(job_id: str, req: InstapaperExportRequest):
                 folder_title = folder_title_map.get(folder_id, folder_id)
                 for bm in bookmarks:
                     all_bookmarks.append((bm, folder_title))
+                _log(f"文件夹「{folder_title}」: {len(bookmarks)} 篇")
                 logger.info(
                     f"[InstapaperExport] 文件夹 '{folder_title}': {len(bookmarks)} 篇"
                 )
@@ -122,6 +206,7 @@ async def _run_instapaper_export(job_id: str, req: InstapaperExportRequest):
         total = len(all_bookmarks)
         task["total_articles"] = total
         task["message"] = f"共 {total} 篇文章，开始提取正文..."
+        _log(f"共 {total} 篇文章，开始提取正文...")
 
         if total == 0:
             task.update({
@@ -149,20 +234,27 @@ async def _run_instapaper_export(job_id: str, req: InstapaperExportRequest):
                 file_count += 1
                 task["output_files"].append(str(md_path))
                 task["file_count"] = file_count
+                _log(f"[{idx+1}/{total}] ⏭ 已存在，跳过：{title[:40]}")
                 continue
+
+            _log(f"[{idx+1}/{total}] 🌐 抓取正文：{title[:50]}")
+            task["message"] = f"[{idx+1}/{total}] 抓取: {title[:30]}..."
 
             try:
                 content = await fetcher.fetch_content(url, title)
+                source_label = "✅ trafilatura" if content["source"] == "trafilatura" else "⚠️ 基本信息"
                 md_text = ArticleFetcher.build_markdown(bookmark, content)
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(md_text)
                 file_count += 1
                 task["output_files"].append(str(md_path))
+                _log(f"[{idx+1}/{total}] ✅ 完成（{source_label}）：{title[:40]}")
                 logger.info(
                     f"[InstapaperExport] [{idx+1}/{total}] ✅ "
                     f"{title[:40]} ({content['source']})"
                 )
             except Exception as e:
+                _log(f"[{idx+1}/{total}] ❌ 失败：{title[:40]} — {str(e)[:80]}")
                 logger.error(f"[InstapaperExport] [{idx+1}/{total}] ❌ {bm_id}: {e}")
 
             task["file_count"] = file_count
@@ -177,10 +269,12 @@ async def _run_instapaper_export(job_id: str, req: InstapaperExportRequest):
             "message": f"导出完成，共生成 {file_count} 个 Markdown 文件",
             "completed_at": datetime.now().isoformat(),
         })
+        _log(f"🎉 任务完成，共生成 {file_count} 个 Markdown 文件")
         logger.info(f"[InstapaperExport] 任务完成: job_id={job_id}, files={file_count}")
 
     except Exception as e:
         logger.error(f"[InstapaperExport] 任务失败: {job_id}: {e}")
+        _log(f"❌ 任务失败: {str(e)[:100]}")
         task.update({
             "status": "failed",
             "message": f"导出失败: {str(e)}",
@@ -230,6 +324,7 @@ async def start_instapaper_export(
         "message": "任务已创建，等待启动...",
         "file_count": 0,
         "output_files": [],
+        "logs": [],
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
     }

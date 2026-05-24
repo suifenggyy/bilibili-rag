@@ -6,6 +6,8 @@ import {
   Video,
   favoritesApi,
   knowledgeApi,
+  biliCreatorApi,
+  BiliCreator,
   BuildStatus,
   FolderStatus,
   OrganizePreviewResponse,
@@ -26,7 +28,19 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
   const [progress, setProgress] = useState<BuildStatus | null>(null);
   const [statusMap, setStatusMap] = useState<Record<number, FolderStatus>>({});
   const [message, setMessage] = useState<string | null>(null);
+  const [folderNameFilter, setFolderNameFilter] = useState("");
+  const [filterError, setFilterError] = useState<string | null>(null);
   const [organizeOpen, setOrganizeOpen] = useState(false);
+
+  // 创作者管理
+  const [creators, setCreators] = useState<BiliCreator[]>([]);
+  const [creatorUid, setCreatorUid] = useState("");
+  const [creatorNickname, setCreatorNickname] = useState("");
+  const [creatorAfterDate, setCreatorAfterDate] = useState("");
+  const [creatorAdding, setCreatorAdding] = useState(false);
+  const [creatorSyncing, setCreatorSyncing] = useState(false);
+  const [creatorMessage, setCreatorMessage] = useState<string | null>(null);
+  const [showCreators, setShowCreators] = useState(false);
   const [organizeLoading, setOrganizeLoading] = useState(false);
   const [organizePreview, setOrganizePreview] = useState<OrganizePreviewResponse | null>(null);
   const [organizeMessage, setOrganizeMessage] = useState<string | null>(null);
@@ -69,11 +83,63 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
     loadFolders().then(loadStatuses);
   }, [sessionId]);
 
+  // 加载创作者列表
+  const loadCreators = async () => {
+    try {
+      const list = await biliCreatorApi.list(sessionId);
+      setCreators(list);
+    } catch { /* ignore */ }
+  };
+
+  useEffect(() => {
+    loadCreators();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
   // 刷新
   const refresh = async () => {
     setMessage(null);
     await loadFolders();
     await loadStatuses();
+  };
+
+  const handleAddCreator = async () => {
+    const uid = creatorUid.trim();
+    if (!uid) return;
+    setCreatorAdding(true);
+    setCreatorMessage(null);
+    try {
+      await biliCreatorApi.add(sessionId, uid, creatorNickname.trim() || undefined, creatorAfterDate || undefined);
+      setCreatorUid("");
+      setCreatorNickname("");
+      setCreatorAfterDate("");
+      await loadCreators();
+      setCreatorMessage("UP主已添加");
+    } catch (e: unknown) {
+      setCreatorMessage(`添加失败: ${(e as Error).message}`);
+    }
+    setCreatorAdding(false);
+  };
+
+  const handleDeleteCreator = async (id: number) => {
+    try {
+      await biliCreatorApi.delete(sessionId, id);
+      await loadCreators();
+    } catch (e: unknown) {
+      setCreatorMessage(`删除失败: ${(e as Error).message}`);
+    }
+  };
+
+  const handleSyncCreators = async () => {
+    setCreatorSyncing(true);
+    setCreatorMessage(null);
+    try {
+      const res = await biliCreatorApi.sync(sessionId);
+      setCreatorMessage(`同步任务已启动 (${res.task_id.slice(0, 8)}...)`);
+    } catch (e: unknown) {
+      setCreatorMessage(`同步失败: ${(e as Error).message}`);
+    }
+    setCreatorSyncing(false);
   };
 
   const openOrganizePreview = async (folderId: number) => {
@@ -119,6 +185,34 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
     }
   };
 
+  // 按名称过滤收藏夹：验证名称并更新选中集合
+  const applyFolderNameFilter = (filterText: string, currentFolders: typeof folders) => {
+    const names = filterText.split(",").map((n) => n.trim()).filter(Boolean);
+    if (names.length === 0) {
+      setFilterError(null);
+      return;
+    }
+    const missing = names.filter(
+      (name) => !currentFolders.some((f) => f.title.toLowerCase() === name.toLowerCase())
+    );
+    if (missing.length > 0) {
+      setFilterError(`未找到收藏夹：${missing.join("、")}`);
+      return;
+    }
+    setFilterError(null);
+    const matched = currentFolders
+      .filter((f) => names.some((name) => f.title.toLowerCase() === name.toLowerCase()))
+      .map((f) => f.media_id);
+    const s = new Set(matched);
+    setSelected(s);
+    onSelectionChange?.(Array.from(s));
+  };
+
+  const handleFolderNameFilterChange = (value: string) => {
+    setFolderNameFilter(value);
+    applyFolderNameFilter(value, folders);
+  };
+
   // 选择收藏夹
   const toggleSelect = (id: number) => {
     const s = new Set(selected);
@@ -130,6 +224,17 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
   // 构建/更新知识库（统一操作）
   const buildKnowledge = async () => {
     if (selected.size === 0) return;
+    // 若有名称过滤，先验证
+    if (folderNameFilter.trim()) {
+      const names = folderNameFilter.split(",").map((n) => n.trim()).filter(Boolean);
+      const missing = names.filter(
+        (name) => !folders.some((f) => f.title.toLowerCase() === name.toLowerCase())
+      );
+      if (missing.length > 0) {
+        setFilterError(`未找到收藏夹：${missing.join("、")}`);
+        return;
+      }
+    }
     setBuilding(true);
     setMessage(null);
     setProgress(null);
@@ -262,6 +367,88 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
       </div>
 
       <div className="panel-body">
+        {/* 收藏夹名称过滤 */}
+        <div className="mb-3">
+          <input
+            type="text"
+            className="w-full text-sm border border-[var(--border)] rounded px-3 py-1.5 bg-[var(--surface)]"
+            placeholder="指定收藏夹（逗号分隔，留空=显示全部）"
+            value={folderNameFilter}
+            onChange={(e) => handleFolderNameFilterChange(e.target.value)}
+          />
+          {filterError && (
+            <div className="text-xs text-red-400 mt-1">{filterError}</div>
+          )}
+        </div>
+
+        {/* UP主创作者管理 */}
+        <div className="mb-3 border border-[var(--border)] rounded-lg">
+          <button
+            className="w-full flex items-center justify-between px-3 py-2 text-sm font-medium"
+            onClick={() => setShowCreators((v) => !v)}
+          >
+            <span>UP主作品 {creators.length > 0 ? `(${creators.length})` : ""}</span>
+            <span className="text-[var(--muted)] text-xs">{showCreators ? "▲" : "▼"}</span>
+          </button>
+          {showCreators && (
+            <div className="px-3 pb-3 space-y-2">
+              {/* 添加 UP主 */}
+              <div className="space-y-1">
+                <input
+                  type="text"
+                  className="w-full text-xs border border-[var(--border)] rounded px-2 py-1 bg-[var(--surface)]"
+                  placeholder="UP主 UID（数字）"
+                  value={creatorUid}
+                  onChange={(e) => setCreatorUid(e.target.value)}
+                />
+                <input
+                  type="text"
+                  className="w-full text-xs border border-[var(--border)] rounded px-2 py-1 bg-[var(--surface)]"
+                  placeholder="昵称（可选，留空自动获取）"
+                  value={creatorNickname}
+                  onChange={(e) => setCreatorNickname(e.target.value)}
+                />
+                <input
+                  type="date"
+                  className="w-full text-xs border border-[var(--border)] rounded px-2 py-1 bg-[var(--surface)]"
+                  title="仅获取此日期之后发布的视频（留空=全部）"
+                  value={creatorAfterDate}
+                  onChange={(e) => setCreatorAfterDate(e.target.value)}
+                />
+                <button
+                  onClick={handleAddCreator}
+                  disabled={creatorAdding || !creatorUid.trim()}
+                  className="btn btn-primary text-xs w-full"
+                >
+                  {creatorAdding ? "添加中..." : "+ 添加 UP主"}
+                </button>
+              </div>
+              {/* 已添加列表 */}
+              {creators.length > 0 && (
+                <div className="space-y-1">
+                  {creators.map((c) => (
+                    <div key={c.id} className="flex items-center justify-between text-xs p-1.5 rounded bg-[var(--surface-alt,var(--surface))]">
+                      <div className="min-w-0 flex-1">
+                        <div className="font-medium truncate">{c.nickname || c.uid}</div>
+                        <div className="text-[var(--muted)]">UID: {c.uid}{c.after_date ? ` · ${c.after_date}起` : ""}</div>
+                      </div>
+                      <button onClick={() => handleDeleteCreator(c.id)} className="text-[var(--muted)] hover:text-red-400 ml-2">✕</button>
+                    </div>
+                  ))}
+                  <button
+                    onClick={handleSyncCreators}
+                    disabled={creatorSyncing}
+                    className="btn btn-ghost text-xs w-full"
+                  >
+                    {creatorSyncing ? "同步中..." : "同步 UP主作品"}
+                  </button>
+                </div>
+              )}
+              {creatorMessage && <div className="text-xs text-[var(--muted)]">{creatorMessage}</div>}
+            </div>
+          )}
+        </div>
+
         <div className="sources-scroll">
           {loading ? (
             <div className="text-center text-sm text-[var(--muted)] py-6">加载中...</div>
@@ -269,11 +456,15 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
             <div className="text-center text-sm text-[var(--muted)] py-6">暂无收藏夹</div>
           ) : (
             <div className="space-y-2">
-              {folders.map((f) => {
-                const status = getFolderStatus(f.media_id, f.media_count);
-                const lastSync = formatTime(statusMap[f.media_id]?.last_sync_at);
-
-                return (
+              {(() => {
+                const filterNames = folderNameFilter.split(",").map((n) => n.trim()).filter(Boolean);
+                const visibleFolders = filterNames.length > 0
+                  ? folders.filter((f) => filterNames.some((name) => f.title.toLowerCase() === name.toLowerCase()))
+                  : folders;
+                return visibleFolders.map((f) => {
+                  const status = getFolderStatus(f.media_id, f.media_count);
+                  const lastSync = formatTime(statusMap[f.media_id]?.last_sync_at);
+                  return (
                   <div key={f.media_id} className={`folder-card ${selected.has(f.media_id) ? "selected" : ""}`}>
                     <div className="folder-head" onClick={() => toggleExpand(f.media_id)}>
                       <input
@@ -315,8 +506,9 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
                       </div>
                     )}
                   </div>
-                );
-              })}
+                  );
+                });
+              })()}
             </div>
           )}
         </div>
@@ -343,7 +535,7 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
         {/* 主按钮 */}
         <button
           onClick={buildKnowledge}
-          disabled={selected.size === 0 || building}
+          disabled={selected.size === 0 || building || !!filterError}
           className="btn btn-primary w-full"
         >
           {getButtonText()}

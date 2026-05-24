@@ -659,6 +659,113 @@ class BilibiliService:
         
         return "\n".join(texts)
 
+    async def get_creator_info(self, uid: str) -> Dict[str, Any]:
+        """
+        获取 UP主基本信息（用于展示昵称等）
+
+        Args:
+            uid: B站用户 UID
+
+        Returns:
+            {"mid": int, "name": str, "face": str}
+        """
+        params = {"mid": str(uid)}
+        signed = await wbi_signer.sign(params)
+        url = f"{self.BASE_URL}/x/space/wbi/acc/info"
+        response = await self.client.get(url, params=signed, cookies=self._get_cookies())
+        data = response.json()
+        if data.get("code") != 0:
+            raise Exception(f"获取 UP主信息失败: {data.get('message', '未知错误')}")
+        info = data.get("data") or {}
+        return {
+            "mid": info.get("mid"),
+            "name": info.get("name") or str(uid),
+            "face": info.get("face") or "",
+        }
+
+    async def get_creator_videos_page(
+        self, uid: str, pn: int = 1, ps: int = 30
+    ) -> Dict[str, Any]:
+        """
+        获取 UP主投稿视频（一页）
+
+        Returns:
+            {"list": [...], "count": int, "has_more": bool}
+        """
+        params = {
+            "mid": str(uid),
+            "pn": pn,
+            "ps": ps,
+            "order": "pubdate",
+        }
+        signed = await wbi_signer.sign(params)
+        url = f"{self.BASE_URL}/x/space/wbi/arc/search"
+        response = await self.client.get(url, params=signed, cookies=self._get_cookies())
+        data = response.json()
+        if data.get("code") != 0:
+            raise Exception(f"获取 UP主视频失败: {data.get('message', '未知错误')}")
+        page_data = (data.get("data") or {}).get("list") or {}
+        vlist = page_data.get("vlist") or []
+        page_info = (data.get("data") or {}).get("page") or {}
+        count = page_info.get("count") or 0
+        has_more = (pn * ps) < count
+        return {"list": vlist, "count": count, "has_more": has_more}
+
+    async def get_all_creator_videos(
+        self, uid: str, after_date: Optional[str] = None, max_pages: int = 200
+    ) -> List[Dict[str, Any]]:
+        """
+        获取 UP主全部投稿视频，可按发布日期过滤。
+
+        Args:
+            uid: B站用户 UID
+            after_date: 'YYYY-MM-DD' 格式，仅返回此日期之后发布的视频（含当天）
+            max_pages: 最多翻页次数
+
+        Returns:
+            视频列表，每项包含 bvid, title, pubdate(timestamp), desc 等字段
+        """
+        after_ts: Optional[int] = None
+        if after_date:
+            try:
+                from datetime import datetime as dt
+                after_ts = int(dt.strptime(after_date, "%Y-%m-%d").timestamp())
+            except ValueError:
+                logger.warning(f"[Bilibili] 无效的 after_date: {after_date}，将忽略日期过滤")
+
+        all_videos: List[Dict[str, Any]] = []
+        pn = 1
+
+        while pn <= max_pages:
+            logger.debug(f"[Bilibili] 获取 UP主 {uid} 第 {pn} 页视频")
+            try:
+                result = await self.get_creator_videos_page(uid, pn=pn, ps=30)
+            except Exception as e:
+                logger.error(f"[Bilibili] 获取 UP主视频第 {pn} 页失败: {e}")
+                break
+
+            videos = result.get("list") or []
+            if not videos:
+                break
+
+            for v in videos:
+                pubdate = v.get("created") or v.get("pubdate") or 0
+                if after_ts and pubdate < after_ts:
+                    # 按发布时间倒序，一旦遇到早于 after_date 的视频，停止翻页
+                    logger.debug(
+                        f"[Bilibili] UP主 {uid} pubdate={pubdate} < after_ts={after_ts}，停止翻页"
+                    )
+                    return all_videos
+                all_videos.append(v)
+
+            if not result.get("has_more"):
+                break
+
+            pn += 1
+            await asyncio.sleep(0.5)
+
+        return all_videos
+
     async def download_audio_to_file(
         self,
         audio_url: str,

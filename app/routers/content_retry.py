@@ -41,6 +41,8 @@ class ContentProcessingRecordOut(BaseModel):
     has_asr_raw: bool
     has_corrected: bool
     has_summary: bool
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
     @classmethod
     def from_orm(cls, rec: ContentProcessingRecord) -> "ContentProcessingRecordOut":
@@ -54,6 +56,8 @@ class ContentProcessingRecordOut(BaseModel):
             has_asr_raw=bool(rec.asr_raw_text),
             has_corrected=bool(rec.corrected_text),
             has_summary=bool(rec.summary_block),
+            created_at=rec.created_at.isoformat() if rec.created_at else None,
+            updated_at=rec.updated_at.isoformat() if rec.updated_at else None,
         )
 
 
@@ -78,17 +82,45 @@ class RetryResponse(BaseModel):
 async def list_processing_records(
     platform: Optional[str] = None,
     stage: Optional[str] = None,
-    limit: int = 50,
+    q: Optional[str] = None,
+    limit: int = 100,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
 ):
-    """列出处理记录（可按平台/阶段过滤）"""
+    """列出处理记录（可按平台/阶段/标题过滤）"""
     records = await _proc_svc.list_records(db, platform=platform, stage=stage,
-                                            limit=limit, offset=offset)
+                                            title_search=q, limit=limit, offset=offset)
     return ListResponse(
         records=[ContentProcessingRecordOut.from_orm(r) for r in records],
         total=len(records),
     )
+
+
+@router.get("/{platform}/{content_id}/content")
+async def get_content(
+    platform: str,
+    content_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """获取处理记录的文本内容（用于预览 MD 文档）"""
+    result = await db.execute(
+        select(ContentProcessingRecord).where(
+            ContentProcessingRecord.platform == platform,
+            ContentProcessingRecord.content_id == content_id,
+        )
+    )
+    rec = result.scalar_one_or_none()
+    if not rec:
+        raise HTTPException(status_code=404, detail="处理记录不存在")
+    content = rec.corrected_text or rec.asr_raw_text or ""
+    return {
+        "platform": rec.platform,
+        "content_id": rec.content_id,
+        "title": rec.title or content_id,
+        "stage": rec.stage,
+        "content": content,
+        "summary_block": rec.summary_block or "",
+    }
 
 
 @router.post("/{platform}/{content_id}/retry", response_model=RetryResponse)

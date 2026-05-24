@@ -109,6 +109,9 @@ class BuildStatus(BaseModel):
     total_episodes: int
     processed_episodes: int
     message: str
+    logs: list[str] = []
+
+    model_config = {"extra": "ignore"}
 
 
 class SyncSubscriptionsResponse(BaseModel):
@@ -390,6 +393,7 @@ async def build_knowledge(
         "total_episodes": 0,
         "processed_episodes": 0,
         "message": "",
+        "logs": [],
     }
 
     background_tasks.add_task(
@@ -424,13 +428,24 @@ async def _run_build(
     task = _build_tasks[task_id]
     task["status"] = "running"
 
+    def _log(msg: str) -> None:
+        from datetime import datetime as _dt
+        ts = _dt.now().strftime("%H:%M:%S")
+        entry = f"[{ts}] {msg}"
+        logger.info(f"[Xiaoyuzhou] {msg}")
+        task["logs"].append(entry)
+        if len(task["logs"]) > 200:
+            task["logs"] = task["logs"][-200:]
+
     try:
+        _log(f"开始构建小宇宙知识库，ASR 后端: {asr_backend}")
         asr = create_asr_service(asr_backend)
         fetcher = XiaoyuzhouContentFetcher(asr_service=asr)
         rag = get_rag_service()
         xyz = XiaoyuzhouService()
 
         # 收集所有集数
+        _log("收集播客集数列表...")
         all_episodes: list[tuple[dict, str]] = []  # (episode_info, podcast_title)
         for sub in subs:
             rss_url = sub.get("rss_url") or xyz.build_rss_url(sub["podcast_id"])
@@ -438,12 +453,15 @@ async def _run_build(
                 episodes = await xyz.get_episodes_from_rss(rss_url, limit=episode_limit)
                 for ep in episodes:
                     all_episodes.append((ep, sub["title"]))
+                _log(f"「{sub['title']}」: 获取到 {len(episodes)} 集")
             except Exception as e:
                 logger.warning(f"[Xiaoyuzhou] 获取集数失败 [{sub['podcast_id']}]: {e}")
+                _log(f"⚠️ 获取「{sub['title']}」集数失败: {str(e)[:60]}")
 
         total = len(all_episodes)
         task["total_episodes"] = total
         task["current_step"] = f"共 {total} 集，开始处理"
+        _log(f"共 {total} 集，开始处理...")
 
         for i, (ep, podcast_title) in enumerate(all_episodes):
             episode_id = ep.get("episode_id", "")
@@ -459,9 +477,14 @@ async def _run_build(
                     await db.commit()
                 if _proc_svc.is_completed(proc_rec):
                     task["processed_episodes"] += 1
+                    _log(f"[{i+1}/{total}] ⏭ 已完成，跳过：{ep_title[:40]}")
                     continue
 
+                _log(f"[{i+1}/{total}] 🔊 ASR 转写中：{ep_title[:50]}")
+                task["message"] = f"[{i+1}/{total}] 转写: {ep_title[:30]}..."
                 content = await fetcher.fetch_content(ep, podcast_title=podcast_title)
+                source_label = "ASR ✅" if content.content_source == "asr" else "基本信息 ⚠️"
+                _log(f"[{i+1}/{total}] ✅ 完成（{source_label}）：{ep_title[:40]}")
 
                 async with get_db_context() as db:
                     result = await db.execute(
@@ -518,6 +541,7 @@ async def _run_build(
                     logger.warning(f"[Xiaoyuzhou] 处理状态记录失败（非关键）[{episode_id}]: {_e}")
 
             except Exception as e:
+                _log(f"[{i+1}/{total}] ❌ 失败：{ep_title[:40]} — {str(e)[:80]}")
                 logger.error(f"[Xiaoyuzhou] 处理集数失败 [{episode_id}]: {e}")
                 try:
                     async with get_db_context() as db_err:
@@ -533,9 +557,11 @@ async def _run_build(
         task["progress"] = 100
         task["current_step"] = "完成"
         task["message"] = f"成功处理 {task['processed_episodes']} 集"
+        _log(f"🎉 任务完成，共处理 {task['processed_episodes']} 集")
 
     except Exception as e:
         logger.error(f"[Xiaoyuzhou] 构建任务失败 [{task_id}]: {e}")
+        _log(f"❌ 任务失败: {str(e)[:100]}")
         task["status"] = "failed"
         task["message"] = str(e)
         task["current_step"] = "失败"

@@ -170,6 +170,9 @@ class DouyinExportStatus(BaseModel):
     file_count: int
     created_at: str
     completed_at: Optional[str] = None
+    logs: list[str] = []
+
+    model_config = {"extra": "ignore"}
 
 
 # ==================== 工具函数 ====================
@@ -253,9 +256,18 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
         storage_manager=storage_manager,
     )
 
+    def _log(msg: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        entry = f"[{ts}] {msg}"
+        logger.info(f"[DouyinExport] {msg}")
+        task["logs"].append(entry)
+        if len(task["logs"]) > 200:
+            task["logs"] = task["logs"][-200:]
+
     try:
         task["status"] = "running"
         task["message"] = "正在获取收藏夹视频列表..."
+        _log("开始获取抖音收藏夹视频列表...")
 
         # 获取所有收藏视频
         all_videos = await douyin.get_all_collection_videos()
@@ -265,6 +277,7 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
         total = len(all_videos)
         task["total_videos"] = total
         task["message"] = f"共 {total} 个视频，开始转写..."
+        _log(f"获取到 {total} 个视频，开始处理...")
 
         if total == 0:
             task.update({
@@ -296,6 +309,7 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                     file_count += 1
                     task["output_files"].append(str(md_path))
                     task["file_count"] = file_count
+                    _log(f"[{idx+1}/{total}] ⏭ 已完成，跳过：{title[:40]}")
                     continue
 
             md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
@@ -304,19 +318,22 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                 file_count += 1
                 task["output_files"].append(str(md_path))
                 task["file_count"] = file_count
+                _log(f"[{idx+1}/{total}] ⏭ 文件已存在，跳过：{title[:40]}")
                 continue
 
+            _log(f"[{idx+1}/{total}] 🔄 开始处理：{title[:50]}")
+            task["message"] = f"[{idx+1}/{total}] 🔊 转写中: {title[:30]}..."
+
             try:
+                _log(f"[{idx+1}/{total}] 🎵 下载音频并进行 ASR 转写...")
                 vc = await fetcher.fetch_content(video_info)
+                source_label = "ASR ✅" if vc.content_source == "asr" else "基本信息 ⚠️"
+                _log(f"[{idx+1}/{total}] ✅ 转写完成（{source_label}）：{title[:40]}")
                 md_content = _build_markdown(vc, vc.content_source)
                 with open(md_path, "w", encoding="utf-8") as f:
                     f.write(md_content)
                 file_count += 1
                 task["output_files"].append(str(md_path))
-                logger.info(
-                    f"[DouyinExport] [{idx+1}/{total}] ✅ "
-                    f"{title[:40]} ({vc.content_source})"
-                )
                 # Track processing stages
                 try:
                     async with get_db_context() as db:
@@ -331,6 +348,7 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                 except Exception as _e:
                     logger.warning(f"[DouyinExport] 处理状态记录失败（非关键）[{aweme_id}]: {_e}")
             except Exception as e:
+                _log(f"[{idx+1}/{total}] ❌ 失败：{title[:40]} — {str(e)[:80]}")
                 logger.error(f"[DouyinExport] [{idx+1}/{total}] ❌ {aweme_id}: {e}")
 
             task["file_count"] = file_count
@@ -345,10 +363,12 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
             "message": f"导出完成，共生成 {file_count} 个 Markdown 文件",
             "completed_at": datetime.now().isoformat(),
         })
+        _log(f"🎉 任务完成，共生成 {file_count} 个 Markdown 文件")
         logger.info(f"[DouyinExport] 任务完成: job_id={job_id}, files={file_count}")
 
     except Exception as e:
         logger.error(f"[DouyinExport] 任务失败: job_id={job_id}, error={e}")
+        _log(f"❌ 任务失败: {str(e)[:100]}")
         task.update({
             "status": "failed",
             "message": f"导出失败: {str(e)}",
@@ -415,6 +435,7 @@ async def start_douyin_export(req: DouyinExportRequest, background_tasks: Backgr
         "message": "任务已创建，等待启动...",
         "file_count": 0,
         "output_files": [],
+        "logs": [],
         "created_at": datetime.now().isoformat(),
         "completed_at": None,
     }

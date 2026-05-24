@@ -382,6 +382,7 @@ export interface DouyinExportJobStatus {
     file_count: number;
     created_at: string;
     completed_at?: string;
+    logs?: string[];
 }
 
 export const douyinExportApi = {
@@ -454,6 +455,7 @@ export interface InstapaperExportJobStatus {
     file_count: number;
     created_at: string;
     completed_at?: string;
+    logs?: string[];
 }
 
 export const instapaperExportApi = {
@@ -527,6 +529,7 @@ export interface YoutubeBuildStatus {
     total_videos: number;
     processed_videos: number;
     message: string;
+    logs?: string[];
 }
 
 export const youtubeApi = {
@@ -615,6 +618,7 @@ export interface XiaoyuzhouBuildStatus {
     total_episodes: number;
     processed_episodes: number;
     message: string;
+    logs?: string[];
 }
 
 export const xiaoyuzhouApi = {
@@ -810,5 +814,17 @@ export const processingApi = {
                 body: JSON.stringify({ stage, asr_backend: asrBackend ?? null }),
             }
         ),
+};
+
+export interface PrefillConfig {
+    douyin_cookie: string;
+    instapaper_consumer_key: string;
+    instapaper_consumer_secret: string;
+    instapaper_email: string;
+    instapaper_password: string;
+}
+
+export const settingsApi = {
+    getPrefill: () => request<PrefillConfig>("/api/settings/prefill"),
 };
 

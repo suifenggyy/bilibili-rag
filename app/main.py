@@ -13,6 +13,7 @@ from app.config import settings, ensure_directories
 from app.database import init_db
 from app.routers import auth, favorites, knowledge, chat, export, douyin_export, instapaper_export
 from app.routers import youtube_knowledge, xiaoyuzhou_knowledge, content_retry
+from fastapi.routing import APIRouter
 
 
 # 配置日志
@@ -92,6 +93,23 @@ app.include_router(instapaper_export.router)
 app.include_router(youtube_knowledge.router)
 app.include_router(xiaoyuzhou_knowledge.router)
 app.include_router(content_retry.router)
+
+
+# ---- 配置预填充接口 ----
+_settings_router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+@_settings_router.get("/prefill")
+async def get_prefill():
+    """返回 .env 中已配置的可预填充值（不含完整密钥，仅供表单默认值）"""
+    return {
+        "douyin_cookie": settings.douyin_cookie or "",
+        "instapaper_consumer_key": settings.instapaper_consumer_key or "",
+        "instapaper_consumer_secret": settings.instapaper_consumer_secret or "",
+        "instapaper_email": settings.instapaper_email or "",
+        "instapaper_password": settings.instapaper_password or "",
+    }
+
+app.include_router(_settings_router)
 
 
 @app.get("/")

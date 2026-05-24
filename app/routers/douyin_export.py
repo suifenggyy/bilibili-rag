@@ -5,9 +5,11 @@
 与 B站导出路由不同，无需 B站会话，Cookie 直接由请求体传入。
 
 端点：
-    POST /douyin-export/start          启动导出任务
-    GET  /douyin-export/status/{id}    查询任务进度
-    GET  /douyin-export/download/{id}  下载 ZIP 结果
+    GET  /douyin-export/qrcode              生成 QR 码登录二维码
+    GET  /douyin-export/qrcode/poll/{token} 轮询 QR 码登录状态
+    POST /douyin-export/start               启动导出任务
+    GET  /douyin-export/status/{id}         查询任务进度
+    GET  /douyin-export/download/{id}       下载 ZIP 结果
 """
 
 import asyncio
@@ -18,14 +20,18 @@ import time
 import uuid
 import zipfile
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.database import get_db, get_db_context
+from app.models import DouyinSession, DouyinCreator
 from app.services.content_summary import append_summary_section
 from app.services.content_storage import ContentStorageManager
 
@@ -34,14 +40,107 @@ router = APIRouter(prefix="/douyin-export", tags=["抖音导出"])
 # 任务状态（内存存储，重启后清空）
 douyin_export_tasks: dict[str, dict] = {}
 
-# ==================== 请求 / 响应模型 ====================
+# ==================== QR 登录模型 ====================
+
+class DouyinQRCodeResponse(BaseModel):
+    token: str
+    qrcode_url: str
+    qrcode_image_base64: str
+
+
+class DouyinQRPollResponse(BaseModel):
+    status: str          # waiting | scanned | confirmed | expired
+    message: str
+    cookie_str: Optional[str] = None
+    session_id: Optional[str] = None   # set when confirmed and saved
+
+
+class DouyinSessionResponse(BaseModel):
+    session_id: str
+    cookie_str: str
+
+
+class DouyinCreatorRequest(BaseModel):
+    """添加抖音创作者配置"""
+    sec_uid: str               # sec_uid 或主页 URL
+    nickname: Optional[str] = None
+    after_date: Optional[str] = None   # YYYY-MM-DD
+
+
+class DouyinCreatorResponse(BaseModel):
+    id: int
+    sec_uid: str
+    nickname: Optional[str] = None
+    after_date: Optional[str] = None
+
+
+# ==================== QR 登录路由 ====================
+
+@router.get("/qrcode", response_model=DouyinQRCodeResponse)
+async def douyin_generate_qrcode():
+    """生成抖音扫码登录二维码。"""
+    from app.services.douyin_auth import DouyinAuthService
+    async with DouyinAuthService() as svc:
+        try:
+            result = await svc.generate_qrcode()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+    return DouyinQRCodeResponse(**result)
+
+
+@router.get("/qrcode/poll/{token}", response_model=DouyinQRPollResponse)
+async def douyin_poll_qrcode(token: str, db: AsyncSession = Depends(get_db)):
+    """轮询抖音二维码登录状态。confirmed 时保存 Cookie 到数据库并返回 session_id。"""
+    from app.services.douyin_auth import DouyinAuthService
+    async with DouyinAuthService() as svc:
+        try:
+            result = await svc.poll_qrcode_status(token)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=str(e))
+
+    session_id: Optional[str] = None
+    if result.get("status") == "confirmed" and result.get("cookie_str"):
+        session_id = str(uuid.uuid4())
+        db_session = DouyinSession(
+            session_id=session_id,
+            cookie_str=result["cookie_str"],
+        )
+        db.add(db_session)
+        await db.commit()
+        logger.info("[DouyinExport] Cookie 已保存, session_id={}", session_id)
+
+    return DouyinQRPollResponse(**result, session_id=session_id)
+
+
+@router.get("/session/{session_id}", response_model=DouyinSessionResponse)
+async def douyin_get_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    """根据 session_id 恢复抖音 Cookie（刷新页面后调用）。"""
+    row = await db.scalar(
+        select(DouyinSession).where(DouyinSession.session_id == session_id)
+    )
+    if not row or not row.cookie_str:
+        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+    return DouyinSessionResponse(session_id=session_id, cookie_str=row.cookie_str)
+
+
+@router.delete("/session/{session_id}", status_code=204)
+async def douyin_delete_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    """删除保存的抖音 Cookie（登出）。"""
+    row = await db.scalar(
+        select(DouyinSession).where(DouyinSession.session_id == session_id)
+    )
+    if row:
+        await db.delete(row)
+        await db.commit()
+        logger.info("[DouyinExport] 会话已删除, session_id={}", session_id)
+
 
 class DouyinExportRequest(BaseModel):
     """抖音导出请求"""
     cookie: str = Field(..., description="抖音浏览器 Cookie 字符串")
     evil0ctal_url: str = Field(
-        default="http://localhost:2333",
-        description="Evil0ctal API 服务地址",
+        default="",
+        description="已废弃，忽略（直接调用子模块，无需外部服务）",
     )
     limit: int = Field(
         default=0,
@@ -144,7 +243,7 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
     from app.services.douyin import DouyinService
     from app.services.douyin_fetcher import DouyinContentFetcher
 
-    douyin = DouyinService(cookie=req.cookie, evil0ctal_url=req.evil0ctal_url)
+    douyin = DouyinService(cookie=req.cookie)
     asr = _build_asr_service(req)
     storage_manager = ContentStorageManager()
     fetcher = DouyinContentFetcher(
@@ -247,7 +346,7 @@ async def start_douyin_export(req: DouyinExportRequest, background_tasks: Backgr
 
     # 验证 Evil0ctal API 可达性
     from app.services.douyin import DouyinService
-    douyin_check = DouyinService(cookie=req.cookie, evil0ctal_url=req.evil0ctal_url)
+    douyin_check = DouyinService(cookie=req.cookie)
     available = await douyin_check.check_evil0ctal_available()
     await douyin_check.close()
 
@@ -255,8 +354,8 @@ async def start_douyin_export(req: DouyinExportRequest, background_tasks: Backgr
         raise HTTPException(
             status_code=503,
             detail=(
-                f"无法连接到 Evil0ctal API 服务（{req.evil0ctal_url}）。"
-                "请先按文档部署：git clone https://github.com/Evil0ctal/Douyin_TikTok_Download_API"
+                "Evil0ctal 子模块不可用，请确认已运行 git submodule update --init "
+                "并安装依赖（pip install -r requirements.txt）。"
             ),
         )
 
@@ -338,3 +437,197 @@ async def download_douyin_export(job_id: str):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="douyin_export_{ts}.zip"'},
     )
+
+
+# ==================== 创作者管理 ====================
+
+@router.post("/creators", response_model=DouyinCreatorResponse)
+async def add_douyin_creator(
+    request: DouyinCreatorRequest,
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """添加抖音创作者配置"""
+    sec_uid = request.sec_uid.strip()
+    if not sec_uid:
+        raise HTTPException(status_code=400, detail="sec_uid 不能为空")
+
+    result = await db.execute(
+        select(DouyinCreator).where(
+            DouyinCreator.session_id == session_id,
+            DouyinCreator.sec_uid == sec_uid,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing:
+        existing.nickname = request.nickname or existing.nickname
+        existing.after_date = request.after_date
+        await db.commit()
+        await db.refresh(existing)
+        return DouyinCreatorResponse(id=existing.id, sec_uid=existing.sec_uid, nickname=existing.nickname, after_date=existing.after_date)
+
+    creator = DouyinCreator(
+        session_id=session_id,
+        sec_uid=sec_uid,
+        nickname=request.nickname,
+        after_date=request.after_date,
+    )
+    db.add(creator)
+    await db.commit()
+    await db.refresh(creator)
+    return DouyinCreatorResponse(id=creator.id, sec_uid=creator.sec_uid, nickname=creator.nickname, after_date=creator.after_date)
+
+
+@router.get("/creators", response_model=List[DouyinCreatorResponse])
+async def list_douyin_creators(
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取已配置的抖音创作者列表"""
+    result = await db.execute(
+        select(DouyinCreator).where(DouyinCreator.session_id == session_id)
+    )
+    creators = result.scalars().all()
+    return [DouyinCreatorResponse(id=c.id, sec_uid=c.sec_uid, nickname=c.nickname, after_date=c.after_date) for c in creators]
+
+
+@router.delete("/creators/{creator_id}", status_code=204)
+async def delete_douyin_creator(
+    creator_id: int,
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """删除抖音创作者配置"""
+    result = await db.execute(
+        select(DouyinCreator).where(
+            DouyinCreator.id == creator_id,
+            DouyinCreator.session_id == session_id,
+        )
+    )
+    creator = result.scalar_one_or_none()
+    if not creator:
+        raise HTTPException(status_code=404, detail="未找到该创作者配置")
+    await db.delete(creator)
+    await db.commit()
+
+
+@router.post("/creators/sync")
+async def sync_douyin_creator_videos(
+    background_tasks: BackgroundTasks,
+    session_id: str = Query(..., description="会话ID"),
+    db: AsyncSession = Depends(get_db),
+):
+    """同步所有已配置抖音创作者的作品（后台任务）"""
+    # 获取 Cookie
+    result = await db.execute(
+        select(DouyinCreator).where(DouyinCreator.session_id == session_id)
+    )
+    creators = result.scalars().all()
+    if not creators:
+        raise HTTPException(status_code=400, detail="尚未配置任何抖音创作者")
+
+    # 获取 Cookie
+    from sqlalchemy import select as sa_select
+    sess_result = await db.execute(
+        sa_select(DouyinSession).where(DouyinSession.session_id == session_id)
+    )
+    sess = sess_result.scalar_one_or_none()
+    cookie_str = sess.cookie_str if sess else ""
+
+    creator_list = [
+        {"id": c.id, "sec_uid": c.sec_uid, "nickname": c.nickname, "after_date": c.after_date}
+        for c in creators
+    ]
+
+    job_id = str(uuid.uuid4())
+    douyin_export_tasks[job_id] = {
+        "status": "pending",
+        "progress": 0,
+        "current_step": "初始化中...",
+        "total": 0,
+        "done": 0,
+        "message": "",
+    }
+
+    background_tasks.add_task(
+        _sync_douyin_creators_task,
+        job_id,
+        session_id,
+        cookie_str,
+        creator_list,
+    )
+    return {"task_id": job_id, "message": "抖音创作者同步任务已启动"}
+
+
+async def _sync_douyin_creators_task(
+    job_id: str,
+    session_id: str,
+    cookie_str: str,
+    creator_list: list,
+):
+    """后台任务：获取抖音创作者视频并导出为 Markdown"""
+    from app.services.douyin import DouyinService
+    storage = ContentStorageManager()
+
+    try:
+        douyin_export_tasks[job_id]["status"] = "running"
+        total_saved = 0
+
+        douyin_svc = DouyinService(cookie=cookie_str)
+        try:
+            for creator in creator_list:
+                sec_uid = creator["sec_uid"]
+                nickname = creator.get("nickname") or sec_uid[:20]
+                after_date = creator.get("after_date")
+
+                douyin_export_tasks[job_id]["current_step"] = f"获取 {nickname} 的作品列表..."
+                logger.info(f"[Douyin Creator Sync] 同步 {nickname}, after_date={after_date}")
+
+                try:
+                    videos = await douyin_svc.get_all_creator_videos(sec_uid, after_date=after_date)
+                except Exception as e:
+                    logger.error(f"[Douyin Creator Sync] 获取 {sec_uid} 失败: {e}")
+                    continue
+
+                douyin_export_tasks[job_id]["total"] = douyin_export_tasks[job_id].get("total", 0) + len(videos)
+                logger.info(f"[Douyin Creator Sync] {nickname} 共 {len(videos)} 个视频")
+
+                for video in videos:
+                    info = DouyinService.parse_video_info(video)
+                    try:
+                        content_lines = [
+                            f"# {info['title']}",
+                            f"\n作者：{info['author']}",
+                            f"\n链接：{info['share_url']}",
+                            f"\n发布时间：{datetime.fromtimestamp(info['create_time']).strftime('%Y-%m-%d %H:%M') if info['create_time'] else '未知'}",
+                            "\n\n（暂无转写文本）",
+                        ]
+                        content = "\n".join(content_lines)
+                        output_path = await storage.save_content(
+                            platform="douyin_creator",
+                            content_id=info["aweme_id"],
+                            title=info["title"],
+                            content=content,
+                        )
+                        if output_path:
+                            total_saved += 1
+                    except Exception as e:
+                        logger.error(f"[Douyin Creator Sync] 保存视频 {info.get('aweme_id')} 失败: {e}")
+
+                    douyin_export_tasks[job_id]["done"] = douyin_export_tasks[job_id].get("done", 0) + 1
+                    total = max(douyin_export_tasks[job_id].get("total", 1), 1)
+                    done = douyin_export_tasks[job_id].get("done", 0)
+                    douyin_export_tasks[job_id]["progress"] = min(99, int(done / total * 100))
+        finally:
+            await douyin_svc.close()
+
+        douyin_export_tasks[job_id]["status"] = "completed"
+        douyin_export_tasks[job_id]["progress"] = 100
+        douyin_export_tasks[job_id]["current_step"] = "完成"
+        douyin_export_tasks[job_id]["message"] = f"已导出 {total_saved} 个视频"
+        logger.info(f"[Douyin Creator Sync] 完成，共保存 {total_saved} 个视频")
+
+    except Exception as e:
+        logger.error(f"[Douyin Creator Sync] 任务失败: {e}")
+        douyin_export_tasks[job_id]["status"] = "failed"
+        douyin_export_tasks[job_id]["message"] = str(e)

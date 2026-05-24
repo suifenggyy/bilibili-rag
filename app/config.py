@@ -54,13 +54,16 @@ class Settings(BaseSettings):
     )
     text_model_timeout: int = Field(default=300, env="TEXT_MODEL_TIMEOUT")
 
+    # 本地 OpenAI 兼容接口（如 LM Studio / Jan / LocalAI，默认 http://localhost:4141）
+    local_openai_base_url: str = Field(default="http://localhost:4141", env="LOCAL_OPENAI_BASE_URL")
+    local_openai_model: str = Field(default="", env="LOCAL_OPENAI_MODEL")
+
     # 本地 openai-whisper ASR
     whisper_model: str = Field(default="turbo", env="WHISPER_MODEL")
     whisper_language: str = Field(default="zh", env="WHISPER_LANGUAGE")
 
     # 抖音导出配置
     douyin_cookie: str = Field(default="", env="DOUYIN_COOKIE")
-    douyin_evil0ctal_url: str = Field(default="http://localhost:2333", env="DOUYIN_EVIL0CTAL_URL")
     douyin_output_dir: str = Field(default="douyin_output", env="DOUYIN_OUTPUT_DIR")
 
     # 抓取工作目录 / 最终导出目录

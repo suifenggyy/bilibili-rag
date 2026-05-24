@@ -291,8 +291,8 @@ async def main():
     )
     parser.add_argument(
         "--evil0ctal-url",
-        default=_get_env("DOUYIN_EVIL0CTAL_URL", "http://localhost:2333"),
-        help="Evil0ctal API 服务地址（默认: http://localhost:2333）",
+        default="",
+        help="（已废弃，忽略）原 Evil0ctal API 服务地址，现已使用子模块直接调用",
     )
     parser.add_argument(
         "--output-dir",
@@ -358,18 +358,16 @@ async def main():
 
     storage_manager = ContentStorageManager(export_root=args.output_dir)
     output_dir = storage_manager.get_export_dir("douyin")
-    douyin = DouyinService(cookie=args.cookie, evil0ctal_url=args.evil0ctal_url)
+    douyin = DouyinService(cookie=args.cookie)
 
-    print(f"\n🔗 检查 Evil0ctal API 服务（{args.evil0ctal_url}）...", end="", flush=True)
+    print(f"\n🔗 检查 Evil0ctal 子模块可用性...", end="", flush=True)
     available = await douyin.check_evil0ctal_available()
     if not available:
         print(
-            f"\n❌ 无法连接到 Evil0ctal API 服务（{args.evil0ctal_url}）\n\n"
-            "   请先按以下步骤部署：\n"
-            "docker pull evil0ctal/douyin_tiktok_download_api:latest\n"
-            "docker run -d --name douyin_tiktok_api -p 2333:80 evil0ctal/douyin_tiktok_download_api"
+            "\n❌ Evil0ctal 子模块不可用。请确认：\n"
+            "   git submodule update --init\n"
+            "   pip install -r requirements.txt\n"
         )
-        await douyin.close()
         sys.exit(1)
     print(" ✅")
 

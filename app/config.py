@@ -59,7 +59,7 @@ class Settings(BaseSettings):
     local_openai_model: str = Field(default="", env="LOCAL_OPENAI_MODEL")
 
     # 本地 openai-whisper ASR
-    whisper_model: str = Field(default="turbo", env="WHISPER_MODEL")
+    whisper_model: str = Field(default="small", env="WHISPER_MODEL")
     whisper_language: str = Field(default="zh", env="WHISPER_LANGUAGE")
 
     # 抖音导出配置

@@ -24,10 +24,15 @@ class ProxyTextPostProcessor:
         self.prompt_template = prompt_template or settings.text_model_correction_prompt
         self.timeout = timeout or settings.text_model_timeout
 
-    async def postprocess(self, text: str) -> str:
+    async def postprocess(self, text: str, title: Optional[str] = None) -> str:
         cleaned = (text or "").strip()
         if not cleaned:
             return ""
+
+        if title:
+            user_content = f"标题：{title.strip()}\n正文：{cleaned}"
+        else:
+            user_content = cleaned
 
         endpoint = f"{self.base_url}/v1/chat/completions"
 
@@ -38,7 +43,7 @@ class ProxyTextPostProcessor:
                     "model": self.model,
                     "messages": [
                         {"role": "system", "content": self.prompt_template},
-                        {"role": "user", "content": cleaned},
+                        {"role": "user", "content": user_content},
                     ],
                 },
             )

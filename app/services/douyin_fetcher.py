@@ -123,7 +123,7 @@ class DouyinContentFetcher:
                 transcript = await self._extract_and_transcribe(tmp_video, aweme_id, title)
                 if transcript:
                     self.storage_manager.write_work_text("douyin", title, "asr_raw.txt", transcript.strip())
-                    base.content = await self._postprocess_asr_text(aweme_id, transcript)
+                    base.content = await self._postprocess_asr_text(aweme_id, transcript, title=title)
                     self.storage_manager.write_work_text("douyin", title, "asr_corrected.txt", base.content.strip())
                     base.content_source = "asr"
                     base.summary_block = await self._summarize_content(aweme_id, base.content)
@@ -193,14 +193,14 @@ class DouyinContentFetcher:
         self.storage_manager.cleanup_workspace_if_needed()
         return await self.asr.transcribe_local_file(wav_path, title=title or aweme_id)
 
-    async def _postprocess_asr_text(self, aweme_id: str, text: str) -> str:
+    async def _postprocess_asr_text(self, aweme_id: str, text: str, title: Optional[str] = None) -> str:
         processor = getattr(self, "text_postprocessor", None)
         raw_text = (text or "").strip()
         if not processor or not raw_text:
             return raw_text
 
         try:
-            processed_text = await processor.postprocess(raw_text)
+            processed_text = await processor.postprocess(raw_text, title=title)
         except Exception as e:
             logger.warning(f"[DouyinFetcher] 文本后处理失败，回退原始文本 [{aweme_id}]: {e}")
             return raw_text

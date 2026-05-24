@@ -24,13 +24,17 @@ class OllamaTextPostProcessor:
         self.prompt_template = prompt_template or settings.text_model_correction_prompt
         self.timeout = timeout or settings.text_model_timeout
 
-    async def postprocess(self, text: str) -> str:
+    async def postprocess(self, text: str, title: Optional[str] = None) -> str:
         """调用 Ollama /api/generate 纠错并格式化文本。"""
         cleaned = (text or "").strip()
         if not cleaned:
             return ""
 
-        prompt = f"{self.prompt_template}\n\n{cleaned}"
+        if title:
+            content = f"标题：{title.strip()}\n正文：{cleaned}"
+        else:
+            content = cleaned
+        prompt = f"{self.prompt_template}\n\n{content}"
         endpoint = f"{self.base_url}/api/generate"
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:

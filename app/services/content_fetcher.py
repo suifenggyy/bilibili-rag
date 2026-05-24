@@ -112,7 +112,7 @@ class ContentFetcher:
         )
         if asr_text:
             self._persist_text_artifact(title, "asr_raw.txt", asr_text)
-            asr_text = await self._postprocess_asr_text(bvid, asr_text)
+            asr_text = await self._postprocess_asr_text(bvid, asr_text, title=title)
             self._persist_text_artifact(title, "asr_corrected.txt", asr_text)
             summary_block = await self._summarize_content(bvid, asr_text)
             logger.info(f"[{bvid}] 使用 ASR 文本")
@@ -194,14 +194,14 @@ class ContentFetcher:
             logger.warning(f"[{bvid}] ASR 失败: {e}")
             return None
 
-    async def _postprocess_asr_text(self, bvid: str, text: str) -> str:
+    async def _postprocess_asr_text(self, bvid: str, text: str, title: Optional[str] = None) -> str:
         processor = getattr(self, "text_postprocessor", None)
         raw_text = (text or "").strip()
         if not processor or not raw_text:
             return raw_text
 
         try:
-            processed_text = await processor.postprocess(raw_text)
+            processed_text = await processor.postprocess(raw_text, title=title)
         except Exception as e:
             logger.warning(f"[{bvid}] ASR 文本后处理失败，回退原始文本: {e}")
             return raw_text

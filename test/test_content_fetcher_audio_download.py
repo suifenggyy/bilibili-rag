@@ -27,9 +27,7 @@ class ContentFetcherAudioDownloadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(content.content, "纠错后的文本。")
         self.assertEqual(content.source, ContentSource.ASR)
-        postprocessor.postprocess.assert_awaited_once_with("原始 asr 文本")
-
-    async def test_fetch_content_persists_raw_and_corrected_asr_text(self):
+        postprocessor.postprocess.assert_awaited_once_with("原始 asr 文本", title="测试标题")
         from app.services.content_storage import ContentStorageManager
 
         bili = type("FakeBili", (), {})()
@@ -82,9 +80,7 @@ class ContentFetcherAudioDownloadTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(content.content, "原始 asr 文本")
         self.assertEqual(content.source, ContentSource.ASR)
-        postprocessor.postprocess.assert_awaited_once_with("原始 asr 文本")
-
-    async def test_fetch_content_generates_summary_block_from_corrected_text(self):
+        postprocessor.postprocess.assert_awaited_once_with("原始 asr 文本", title="测试标题")
         bili = type("FakeBili", (), {})()
         asr = type("FakeASR", (), {})()
         postprocessor = type("FakePostprocessor", (), {})()

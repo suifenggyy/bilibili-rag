@@ -33,7 +33,7 @@ class DouyinContentFetcherPostprocessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(content.content, "纠错后的抖音文本。")
         self.assertEqual(content.content_source, "asr")
-        postprocessor.postprocess.assert_awaited_once_with("原始抖音 asr 文本")
+        postprocessor.postprocess.assert_awaited_once_with("原始抖音 asr 文本", title="测试抖音")
 
     async def test_fetch_content_keeps_downloaded_video_and_asr_files_in_workspace(self):
         from app.services.content_storage import ContentStorageManager

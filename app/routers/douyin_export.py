@@ -314,7 +314,6 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                 md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
                 if md_path.exists():
                     md_text = md_path.read_text(encoding="utf-8")
-                    # Re-process if we have a cookie but the MD has no comments section yet
                     needs_comments = req.cookie.strip() and "## 热门评论" not in md_text
                     if not needs_comments:
                         file_count += 1
@@ -325,7 +324,30 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
                         task["processed_videos"] = done_count
                         task["progress"] = int(done_count / total * 95)
                         return
-                    _log(f"🔄 已完成但缺少评论，重新处理：{title[:40]}")
+
+                    # Fast path: use cached corrected text, skip re-download + ASR
+                    if proc_rec.corrected_text:
+                        _log(f"💬 补充评论（无需重新转写）：{title[:40]}")
+                        from app.services.comments import fetch_douyin_comments, format_comments_section as _fmt  # noqa: PLC0415
+                        comments = await fetch_douyin_comments(aweme_id, req.cookie)
+                        if comments:
+                            cs = _fmt(comments)
+                            md_path.write_text(
+                                md_text.rstrip() + "\n\n" + cs.strip() + "\n",
+                                encoding="utf-8",
+                            )
+                            _log(f"✅ 评论已补充（{len(comments)} 条）：{title[:40]}")
+                        else:
+                            _log(f"ℹ️ 评论接口未返回数据：{title[:40]}")
+                        file_count += 1
+                        task["output_files"].append(str(md_path))
+                        task["file_count"] = file_count
+                        done_count += 1
+                        task["processed_videos"] = done_count
+                        task["progress"] = int(done_count / total * 95)
+                        return
+
+                    _log(f"🔄 无缓存文本，重新处理（含评论）：{title[:40]}")
 
             md_path = storage_manager.build_markdown_path("douyin", title, aweme_id)
 

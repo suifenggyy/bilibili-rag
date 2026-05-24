@@ -434,10 +434,20 @@ async def main():
     print("\n📥 获取各播客单集列表...", flush=True)
     all_episodes: list[tuple[dict, str]] = []
     for sub in subscriptions:
-        rss_url = sub.get("rss_url") or xyz.build_rss_url(sub["podcast_id"])
-        podcast_title = sub.get("title", sub["podcast_id"])
+        podcast_id = sub.get("podcast_id", "")
+        rss_url = sub.get("rss_url") or ""
+        podcast_title = sub.get("title", podcast_id)
+        episodes: list[dict] = []
         try:
-            episodes = await xyz.get_episodes_from_rss(rss_url, limit=args.limit or 0)
+            # 优先用 API（已登录），RSS 作为兜底
+            if xyz.access_token and podcast_id and not podcast_id.startswith("rss_"):
+                result = await xyz.get_episodes_by_api(podcast_id, limit=args.limit or 50)
+                episodes = result.get("episodes", [])
+                # 如果 API 返回结果过少且有 RSS URL，补充 RSS
+                if not episodes and rss_url:
+                    episodes = await xyz.get_episodes_from_rss(rss_url, limit=args.limit or 0)
+            elif rss_url:
+                episodes = await xyz.get_episodes_from_rss(rss_url, limit=args.limit or 0)
             print(f"   「{podcast_title}」: {len(episodes)} 集")
             for ep in episodes:
                 all_episodes.append((ep, podcast_title))

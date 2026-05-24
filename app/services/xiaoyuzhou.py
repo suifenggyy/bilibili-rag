@@ -273,7 +273,7 @@ class XiaoyuzhouService:
             raise RuntimeError("未登录小宇宙，请先调用 login_with_sms()")
 
         url = f"{self.API_BASE}/v1/episode/list"
-        body: dict = {"pid": podcast_id, "order": "desc"}
+        body: dict = {"pid": podcast_id, "order": "desc", "limit": limit}
         if load_more_key:
             body["loadMoreKey"] = load_more_key
 

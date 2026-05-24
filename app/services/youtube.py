@@ -85,7 +85,7 @@ class YouTubeService:
             opts["cookiefile"] = self.cookie_file
         if download and output_path:
             opts["outtmpl"] = output_path
-            opts["format"] = "bestaudio/best"
+            opts["format"] = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=480]/best"
             # 速率限制 ~2MB/s，防止被封
             opts["ratelimit"] = 2_000_000
         return opts

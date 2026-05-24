@@ -9,8 +9,10 @@
 - Token 自动刷新
 """
 import hashlib
+import re
 import uuid
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
@@ -39,22 +41,62 @@ class XiaoyuzhouService:
     @property
     def device_id(self) -> str:
         if not self._device_id:
-            seed = (self.access_token or self.refresh_token or "default")
-            self._device_id = str(
-                uuid.UUID(hashlib.md5(seed.encode()).hexdigest())
-            )
+            token = self.refresh_token or self.access_token or "default"
+            normalized = re.sub(r"[^a-f0-9]", "", token.lower())
+            if len(normalized) < 32:
+                normalized = normalized.ljust(32, "0")
+            normalized = normalized[:32]
+            self._device_id = (
+                f"{normalized[:8]}-{normalized[8:12]}-"
+                f"4{normalized[13:16]}-a{normalized[17:20]}-{normalized[20:32]}"
+            ).upper()
         return self._device_id
 
-    def _build_headers(self) -> dict:
+    def _build_headers(self, credential: Optional[dict] = None) -> dict:
+        """App API 请求头（用于 api.xiaoyuzhoufm.com）"""
+        cred = credential or {}
+        access = cred.get("accessToken") or self.access_token or ""
+        refresh = cred.get("refreshToken") or self.refresh_token or ""
         headers = {
+            "Host": "api.xiaoyuzhoufm.com",
             "User-Agent": f"Xiaoyuzhou/{self.APP_VERSION} (build:{self.BUILD}; iOS 17.4.1)",
-            "BundleID": "app.podcast.cosmos",
+            "Market": "AppStore",
+            "App-BuildNo": self.BUILD,
+            "OS": "ios",
             "x-jike-device-id": self.device_id,
+            "Manufacturer": "Apple",
+            "BundleID": "app.podcast.cosmos",
+            "Connection": "keep-alive",
+            "Accept-Language": "zh-Hant-HK;q=1.0, zh-Hans-CN;q=0.9",
+            "Model": "iPhone14,2",
+            "app-permissions": "4",
+            "Accept": "*/*",
+            "App-Version": self.APP_VERSION,
+            "WifiConnected": "true",
+            "OS-Version": "17.4.1",
+            "x-custom-xiaoyuzhou-app-dev": "",
+            "abtest-info": "{}",
+            "Timezone": "Asia/Shanghai",
+            "Local-Time": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "Content-Type": "application/json",
         }
-        if self.access_token:
-            headers["x-jike-access-token"] = self.access_token
+        if access:
+            headers["x-jike-access-token"] = access
+        if refresh:
+            headers["x-jike-refresh-token"] = refresh
         return headers
+
+    def _creator_headers(self) -> dict:
+        """Podcaster API 请求头（用于 podcaster-api.xiaoyuzhoufm.com 的登录接口）"""
+        return {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "content-type": "application/json;charset=UTF-8",
+            "x-app-build-time": "2026-04-08 10:43:10 +0800",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Origin": "https://podcaster.xiaoyuzhoufm.com",
+            "Referer": "https://podcaster.xiaoyuzhoufm.com/login",
+        }
 
     # ==================== 登录 ====================
 
@@ -63,7 +105,7 @@ class XiaoyuzhouService:
         url = f"{self.PODCASTER_BASE}/v1/auth/send-code"
         body = {"areaCode": "+86", "mobilePhoneNumber": phone}
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=body, headers=self._build_headers())
+            resp = await client.post(url, json=body, headers=self._creator_headers())
         if resp.status_code == 200:
             logger.info(f"[Xiaoyuzhou] 验证码已发送至 {phone}")
             return True
@@ -72,7 +114,10 @@ class XiaoyuzhouService:
 
     async def login_with_sms(self, phone: str, code: str) -> Optional[dict]:
         """
-        短信验证码登录
+        短信验证码登录。
+
+        登录后立即调用 /app_auth_tokens.refresh 换取稳定 App Token，
+        这步是必须的——SMS token 仅用于换取 App token，不能直接访问 API。
 
         Returns:
             {"access_token": ..., "refresh_token": ..., "uid": ..., "nickname": ...}
@@ -81,75 +126,81 @@ class XiaoyuzhouService:
         url = f"{self.PODCASTER_BASE}/v1/auth/login-with-sms"
         body = {"areaCode": "+86", "mobilePhoneNumber": phone, "verifyCode": code}
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json=body, headers=self._build_headers())
+            resp = await client.post(url, json=body, headers=self._creator_headers())
 
         if resp.status_code != 200:
             logger.warning(f"[Xiaoyuzhou] 登录失败: {resp.status_code} {resp.text[:300]}")
             return None
 
         # Token 在响应头中
-        access_token = resp.headers.get("x-jike-access-token", "")
-        refresh_token = resp.headers.get("x-jike-refresh-token", "")
+        sms_access = resp.headers.get("x-jike-access-token", "")
+        sms_refresh = resp.headers.get("x-jike-refresh-token", "")
 
-        if not access_token:
-            # 兜底：某些版本 token 在 body 中
-            try:
-                data = resp.json()
-                cred = data.get("credential") or data.get("data") or {}
-                access_token = cred.get("accessToken") or cred.get("access_token") or ""
-                refresh_token = cred.get("refreshToken") or cred.get("refresh_token") or ""
-            except Exception:
-                pass
-
-        if not access_token:
+        if not sms_access:
             logger.warning("[Xiaoyuzhou] 登录响应中未找到 token")
             return None
 
-        self.access_token = access_token
-        self.refresh_token = refresh_token
-        self._device_id = None  # 重置设备 ID（会重新基于 token 生成）
-
-        # 解析用户信息（body 中）
+        # 解析用户信息
         uid = ""
         nickname = ""
         try:
             data = resp.json()
-            user_info = data.get("userInfo") or {}
-            uid = user_info.get("uid") or user_info.get("id") or ""
-            nickname = user_info.get("nickname") or ""
+            user = data.get("data", {}).get("user") or data.get("userInfo") or {}
+            uid = user.get("uid") or user.get("id") or ""
+            nickname = user.get("nickname") or ""
         except Exception:
             pass
 
-        logger.info(f"[Xiaoyuzhou] 登录成功，uid={uid}, nickname={nickname}")
+        # 立即用 SMS token 换取稳定 App Token
+        self.access_token = sms_access
+        self.refresh_token = sms_refresh
+        self._device_id = None  # 重新基于 refresh token 生成
+
+        stable = await self._do_refresh({"accessToken": sms_access, "refreshToken": sms_refresh})
+        if stable:
+            self.access_token = stable["accessToken"]
+            self.refresh_token = stable["refreshToken"]
+            self._device_id = None
+            logger.info(f"[Xiaoyuzhou] 登录并换取 App Token 成功，uid={uid}, nickname={nickname}")
+        else:
+            logger.warning("[Xiaoyuzhou] 换取稳定 App Token 失败，使用原始 SMS Token")
+
         return {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
             "uid": uid,
             "nickname": nickname,
         }
 
     async def refresh_access_token(self) -> bool:
-        """刷新 access token"""
+        """刷新 access token（使用 /app_auth_tokens.refresh 端点）"""
         if not self.refresh_token:
             return False
-        url = f"{self.API_BASE}/v1/auth/refresh-token"
-        headers = self._build_headers()
-        headers["x-jike-refresh-token"] = self.refresh_token
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json={}, headers=headers)
-
-        new_access = resp.headers.get("x-jike-access-token", "")
-        new_refresh = resp.headers.get("x-jike-refresh-token", "")
-        if new_access:
-            self.access_token = new_access
-            if new_refresh:
-                self.refresh_token = new_refresh
+        cred = {"accessToken": self.access_token or "", "refreshToken": self.refresh_token}
+        stable = await self._do_refresh(cred)
+        if stable:
+            self.access_token = stable["accessToken"]
+            self.refresh_token = stable["refreshToken"]
             self._device_id = None
             logger.info("[Xiaoyuzhou] Token 刷新成功")
             return True
+        return False
+
+    async def _do_refresh(self, credential: dict) -> Optional[dict]:
+        """内部：调用 /app_auth_tokens.refresh，返回新的 {accessToken, refreshToken} 或 None"""
+        url = f"{self.API_BASE}/app_auth_tokens.refresh"
+        headers = self._build_headers(credential)
+        headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, data=None, headers=headers)
+
+        new_access = resp.headers.get("x-jike-access-token", "")
+        new_refresh = resp.headers.get("x-jike-refresh-token", "")
+        if new_access and new_refresh:
+            return {"accessToken": new_access, "refreshToken": new_refresh}
 
         logger.warning(f"[Xiaoyuzhou] Token 刷新失败: {resp.status_code} {resp.text[:200]}")
-        return False
+        return None
 
     # ==================== 订阅列表 ====================
 

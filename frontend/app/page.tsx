@@ -8,6 +8,9 @@ import ChatPanel from "@/components/ChatPanel";
 import ExportPanel from "@/components/ExportPanel";
 import DouyinExportPanel from "@/components/DouyinExportPanel";
 import InstapaperExportPanel from "@/components/InstapaperExportPanel";
+import YoutubeKnowledgePanel from "@/components/YoutubeKnowledgePanel";
+import XiaoyuzhouKnowledgePanel from "@/components/XiaoyuzhouKnowledgePanel";
+import ProcessingStatusPanel from "@/components/ProcessingStatusPanel";
 import { UserInfo, authApi } from "@/lib/api";
 
 export default function Home() {
@@ -17,7 +20,7 @@ export default function Home() {
   const [showDemo, setShowDemo] = useState(false);
   const [statsKey, setStatsKey] = useState(0);
   const [selectedFolderIds, setSelectedFolderIds] = useState<number[]>([]);
-  const [activeTab, setActiveTab] = useState<"rag" | "export" | "douyin" | "instapaper">("rag");
+  const [activeTab, setActiveTab] = useState<"rag" | "export" | "douyin" | "instapaper" | "youtube" | "xiaoyuzhou" | "status">("rag");
 
   // 拖拽调整宽度
   const [leftWidth, setLeftWidth] = useState(320);
@@ -216,6 +219,34 @@ export default function Home() {
                   </svg>
                   Instapaper
                 </button>
+                <button
+                  className={`workspace-tab ${activeTab === "youtube" ? "workspace-tab-active" : ""}`}
+                  onClick={() => setActiveTab("youtube")}
+                >
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" style={{ marginRight: 5 }}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  YouTube
+                </button>
+                <button
+                  className={`workspace-tab ${activeTab === "xiaoyuzhou" ? "workspace-tab-active" : ""}`}
+                  onClick={() => setActiveTab("xiaoyuzhou")}
+                >
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" style={{ marginRight: 5 }}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
+                  </svg>
+                  小宇宙
+                </button>
+                <button
+                  className={`workspace-tab ${activeTab === "status" ? "workspace-tab-active" : ""}`}
+                  onClick={() => setActiveTab("status")}
+                >
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" style={{ marginRight: 5 }}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+                  </svg>
+                  处理状态
+                </button>
               </div>
 
               {activeTab === "rag" && (
@@ -226,8 +257,11 @@ export default function Home() {
                 />
               )}
               {activeTab === "export" && <ExportPanel sessionId={session!} />}
-              {activeTab === "douyin" && <DouyinExportPanel />}
+              {activeTab === "douyin" && <DouyinExportPanel sessionId={session ?? "anon"} />}
               {activeTab === "instapaper" && <InstapaperExportPanel />}
+              {activeTab === "youtube" && <YoutubeKnowledgePanel sessionId={session ?? "anon"} />}
+              {activeTab === "xiaoyuzhou" && <XiaoyuzhouKnowledgePanel sessionId={session ?? "anon"} />}
+              {activeTab === "status" && <ProcessingStatusPanel />}
             </section>
           </section>
         )}

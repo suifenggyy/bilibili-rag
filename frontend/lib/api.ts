@@ -343,6 +343,24 @@ export const exportApi = {
 
 // ==================== 抖音导出 ====================
 
+export interface DouyinQRCodeResponse {
+    token: string;
+    qrcode_url: string;
+    qrcode_image_base64: string;
+}
+
+export interface DouyinQRPollResponse {
+    status: "waiting" | "scanned" | "confirmed" | "expired";
+    message: string;
+    cookie_str?: string;
+    session_id?: string;   // returned when confirmed; use to restore session
+}
+
+export interface DouyinSessionResponse {
+    session_id: string;
+    cookie_str: string;
+}
+
 export interface DouyinExportRequest {
     cookie: string;
     evil0ctal_url?: string;
@@ -367,6 +385,14 @@ export interface DouyinExportJobStatus {
 }
 
 export const douyinExportApi = {
+    // QR 码登录：生成二维码
+    generateQrcode: () =>
+        request<DouyinQRCodeResponse>("/douyin-export/qrcode"),
+
+    // QR 码登录：轮询状态
+    pollQrcode: (token: string) =>
+        request<DouyinQRPollResponse>(`/douyin-export/qrcode/poll/${encodeURIComponent(token)}`),
+
     // 启动导出任务
     start: (data: DouyinExportRequest) =>
         request<{ job_id: string; message: string }>(
@@ -384,6 +410,14 @@ export const douyinExportApi = {
     // 下载导出 ZIP
     getDownloadUrl: (jobId: string) =>
         `${API_BASE_URL}/douyin-export/download/${jobId}`,
+
+    // 根据 session_id 恢复已保存的 Cookie
+    getSession: (sessionId: string) =>
+        request<DouyinSessionResponse>(`/douyin-export/session/${sessionId}`),
+
+    // 删除保存的 Cookie（登出）
+    deleteSession: (sessionId: string) =>
+        request<void>(`/douyin-export/session/${sessionId}`, { method: "DELETE" }),
 };
 
 // ==================== Instapaper 导出 ====================
@@ -391,6 +425,13 @@ export const douyinExportApi = {
 export interface InstapaperFolder {
     folder_id: string;
     title: string;
+}
+
+export interface InstapaperCredentials {
+    consumer_key: string;
+    consumer_secret: string;
+    email: string;
+    password: string;
 }
 
 export interface InstapaperExportRequest {
@@ -436,4 +477,338 @@ export const instapaperExportApi = {
     // 下载导出 ZIP
     getDownloadUrl: (jobId: string) =>
         `${API_BASE_URL}/instapaper-export/download/${jobId}`,
+
+    // 保存凭据（首次验证成功后调用）
+    saveSession: (sessionId: string, creds: InstapaperCredentials) =>
+        request<InstapaperCredentials>(`/instapaper-export/session/${sessionId}`, {
+            method: "POST",
+            body: JSON.stringify(creds),
+        }),
+
+    // 恢复凭据（页面加载时调用）
+    getSession: (sessionId: string) =>
+        request<InstapaperCredentials>(`/instapaper-export/session/${sessionId}`),
+
+    // 删除凭据（登出）
+    deleteSession: (sessionId: string) =>
+        request<void>(`/instapaper-export/session/${sessionId}`, { method: "DELETE" }),
 };
+
+// ==================== YouTube 知识库 ====================
+
+export interface YoutubeSource {
+    id: number;
+    session_id: string;
+    source_type: "video" | "playlist" | "channel" | "liked" | "watch_later";
+    source_url: string;
+    title?: string;
+    after_date?: string;
+    is_selected: boolean;
+    last_sync_at?: string;
+    created_at: string;
+}
+
+export interface YoutubeVideoInfo {
+    video_id: string;
+    title: string;
+    url: string;
+    description?: string;
+    duration?: number;
+    channel?: string;
+    thumbnail?: string;
+    upload_date?: string;
+}
+
+export interface YoutubeBuildStatus {
+    task_id: string;
+    status: "pending" | "running" | "completed" | "failed";
+    progress: number;
+    current_step: string;
+    total_videos: number;
+    processed_videos: number;
+    message: string;
+}
+
+export const youtubeApi = {
+    // Cookie 管理
+    saveCookie: (sessionId: string, cookieContent: string) =>
+        request<{ message: string }>("/youtube/cookie", {
+            method: "POST",
+            body: JSON.stringify({ session_id: sessionId, cookie_content: cookieContent }),
+        }),
+
+    getCookieStatus: (sessionId: string) =>
+        request<{ has_cookie: boolean }>(`/youtube/cookie/status?session_id=${sessionId}`),
+
+    deleteCookie: (sessionId: string) =>
+        request<{ message: string }>(`/youtube/cookie?session_id=${sessionId}`, {
+            method: "DELETE",
+        }),
+
+    // 来源管理
+    addSource: (sessionId: string, sourceUrl: string, sourceType = "auto", afterDate?: string) =>
+        request<{ source_id: number; source_type: string; title?: string; message: string }>(
+            "/youtube/sources",
+            {
+                method: "POST",
+                body: JSON.stringify({ session_id: sessionId, source_url: sourceUrl, source_type: sourceType, after_date: afterDate }),
+            }
+        ),
+
+    listSources: (sessionId: string) =>
+        request<YoutubeSource[]>(`/youtube/sources?session_id=${sessionId}`),
+
+    deleteSource: (sourceId: number, sessionId: string) =>
+        request<{ message: string }>(`/youtube/sources/${sourceId}?session_id=${sessionId}`, {
+            method: "DELETE",
+        }),
+
+    previewSourceVideos: (sourceId: number, sessionId: string) =>
+        request<{ total: number; videos: YoutubeVideoInfo[] }>(
+            `/youtube/sources/${sourceId}/videos?session_id=${sessionId}`
+        ),
+
+    // 知识库构建
+    build: (sessionId: string, sourceIds: number[], asrBackend = "auto", limitPerSource = 0) =>
+        request<YoutubeBuildStatus>("/youtube/build", {
+            method: "POST",
+            body: JSON.stringify({
+                session_id: sessionId,
+                source_ids: sourceIds,
+                asr_backend: asrBackend,
+                limit_per_source: limitPerSource,
+            }),
+        }),
+
+    getBuildStatus: (taskId: string) =>
+        request<YoutubeBuildStatus>(`/youtube/build/${taskId}`),
+};
+
+// ==================== 小宇宙知识库 ====================
+
+export interface XiaoyuzhouSubscription {
+    id: number;
+    podcast_id: string;
+    title: string;
+    author?: string;
+    rss_url?: string;
+    cover_url?: string;
+    is_selected: boolean;
+    last_sync_at?: string;
+    created_at: string;
+}
+
+export interface XiaoyuzhouEpisode {
+    episode_id: string;
+    title: string;
+    description?: string;
+    duration?: number;
+    audio_url?: string;
+    pub_date?: string;
+}
+
+export interface XiaoyuzhouBuildStatus {
+    task_id: string;
+    status: "pending" | "running" | "completed" | "failed";
+    progress: number;
+    current_step: string;
+    total_episodes: number;
+    processed_episodes: number;
+    message: string;
+}
+
+export const xiaoyuzhouApi = {
+    // 认证
+    sendSms: (sessionId: string, phone: string) =>
+        request<{ message: string }>("/xiaoyuzhou/auth/send-sms", {
+            method: "POST",
+            body: JSON.stringify({ session_id: sessionId, phone }),
+        }),
+
+    login: (sessionId: string, phone: string, code: string) =>
+        request<{ uid?: string; nickname?: string; message: string }>("/xiaoyuzhou/auth/login", {
+            method: "POST",
+            body: JSON.stringify({ session_id: sessionId, phone, code }),
+        }),
+
+    getAuthStatus: (sessionId: string) =>
+        request<{ logged_in: boolean; phone?: string; nickname?: string; uid?: string }>(
+            `/xiaoyuzhou/auth/status?session_id=${sessionId}`
+        ),
+
+    logout: (sessionId: string) =>
+        request<{ message: string }>(`/xiaoyuzhou/auth/logout?session_id=${sessionId}`, {
+            method: "DELETE",
+        }),
+
+    // 订阅管理
+    syncSubscriptions: (sessionId: string) =>
+        request<{ added: number; total: number; message: string }>(
+            `/xiaoyuzhou/subscriptions/sync?session_id=${sessionId}`,
+            { method: "POST" }
+        ),
+
+    addSubscription: (sessionId: string, rssUrl: string) =>
+        request<{ subscription_id: number; podcast_id: string; title: string; message: string }>(
+            "/xiaoyuzhou/subscriptions",
+            {
+                method: "POST",
+                body: JSON.stringify({ session_id: sessionId, rss_url: rssUrl }),
+            }
+        ),
+
+    listSubscriptions: (sessionId: string) =>
+        request<XiaoyuzhouSubscription[]>(`/xiaoyuzhou/subscriptions?session_id=${sessionId}`),
+
+    deleteSubscription: (subId: number, sessionId: string) =>
+        request<{ message: string }>(`/xiaoyuzhou/subscriptions/${subId}?session_id=${sessionId}`, {
+            method: "DELETE",
+        }),
+
+    getEpisodes: (subId: number, sessionId: string, limit = 20) =>
+        request<XiaoyuzhouEpisode[]>(
+            `/xiaoyuzhou/subscriptions/${subId}/episodes?session_id=${sessionId}&limit=${limit}`
+        ),
+
+    // 知识库构建
+    build: (sessionId: string, subscriptionIds: number[], asrBackend = "auto", episodeLimit = 10) =>
+        request<XiaoyuzhouBuildStatus>("/xiaoyuzhou/build", {
+            method: "POST",
+            body: JSON.stringify({
+                session_id: sessionId,
+                subscription_ids: subscriptionIds,
+                asr_backend: asrBackend,
+                episode_limit: episodeLimit,
+            }),
+        }),
+
+    getBuildStatus: (taskId: string) =>
+        request<XiaoyuzhouBuildStatus>(`/xiaoyuzhou/build/${taskId}`),
+};
+
+// ==================== B站 UP主创作者 ====================
+
+export interface BiliCreator {
+    id: number;
+    uid: string;
+    nickname?: string;
+    after_date?: string;
+}
+
+export const biliCreatorApi = {
+    list: (sessionId: string) =>
+        request<BiliCreator[]>(`/knowledge/creators?session_id=${sessionId}`),
+
+    add: (sessionId: string, uid: string, nickname?: string, afterDate?: string) =>
+        request<BiliCreator>("/knowledge/creators?" + new URLSearchParams({ session_id: sessionId }), {
+            method: "POST",
+            body: JSON.stringify({ uid, nickname, after_date: afterDate }),
+        }),
+
+    delete: (sessionId: string, creatorId: number) =>
+        request<{ message: string }>(`/knowledge/creators/${creatorId}?session_id=${sessionId}`, {
+            method: "DELETE",
+        }),
+
+    sync: (sessionId: string) =>
+        request<{ task_id: string; message: string }>(
+            `/knowledge/creators/sync?session_id=${sessionId}`,
+            { method: "POST" }
+        ),
+};
+
+// ==================== 抖音创作者 ====================
+
+export interface DouyinCreator {
+    id: number;
+    sec_uid: string;
+    nickname?: string;
+    after_date?: string;
+}
+
+export const douyinCreatorApi = {
+    list: (sessionId: string) =>
+        request<DouyinCreator[]>(`/douyin-export/creators?session_id=${sessionId}`),
+
+    add: (sessionId: string, secUid: string, nickname?: string, afterDate?: string) =>
+        request<DouyinCreator>("/douyin-export/creators?" + new URLSearchParams({ session_id: sessionId }), {
+            method: "POST",
+            body: JSON.stringify({ sec_uid: secUid, nickname, after_date: afterDate }),
+        }),
+
+    delete: (sessionId: string, creatorId: number) =>
+        request<void>(`/douyin-export/creators/${creatorId}?session_id=${sessionId}`, {
+            method: "DELETE",
+        }),
+
+    sync: (sessionId: string) =>
+        request<{ task_id: string; message: string }>(
+            `/douyin-export/creators/sync?session_id=${sessionId}`,
+            { method: "POST" }
+        ),
+};
+
+// ==================== 内容处理状态 ====================
+
+export type ProcessingStage = "pending" | "asr_done" | "correction_done" | "completed" | "failed";
+export type RetryStage = "asr" | "correction" | "summary" | "index";
+export type Platform = "bilibili" | "youtube" | "xiaoyuzhou" | "douyin";
+
+export interface ProcessingRecord {
+    platform: Platform;
+    content_id: string;
+    title: string | null;
+    stage: ProcessingStage;
+    failed_stage: string | null;
+    error_message: string | null;
+    has_asr_raw: boolean;
+    has_corrected: boolean;
+    has_summary: boolean;
+    created_at: string | null;
+    updated_at: string | null;
+}
+
+export interface ProcessingListResponse {
+    records: ProcessingRecord[];
+    total: number;
+}
+
+export interface ProcessingContent {
+    platform: string;
+    content_id: string;
+    title: string;
+    stage: string;
+    content: string;
+    summary_block: string;
+}
+
+export const processingApi = {
+    list: (params: {
+        platform?: string;
+        stage?: string;
+        q?: string;
+        limit?: number;
+        offset?: number;
+    } = {}) => {
+        const qs = new URLSearchParams();
+        if (params.platform) qs.set("platform", params.platform);
+        if (params.stage) qs.set("stage", params.stage);
+        if (params.q) qs.set("q", params.q);
+        if (params.limit != null) qs.set("limit", String(params.limit));
+        if (params.offset != null) qs.set("offset", String(params.offset));
+        return request<ProcessingListResponse>(`/api/processing/list?${qs}`);
+    },
+
+    getContent: (platform: string, contentId: string) =>
+        request<ProcessingContent>(`/api/processing/${encodeURIComponent(platform)}/${encodeURIComponent(contentId)}/content`),
+
+    retry: (platform: string, contentId: string, stage: RetryStage, asrBackend?: string) =>
+        request<{ status: string; message: string }>(
+            `/api/processing/${encodeURIComponent(platform)}/${encodeURIComponent(contentId)}/retry`,
+            {
+                method: "POST",
+                body: JSON.stringify({ stage, asr_backend: asrBackend ?? null }),
+            }
+        ),
+};
+

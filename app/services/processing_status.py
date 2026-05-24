@@ -84,6 +84,7 @@ class ProcessingStatusService:
         db: AsyncSession,
         platform: Optional[str] = None,
         stage: Optional[str] = None,
+        title_search: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[ContentProcessingRecord]:
@@ -92,6 +93,8 @@ class ProcessingStatusService:
             q = q.where(ContentProcessingRecord.platform == platform)
         if stage:
             q = q.where(ContentProcessingRecord.stage == stage)
+        if title_search:
+            q = q.where(ContentProcessingRecord.title.ilike(f"%{title_search}%"))
         q = q.order_by(ContentProcessingRecord.updated_at.desc()).limit(limit).offset(offset)
         result = await db.execute(q)
         return list(result.scalars().all())

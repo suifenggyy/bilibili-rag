@@ -584,6 +584,84 @@ MIT — 仅供个人学习与技术研究，使用者需自行遵守 B 站相关
 
 ---
 
+## 🗂️ 模式五：知识库流水线（Obsidian 集成）
+
+将导出脚本产生的 Markdown 自动导入 Obsidian vault，进行分类、归档、topic 管理与日报生成。
+
+### 工作流程
+
+```
+export script / legacy import
+        ↓
+   vault/inbox/               ← 带 YAML frontmatter 的原始 Markdown
+        ↓ (orchestrator)
+   parse → classify → archive → update topics → log
+        ↓
+vault/knowledge/<category>/   ← 分类归档后的文章
+vault/knowledge/_topics/      ← topic 索引页（含 Dataview 查询）
+vault/_meta/logs/             ← 每日处理日志
+vault/daily/                  ← 知识库日报
+```
+
+### 必要的 .env 配置
+
+```env
+# Obsidian vault 根目录（绝对路径）
+OBSIDIAN_VAULT_ROOT=/path/to/your/obsidian/vault
+
+# 各子目录（相对于 vault 根目录，可使用默认值）
+OBSIDIAN_INBOX_DIR=inbox
+OBSIDIAN_KNOWLEDGE_DIR=knowledge
+OBSIDIAN_TOPICS_DIR=knowledge/_topics
+OBSIDIAN_DAILY_DIR=daily
+OBSIDIAN_META_DIR=_meta
+
+# 可选：Obsidian Local REST API（优先使用，缺失时回退到直接写文件）
+OBSIDIAN_LOCAL_REST_URL=http://localhost:27123
+OBSIDIAN_LOCAL_REST_API_KEY=your-rest-api-key
+
+# 可选：Tavily API Key（用于日报中的外部信号查询）
+TAVILY_API_KEY=tvly-xxxxx
+```
+
+### 常用命令
+
+```bash
+# 一次性处理 inbox 中所有待处理文件
+python scripts/run_knowledge_pipeline.py
+
+# 持续监听 inbox，实时处理新文件（需安装 watchdog）
+python scripts/run_knowledge_pipeline.py --watch
+
+# 处理单个文件
+python scripts/run_knowledge_pipeline.py --file vault/inbox/2026-05-28-article.md
+
+# 从旧版 collection/ 目录批量导入历史存档到 inbox
+python scripts/import_collection_to_inbox.py --sources bilibili,instapaper
+
+# 生成今日知识库日报
+python scripts/generate_daily_report.py
+
+# 生成指定日期日报
+python scripts/generate_daily_report.py --date 2026-05-28
+```
+
+### 导出脚本自动写入 inbox
+
+所有导出脚本（B站、抖音、小宇宙、YouTube、Instapaper）产出的 Markdown 文件均自动添加 YAML frontmatter，并写入 `OBSIDIAN_VAULT_ROOT/inbox/` 目录（当 `OBSIDIAN_VAULT_ROOT` 已配置时）。
+
+```yaml
+---
+title: 文章标题
+date: 2026-05-28
+source: https://...
+platform: bilibili
+summary: AI 生成摘要...
+---
+```
+
+---
+
 ## 🗺️ TodoList
 
 - [ ] 对话历史存储与会话管理

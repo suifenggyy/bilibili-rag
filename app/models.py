@@ -289,6 +289,27 @@ class ContentProcessingRecord(Base):
     )
 
 
+class InboxEntry(Base):
+    """知识库 inbox 处理记录（跨平台，用于幂等追踪和流水线状态）"""
+    __tablename__ = 'inbox_entries'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    source_platform = Column(String(30), nullable=False, index=True)
+    source_identifier = Column(String(300), nullable=False)
+    inbox_path = Column(String(1000), nullable=False)
+    archive_path = Column(String(1000), nullable=True)
+    content_hash = Column(String(64), nullable=False, index=True)
+    status = Column(String(30), default="pending", index=True)  # pending/running/completed/failed
+    category = Column(String(200), nullable=True)
+    topics_json = Column(JSON, nullable=True)
+    quality_score = Column(String(20), nullable=True)
+    error_message = Column(Text, nullable=True)
+    processed_at = Column(DateTime, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ==================== Pydantic 模型 (API 用) ====================
 
 class ContentSource(str, Enum):

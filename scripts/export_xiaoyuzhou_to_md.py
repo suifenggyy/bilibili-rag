@@ -94,12 +94,32 @@ def _format_duration(seconds: int) -> str:
 
 
 def _build_markdown(ec, source: str) -> str:
-    """构建 Markdown 文件内容"""
+    """构建 Markdown 文件内容（包含 YAML frontmatter）"""
+    from app.services.knowledge_pipeline.frontmatter import (
+        build_export_frontmatter,
+        extract_plain_summary,
+    )
+
     source_label = {
         "asr": "ASR 语音转写",
         "transcript": "官方字幕（说话人分段）",
         "basic_info": "播客基本信息（ASR 未成功）",
     }.get(source, source)
+
+    pub_str = getattr(ec, "publish_date", None) or datetime.now().strftime("%Y-%m-%d")
+    if hasattr(pub_str, "strftime"):
+        pub_str = pub_str.strftime("%Y-%m-%d")
+
+    summary_block = getattr(ec, "summary_block", "")
+    plain_summary = extract_plain_summary(summary_block)
+    source_url = getattr(ec, "media_url", "") or getattr(ec, "episode_id", "")
+    frontmatter = build_export_frontmatter(
+        title=ec.title,
+        date_str=pub_str,
+        source=source_url,
+        summary=plain_summary,
+        platform="xiaoyuzhou",
+    )
 
     lines = [
         f"# {ec.title}",
@@ -121,7 +141,7 @@ def _build_markdown(ec, source: str) -> str:
         lines += ["", "## 节目简介", "", ec.description[:500]]
 
     from app.services.content_summary import append_summary_section
-    append_summary_section(lines, getattr(ec, "summary_block", ""))
+    append_summary_section(lines, summary_block)
 
     lines += ["", "---", "", "## 转写内容", ""]
     if ec.content and ec.content.strip():
@@ -135,7 +155,7 @@ def _build_markdown(ec, source: str) -> str:
         "",
         f"_导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_",
     ]
-    return "\n".join(lines)
+    return frontmatter + "\n".join(lines)
 
 
 def _load_session() -> dict:

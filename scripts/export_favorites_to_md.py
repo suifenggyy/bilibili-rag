@@ -279,7 +279,12 @@ def _build_markdown(
     folder_title: str,
     summary_block: str = "",
 ) -> str:
-    """构建 Markdown 文件内容"""
+    """构建 Markdown 文件内容（包含 YAML frontmatter）"""
+    from app.services.knowledge_pipeline.frontmatter import (
+        build_export_frontmatter,
+        extract_plain_summary,
+    )
+
     title = video.get("title") or "未知标题"
     bvid = video.get("bvid") or ""
     owner = (video.get("upper") or {}).get("name") or video.get("owner_name") or "未知UP主"
@@ -287,7 +292,18 @@ def _build_markdown(
     cover = video.get("cover") or video.get("pic") or ""
     intro = video.get("intro") or video.get("desc") or ""
     pub_time = video.get("pubtime") or video.get("ctime") or 0
-    pub_str = datetime.fromtimestamp(pub_time).strftime("%Y-%m-%d") if pub_time else "未知"
+    pub_str = datetime.fromtimestamp(pub_time).strftime("%Y-%m-%d") if pub_time else datetime.now().strftime("%Y-%m-%d")
+    source_url = f"https://www.bilibili.com/video/{bvid}" if bvid else ""
+
+    # 构建 frontmatter
+    plain_summary = extract_plain_summary(summary_block)
+    frontmatter = build_export_frontmatter(
+        title=title,
+        date_str=pub_str,
+        source=source_url,
+        summary=plain_summary,
+        platform="bilibili",
+    )
 
     source_label = {
         "asr": "ASR 语音转写",
@@ -325,7 +341,7 @@ def _build_markdown(
 
     lines += ["", f"---", f"", f"_导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"]
 
-    return "\n".join(lines)
+    return frontmatter + "\n".join(lines)
 
 
 async def export_folder(

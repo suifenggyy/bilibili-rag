@@ -94,11 +94,16 @@ def _format_duration(ms: int) -> str:
 
 
 def _build_markdown(vc, asr_text: str, source: str) -> str:
-    """构建 Markdown 文件内容"""
+    """构建 Markdown 文件内容（包含 YAML frontmatter）"""
+    from app.services.knowledge_pipeline.frontmatter import (
+        build_export_frontmatter,
+        extract_plain_summary,
+    )
+
     create_str = (
         datetime.fromtimestamp(vc.create_time).strftime("%Y-%m-%d")
         if vc.create_time
-        else "未知"
+        else datetime.now().strftime("%Y-%m-%d")
     )
     duration_str = _format_duration(vc.duration)
 
@@ -106,6 +111,16 @@ def _build_markdown(vc, asr_text: str, source: str) -> str:
         "asr": "ASR 语音转写",
         "basic_info": "视频基本信息（ASR 未成功）",
     }.get(source, source)
+
+    summary_block = getattr(vc, "summary_block", "")
+    plain_summary = extract_plain_summary(summary_block)
+    frontmatter = build_export_frontmatter(
+        title=vc.title,
+        date_str=create_str,
+        source=vc.share_url or "",
+        summary=plain_summary,
+        platform="douyin",
+    )
 
     lines = [
         f"# {vc.title}",
@@ -124,7 +139,7 @@ def _build_markdown(vc, asr_text: str, source: str) -> str:
     if vc.cover_url:
         lines += ["", f"![封面]({vc.cover_url})"]
 
-    append_summary_section(lines, getattr(vc, "summary_block", ""))
+    append_summary_section(lines, summary_block)
     lines += ["", "---", "", "## 转写内容", ""]
 
     if asr_text and asr_text.strip():
@@ -145,7 +160,7 @@ def _build_markdown(vc, asr_text: str, source: str) -> str:
         f"_导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_",
     ]
 
-    return "\n".join(lines)
+    return frontmatter + "\n".join(lines)
 
 
 async def _build_asr_service(args):

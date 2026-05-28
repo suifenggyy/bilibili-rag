@@ -459,13 +459,17 @@ class ArticleFetcher:
     @staticmethod
     def build_markdown(bookmark: dict, content: dict) -> str:
         """
-        将书签元数据 + 提取的正文拼装为 Markdown 文件内容。
+        将书签元数据 + 提取的正文拼装为 Markdown 文件内容（包含 YAML frontmatter）。
 
         Args:
             bookmark: Instapaper API 返回的书签 dict
             content:  fetch_content() 返回的 dict
         """
         from datetime import datetime
+        from app.services.knowledge_pipeline.frontmatter import (
+            build_export_frontmatter,
+            extract_plain_summary,
+        )
 
         title = content.get("title") or bookmark.get("title") or "未知标题"
         url = bookmark.get("url") or content.get("url") or ""
@@ -475,12 +479,22 @@ class ArticleFetcher:
 
         saved_str = (
             datetime.fromtimestamp(bm_time).strftime("%Y-%m-%d")
-            if bm_time else "未知"
+            if bm_time else datetime.now().strftime("%Y-%m-%d")
         )
         source_label = {
             "trafilatura": "trafilatura 自动提取",
             "basic_info": "基本信息（正文提取失败）",
         }.get(source, source)
+
+        summary_block = content.get("summary_block", "")
+        plain_summary = extract_plain_summary(summary_block) or description
+        frontmatter = build_export_frontmatter(
+            title=title,
+            date_str=saved_str,
+            source=url,
+            summary=plain_summary,
+            platform="instapaper",
+        )
 
         lines = [
             f"# {title}",
@@ -497,7 +511,7 @@ class ArticleFetcher:
         if description:
             lines += ["", "**摘要：** " + description]
 
-        append_summary_section(lines, content.get("summary_block", ""))
+        append_summary_section(lines, summary_block)
         lines += ["", "---", "", "## 正文", ""]
 
         text = content.get("text", "").strip()
@@ -514,4 +528,4 @@ class ArticleFetcher:
             f"_导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_",
         ]
 
-        return "\n".join(lines)
+        return frontmatter + "\n".join(lines)

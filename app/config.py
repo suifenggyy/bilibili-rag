@@ -84,6 +84,31 @@ class Settings(BaseSettings):
         env="COLLECTION_OUTPUT_DIR",
     )
 
+    # Obsidian Vault 与知识库流水线配置
+    obsidian_vault_root: str = Field(
+        default="~/Obsidian/jarvis",
+        env="OBSIDIAN_VAULT_ROOT",
+    )
+    obsidian_inbox_dir: str = Field(default="inbox", env="OBSIDIAN_INBOX_DIR")
+    obsidian_knowledge_dir: str = Field(default="knowledge", env="OBSIDIAN_KNOWLEDGE_DIR")
+    obsidian_topics_dir: str = Field(default="knowledge/_topics", env="OBSIDIAN_TOPICS_DIR")
+    obsidian_daily_dir: str = Field(default="daily", env="OBSIDIAN_DAILY_DIR")
+    obsidian_meta_dir: str = Field(default="_meta", env="OBSIDIAN_META_DIR")
+    obsidian_local_rest_url: str = Field(
+        default="http://127.0.0.1:27124",
+        env="OBSIDIAN_LOCAL_REST_URL",
+    )
+    obsidian_local_rest_api_key: str = Field(default="", env="OBSIDIAN_LOCAL_REST_API_KEY")
+
+    # Tavily API（用于日报外部信号搜索）
+    tavily_api_key: str = Field(default="", env="TAVILY_API_KEY")
+
+    # 知识库分类流水线配置
+    knowledge_classification_timeout: int = Field(
+        default=120,
+        env="KNOWLEDGE_CLASSIFICATION_TIMEOUT",
+    )
+
     # Instapaper 配置
     instapaper_consumer_key: str = Field(default="", env="INSTAPAPER_CONSUMER_KEY")
     instapaper_consumer_secret: str = Field(default="", env="INSTAPAPER_CONSUMER_SECRET")

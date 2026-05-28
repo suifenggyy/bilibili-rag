@@ -15,19 +15,50 @@ from app.config import settings
 
 
 class ContentStorageManager:
-    """负责来源/日期/标题分层的工作目录与导出目录。"""
+    """负责来源/日期/标题分层的工作目录与导出目录，以及 Obsidian Vault 路径。"""
 
     def __init__(
         self,
         workspace_root: Optional[str] = None,
         export_root: Optional[str] = None,
+        vault_root: Optional[str] = None,
+        inbox_dir: Optional[str] = None,
         max_total_size_bytes: Optional[int] = None,
         retention_days: Optional[int] = None,
     ):
         self.workspace_root = Path(workspace_root or settings.content_workspace_root).expanduser()
         self.export_root = Path(export_root or settings.collection_output_dir).expanduser()
+        self._vault_root = Path(vault_root or settings.obsidian_vault_root).expanduser()
+        self._inbox_dir = inbox_dir or settings.obsidian_inbox_dir
         self.max_total_size_bytes = max_total_size_bytes or settings.content_workspace_max_size_bytes
         self.retention_days = retention_days or settings.content_workspace_retention_days
+
+    # ==================== Vault 路径 helpers ====================
+
+    def get_vault_root(self) -> Path:
+        return self._vault_root
+
+    def get_inbox_dir(self) -> Path:
+        return self._vault_root / self._inbox_dir
+
+    def get_failed_inbox_dir(self) -> Path:
+        return self.get_inbox_dir() / "failed"
+
+    def get_knowledge_dir(self) -> Path:
+        return self._vault_root / settings.obsidian_knowledge_dir
+
+    def get_topics_dir(self) -> Path:
+        return self._vault_root / settings.obsidian_topics_dir
+
+    def get_daily_dir(self) -> Path:
+        return self._vault_root / settings.obsidian_daily_dir
+
+    def get_meta_dir(self) -> Path:
+        return self._vault_root / settings.obsidian_meta_dir
+
+    def get_legacy_collection_dir(self, source: str, day: Optional[date] = None) -> Path:
+        """返回旧版 collection/ 子目录路径（仅用于 legacy import，不再创建新文件）。"""
+        return self.export_root / self._sanitize_segment(source) / self._format_day(day)
 
     def get_work_dir(self, source: str, title: str, day: Optional[date] = None) -> Path:
         work_dir = (

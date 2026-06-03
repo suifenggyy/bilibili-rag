@@ -28,8 +28,8 @@
     # 指定 Cookie（不用配置环境变量）
     python scripts/export_douyin_to_md.py --cookie "ttwid=xxx; sessionid=xxx; ..."
 
-    # 指定输出目录
-    python scripts/export_douyin_to_md.py --output-dir /path/to/collection
+    # 指定输出目录（默认写入 inbox）
+    python scripts/export_douyin_to_md.py --output-dir /path/to/custom-inbox
 
     # 导出所有收藏视频
     python scripts/export_douyin_to_md.py --all
@@ -61,6 +61,7 @@ from loguru import logger
 from app.services.content_summary import append_summary_section
 from app.services.processing_status import ProcessingStatusService
 from app.database import get_db_context
+from app.services.content_storage import ContentStorageManager
 
 load_dotenv(ROOT_DIR / ".env")
 
@@ -69,9 +70,7 @@ def _get_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
-DEFAULT_COLLECTION_OUTPUT_DIR = (
-    "/Users/gongyongyue/FangcloudV2/personal_space.localized/同步空间/个人资料/Obsidian/jarvis/collection"
-)
+DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
@@ -401,8 +400,8 @@ async def main():
     )
     parser.add_argument(
         "--output-dir",
-        default=_get_env("COLLECTION_OUTPUT_DIR", DEFAULT_COLLECTION_OUTPUT_DIR),
-        help="输出目录（默认读取 COLLECTION_OUTPUT_DIR）",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"输出目录（默认写入 {DEFAULT_OUTPUT_DIR}）",
     )
     parser.add_argument(
         "--all",

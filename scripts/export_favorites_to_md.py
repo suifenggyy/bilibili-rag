@@ -18,7 +18,7 @@ B站收藏夹 → Markdown 导出工具
     python scripts/export_favorites_to_md.py                         # 交互式选择收藏夹
     python scripts/export_favorites_to_md.py --all                   # 导出所有收藏夹
     python scripts/export_favorites_to_md.py --folder-id 12345678    # 导出指定收藏夹
-    python scripts/export_favorites_to_md.py --output-dir /path/to/collection   # 指定输出目录
+    python scripts/export_favorites_to_md.py --output-dir /path/to/custom-inbox # 指定输出目录
     python scripts/export_favorites_to_md.py --relogin               # 强制重新扫码登录
     python scripts/export_favorites_to_md.py --asr-backend ollama    # 使用 Ollama 本地转写
     python scripts/export_favorites_to_md.py --asr-backend ollama --ollama-model whisper:large
@@ -44,6 +44,7 @@ from loguru import logger
 from app.services.content_summary import append_summary_section
 from app.services.processing_status import ProcessingStatusService
 from app.database import get_db_context
+from app.services.content_storage import ContentStorageManager
 
 load_dotenv(ROOT_DIR / ".env")
 
@@ -55,9 +56,7 @@ def _get_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
-DEFAULT_COLLECTION_OUTPUT_DIR = (
-    "/Users/gongyongyue/FangcloudV2/personal_space.localized/同步空间/个人资料/Obsidian/jarvis/collection"
-)
+DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
@@ -593,8 +592,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--all", action="store_true", help="导出所有收藏夹")
     parser.add_argument(
         "--output-dir",
-        default=_get_env("COLLECTION_OUTPUT_DIR", DEFAULT_COLLECTION_OUTPUT_DIR),
-        help="输出目录（默认读取 COLLECTION_OUTPUT_DIR）",
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"输出目录（默认写入 {DEFAULT_OUTPUT_DIR}）",
     )
     parser.add_argument(
         "--relogin",

@@ -96,7 +96,8 @@ bilibili-rag/
 额外运行时目录：
 
 - `~/.bilibili-rag/<source>/<YYYY-MM-DD>/<title>/`：抓取工作目录，保留视频/音频/`asr_raw.txt`/`asr_corrected.txt`
-- `COLLECTION_OUTPUT_DIR/<source>/<YYYY-MM-DD>/`：最终 Markdown 输出目录
+- `OBSIDIAN_VAULT_ROOT/OBSIDIAN_INBOX_DIR/<source>/<YYYY-MM-DD>/`：导出脚本默认写入的最终 Markdown 目录
+- `COLLECTION_OUTPUT_DIR/<source>/<YYYY-MM-DD>/`：旧版最终 Markdown 输出目录，仅 legacy import 使用
 
 ---
 
@@ -213,7 +214,9 @@ CHROMA_PERSIST_DIRECTORY=./data/chroma_db
 CONTENT_WORKSPACE_ROOT=~/.bilibili-rag
 CONTENT_WORKSPACE_MAX_SIZE_BYTES=1073741824
 CONTENT_WORKSPACE_RETENTION_DAYS=3
-COLLECTION_OUTPUT_DIR=/Users/gongyongyue/FangcloudV2/personal_space.localized/同步空间/个人资料/Obsidian/jarvis/collection
+OBSIDIAN_VAULT_ROOT=/Users/gongyongyue/FangcloudV2/personal_space.localized/同步空间/个人资料/Obsidian/jarvis
+OBSIDIAN_INBOX_DIR=inbox
+# COLLECTION_OUTPUT_DIR=/path/to/collection    # 旧版最终 Markdown 输出目录，仅 legacy import 使用
 ```
 
 ---
@@ -312,7 +315,7 @@ python scripts/export_favorites_to_md.py [选项]
   --folder-id 12345678   导出指定收藏夹（media_id）
 
 输出：
-  --output-dir ./output  输出目录（默认: ./output）
+  --output-dir ./output  输出目录（默认写入 vault/inbox）
 
 登录：
   --relogin              强制重新扫码登录（切换账号时使用）
@@ -359,7 +362,7 @@ python scripts/export_favorites_to_md.py --relogin
 ### 输出文件结构
 
 ```
-$COLLECTION_OUTPUT_DIR/
+$OBSIDIAN_VAULT_ROOT/$OBSIDIAN_INBOX_DIR/
 └── bilibili/
     └── 2026-05-17/
         ├── 如何设计一个好的 API_BV1xx411c7mD.md
@@ -398,7 +401,8 @@ git submodule update --remote douyin_tiktok_download_api
 ```bash
 # .env
 DOUYIN_COOKIE=ttwid=xxx; sessionid=xxx; odin_tt=xxx; msToken=xxx; ...
-COLLECTION_OUTPUT_DIR=/path/to/collection    # B站/抖音 Markdown 统一输出目录
+OBSIDIAN_VAULT_ROOT=~/Obsidian/jarvis
+OBSIDIAN_INBOX_DIR=inbox
 ```
 
 ### 用法
@@ -432,7 +436,7 @@ python scripts/export_douyin_to_md.py --asr-backend ollama --ollama-model whispe
 ### 输出文件结构
 
 ```
-$COLLECTION_OUTPUT_DIR/
+$OBSIDIAN_VAULT_ROOT/$OBSIDIAN_INBOX_DIR/
 └── douyin/
     └── 2026-05-17/
         ├── 这个视频讲得太好了_7234567890123456789.md

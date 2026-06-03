@@ -61,6 +61,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
 from loguru import logger
+from app.services.content_storage import ContentStorageManager
 
 load_dotenv(ROOT_DIR / ".env")
 
@@ -69,10 +70,7 @@ def _get_env(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
-DEFAULT_OUTPUT_DIR = _get_env(
-    "COLLECTION_OUTPUT_DIR",
-    str(ROOT_DIR / "data" / "collection"),
-)
+DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
@@ -328,7 +326,7 @@ async def main():
     parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
-        help=f"输出目录（默认: {DEFAULT_OUTPUT_DIR}）",
+        help=f"输出目录（默认写入 {DEFAULT_OUTPUT_DIR}）",
     )
     parser.add_argument(
         "--asr-backend",

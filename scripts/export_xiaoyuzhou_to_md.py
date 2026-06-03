@@ -63,6 +63,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
 from loguru import logger
+from app.services.content_storage import ContentStorageManager
 
 load_dotenv(ROOT_DIR / ".env")
 
@@ -73,10 +74,7 @@ def _get_env(key: str, default: str = "") -> str:
 
 SESSION_FILE = ROOT_DIR / ".xiaoyuzhou_session.json"
 
-DEFAULT_OUTPUT_DIR = _get_env(
-    "COLLECTION_OUTPUT_DIR",
-    str(ROOT_DIR / "data" / "collection"),
-)
+DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
@@ -396,7 +394,7 @@ async def main():
     parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
-        help=f"输出目录（默认: {DEFAULT_OUTPUT_DIR}）",
+        help=f"输出目录（默认写入 {DEFAULT_OUTPUT_DIR}）",
     )
     parser.add_argument("--all", action="store_true", help="导出所有集（不弹出交互选择）")
     parser.add_argument("--limit", type=int, default=0, help="每个播客最多导出最新 N 集（0=不限制）")

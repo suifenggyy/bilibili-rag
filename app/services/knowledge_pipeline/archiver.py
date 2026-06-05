@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import re
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -31,7 +30,7 @@ class KnowledgeArchiver:
             knowledge_dir = ContentStorageManager().get_knowledge_dir()
         self._knowledge_dir = Path(knowledge_dir)
 
-    def archive(self, inbox_path: Path, doc, classification) -> Path:
+    async def archive(self, inbox_path: Path, doc, classification, writer=None) -> Path:
         """
         执行归档。
 
@@ -61,7 +60,15 @@ class KnowledgeArchiver:
         enriched_text = self._enrich_frontmatter(original_text, classification)
 
         try:
-            target_path.write_text(enriched_text, encoding="utf-8")
+            if writer is not None:
+                try:
+                    vault_relative_path = target_path.relative_to(writer.vault_root)
+                except Exception:
+                    target_path.write_text(enriched_text, encoding="utf-8")
+                else:
+                    await writer.write_text(str(vault_relative_path), enriched_text)
+            else:
+                target_path.write_text(enriched_text, encoding="utf-8")
         except Exception as exc:
             logger.error(f"[Archiver] 写入归档文件失败: {target_path} - {exc}")
             raise

@@ -43,6 +43,7 @@ class TopicUpdater:
         article_date: str,
         new_insight: str,
         article_link: Optional[str] = None,
+        writer=None,
     ) -> Path:
         """
         更新单个 topic 页面。
@@ -70,7 +71,15 @@ class TopicUpdater:
                 topic=topic,
                 first_insight=insight_line,
             )
-            topic_file.write_text(content, encoding="utf-8")
+            if writer is not None:
+                try:
+                    vault_relative_path = topic_file.relative_to(writer.vault_root)
+                except Exception:
+                    topic_file.write_text(content, encoding="utf-8")
+                else:
+                    await writer.write_text(str(vault_relative_path), content)
+            else:
+                topic_file.write_text(content, encoding="utf-8")
             logger.info(f"[TopicUpdater] 创建 topic 页: {topic_file.name}")
         else:
             current = topic_file.read_text(encoding="utf-8")
@@ -79,7 +88,15 @@ class TopicUpdater:
                 logger.debug(f"[TopicUpdater] 已存在观点，跳过: {topic}")
                 return topic_file
             updated = self._append_insight(current, insight_line)
-            topic_file.write_text(updated, encoding="utf-8")
+            if writer is not None:
+                try:
+                    vault_relative_path = topic_file.relative_to(writer.vault_root)
+                except Exception:
+                    topic_file.write_text(updated, encoding="utf-8")
+                else:
+                    await writer.write_text(str(vault_relative_path), updated)
+            else:
+                topic_file.write_text(updated, encoding="utf-8")
             logger.info(f"[TopicUpdater] 追加观点到 topic 页: {topic_file.name}")
 
         return topic_file

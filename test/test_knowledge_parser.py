@@ -1,6 +1,7 @@
 """
 知识库 Markdown 解析器和分类图谱测试
 """
+import asyncio
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -68,6 +69,7 @@ class CategoryMapRepositoryTests(unittest.TestCase):
             meta_dir = Path(tmpdir) / "_meta"
             repo = CategoryMapRepository(meta_dir=meta_dir)
             categories = repo.list_categories()
+            asyncio.run(repo.save())
             self.assertIsInstance(categories, list)
             self.assertTrue((meta_dir / "category-map.json").exists())
 
@@ -78,7 +80,7 @@ class CategoryMapRepositoryTests(unittest.TestCase):
             meta_dir = Path(tmpdir) / "_meta"
             repo = CategoryMapRepository(meta_dir=meta_dir)
             repo.merge_classification("AI与技术", ["AI大模型"])
-            repo.save()
+            asyncio.run(repo.save())
 
             # New repo instance reads from file
             repo2 = CategoryMapRepository(meta_dir=meta_dir)

@@ -94,6 +94,20 @@ class TopicResolution:
     mutation_proposals: List[MutationProposal]
     source_identity: dict
 
+def build_mutation_identity(
+    mutation_type: str,
+    affected_node_ids: List[str],
+    affected_unresolved_names: List[str],
+    target_parent_path: Optional[List[str]],
+    target_replacement_node_id: Optional[str],
+) -> str:
+    affected_part = ",".join(sorted(affected_node_ids or affected_unresolved_names))
+    if target_replacement_node_id:
+        target_part = f"replacement:{target_replacement_node_id}"
+    else:
+        target_part = f"parent:{'/'.join(target_parent_path or [])}"
+    return f"{mutation_type}|{affected_part}|{target_part}"
+
 class TopicGraph:
     def __init__(self, nodes: dict[str, TopicNode], version: str):
         self.nodes = nodes
@@ -378,7 +392,7 @@ class TopicGraph:
             deferred_records.extend(secondary_records)
             
         primary_node = self.get_node_by_path(primary_path)
-        if primary_proposal is None or primary_proposal not in resolution.mutation_proposals:
+        if primary_proposal is None or primary_proposal not in resolution.mutation_proposals or decision.status == "auto_apply":
             return GraphPlacementResult(
                 canonical_primary_path=primary_path,
                 canonical_primary_node_id=primary_node.id if primary_node else None,
@@ -393,20 +407,7 @@ class TopicGraph:
                 deferred_mutation_records=deferred_records,
             )
             
-        if all(record.proposal_identity != primary_proposal.proposal_identity for record in deferred_records):
-            return GraphPlacementResult(
-                canonical_primary_path=primary_path,
-                canonical_primary_node_id=primary_node.id if primary_node else None,
-                placement_path=primary_path,
-                placement_mode="canonical",
-                deferred_primary_path=None,
-                highest_confidence_replacement_path=None,
-                secondary_placements=secondary_placements,
-                secondary_node_ids=[item.canonical_node_id for item in secondary_placements if item.canonical_node_id],
-                ancestor_node_ids=self.get_ancestor_ids(primary_path),
-                secondary_ancestor_node_ids=sorted({ancestor for item in secondary_placements for ancestor in self.get_ancestor_ids(item.placement_path)}),
-                deferred_mutation_records=deferred_records,
-            )
+        deferred_records.append(self.build_deferred_mutation_record(primary_proposal, resolution.source_identity))
             
         existing_ancestor = self.deepest_existing_path(primary_proposal.target_paths[0])
         ancestor_node = self.get_node_by_path(existing_ancestor)

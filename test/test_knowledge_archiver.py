@@ -7,8 +7,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, MagicMock, patch
 
 
-class KnowledgeArchiverTests(unittest.TestCase):
-    def test_archiver_writes_processed_frontmatter_to_category_folder(self):
+class KnowledgeArchiverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_archiver_writes_processed_frontmatter_to_category_folder(self):
         from app.services.knowledge_pipeline.archiver import KnowledgeArchiver
         from app.services.knowledge_pipeline.parser import ParsedKnowledgeDocument
         from app.services.knowledge_pipeline.classifier import ClassificationResult
@@ -42,7 +42,7 @@ class KnowledgeArchiverTests(unittest.TestCase):
             )
 
             archiver = KnowledgeArchiver(knowledge_dir=knowledge_dir)
-            archive_path = archiver.archive(
+            archive_path = await archiver.archive(
                 inbox_path=inbox_file,
                 doc=doc,
                 classification=result,
@@ -56,7 +56,7 @@ class KnowledgeArchiverTests(unittest.TestCase):
             # Category folder should be under knowledge/AI与技术/
             self.assertIn("AI与技术", str(archive_path))
 
-    def test_archiver_generates_dated_slug_filename(self):
+    async def test_archiver_generates_dated_slug_filename(self):
         from app.services.knowledge_pipeline.archiver import KnowledgeArchiver
         from app.services.knowledge_pipeline.parser import ParsedKnowledgeDocument
         from app.services.knowledge_pipeline.classifier import ClassificationResult
@@ -80,7 +80,7 @@ class KnowledgeArchiverTests(unittest.TestCase):
                 category="未分类", topics=[], quality_score=0.5, processing_log="ok"
             )
             archiver = KnowledgeArchiver(knowledge_dir=tmp / "knowledge")
-            path = archiver.archive(inbox_file, doc, cl)
+            path = await archiver.archive(inbox_file, doc, cl)
             self.assertTrue(path.name.startswith("2026-05-28-"))
 
 

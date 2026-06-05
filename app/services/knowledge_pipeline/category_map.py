@@ -39,10 +39,7 @@ class CategoryMapRepository:
             meta_dir = ContentStorageManager().get_meta_dir()
         self._meta_dir = Path(meta_dir)
         self._file_path = self._meta_dir / filename
-        is_new = not self._file_path.exists()
         self._data: dict = self._load()
-        if is_new:
-            self.save()
 
     # ==================== Public API ====================
 
@@ -74,13 +71,20 @@ class CategoryMapRepository:
                 existing.append(t)
                 existing_set.add(t)
 
-    def save(self) -> None:
+    async def save(self, writer=None) -> None:
         """将当前图谱写回文件。"""
-        self._meta_dir.mkdir(parents=True, exist_ok=True)
-        self._file_path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        text = json.dumps(self._data, ensure_ascii=False, indent=2)
+        if writer is not None:
+            try:
+                vault_relative_path = self._file_path.relative_to(writer.vault_root)
+            except Exception:
+                self._meta_dir.mkdir(parents=True, exist_ok=True)
+                self._file_path.write_text(text, encoding="utf-8")
+            else:
+                await writer.write_text(str(vault_relative_path), text)
+        else:
+            self._meta_dir.mkdir(parents=True, exist_ok=True)
+            self._file_path.write_text(text, encoding="utf-8")
         logger.debug(f"[CategoryMap] saved → {self._file_path}")
 
     # ==================== Internal ====================

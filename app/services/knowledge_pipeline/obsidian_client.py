@@ -25,6 +25,7 @@ class ObsidianWriter:
         vault_root: Optional[Path] = None,
         rest_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        write_backend: Optional[str] = None,
     ):
         from app.config import settings
         from app.services.content_storage import ContentStorageManager
@@ -32,6 +33,15 @@ class ObsidianWriter:
         self._vault_root = vault_root or ContentStorageManager().get_vault_root()
         self._rest_url = (rest_url or settings.obsidian_local_rest_url or "").rstrip("/")
         self._api_key = api_key or settings.obsidian_local_rest_api_key
+        self._write_backend = (write_backend or settings.obsidian_write_backend).strip()
+        if self._write_backend not in {"obsidian_api", "filesystem"}:
+            raise ValueError(
+                "obsidian_write_backend must be either 'obsidian_api' or 'filesystem'"
+            )
+
+    @property
+    def vault_root(self) -> Path:
+        return self._vault_root
 
     async def write_text(self, vault_relative_path: str, text: str) -> None:
         """
@@ -40,7 +50,7 @@ class ObsidianWriter:
         先尝试 Local REST API；若失败则直接写文件系统。
         """
         rest_error: Optional[Exception] = None
-        if self._rest_url and self._api_key:
+        if self._write_backend == "obsidian_api" and self._rest_url and self._api_key:
             try:
                 await self._write_via_local_rest(vault_relative_path, text)
                 return

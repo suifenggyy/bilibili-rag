@@ -48,6 +48,9 @@ TAVILY_API_KEY=tvly-xxxx
 # 可选：Obsidian Local REST API
 OBSIDIAN_LOCAL_REST_URL=http://localhost:27123
 OBSIDIAN_LOCAL_REST_API_KEY=your-rest-key
+
+# 写入后端：obsidian_api（默认）或 filesystem
+OBSIDIAN_WRITE_BACKEND=obsidian_api
 ```
 
 ### 1.2 安装 Python 依赖
@@ -402,6 +405,8 @@ uv pip install watchdog[watchmedo]
 ### Q: Obsidian REST API 连接失败
 
 `ObsidianWriter` 会自动回退到直接文件系统写入，不会中断流水线。需要安装 [Obsidian Local REST API](https://github.com/coddingtonbear/obsidian-local-rest-api) 插件并启动后才能使用 REST 模式。
+
+如果你想强制不用插件，把 `OBSIDIAN_WRITE_BACKEND=filesystem` 即可。
 
 ---
 

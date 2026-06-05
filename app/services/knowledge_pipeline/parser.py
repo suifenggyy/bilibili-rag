@@ -28,6 +28,7 @@ class ParsedKnowledgeDocument:
     source_url: str
     summary: str
     body: str
+    key_points: list[str] = field(default_factory=list)
     raw_frontmatter: dict[str, Any] = field(default_factory=dict)
 
 
@@ -75,6 +76,7 @@ class KnowledgeMarkdownParser:
             source_url=str(frontmatter["source"]),
             summary=str(frontmatter.get("summary") or ""),
             body=body,
+            key_points=frontmatter.get("key_points", []),
             raw_frontmatter=frontmatter,
         )
 

@@ -17,6 +17,26 @@ _spec.loader.exec_module(_prompts_mod)  # type: ignore[union-attr]
 DEFAULT_TEXT_MODEL_CORRECTION_PROMPT: str = _prompts_mod.DEFAULT_TEXT_MODEL_CORRECTION_PROMPT
 DEFAULT_TEXT_MODEL_SUMMARY_PROMPT: str = _prompts_mod.DEFAULT_TEXT_MODEL_SUMMARY_PROMPT
 
+_knowledge_prompt_defaults_path = os.path.join(
+    os.path.dirname(__file__),
+    "services",
+    "knowledge_pipeline",
+    "prompt_defaults.py",
+)
+_knowledge_prompt_spec = importlib.util.spec_from_file_location(
+    "knowledge_prompt_defaults",
+    _knowledge_prompt_defaults_path,
+)
+_knowledge_prompt_mod = importlib.util.module_from_spec(_knowledge_prompt_spec)  # type: ignore[arg-type]
+_knowledge_prompt_spec.loader.exec_module(_knowledge_prompt_mod)  # type: ignore[union-attr]
+
+DEFAULT_TOPIC_PATH_PROMPT = _knowledge_prompt_mod.DEFAULT_TOPIC_PATH_PROMPT
+DEFAULT_KNOWLEDGE_NOTE_DISTILL_PROMPT = _knowledge_prompt_mod.DEFAULT_KNOWLEDGE_NOTE_DISTILL_PROMPT
+DEFAULT_TOPIC_SUMMARY_DECISION_PROMPT = _knowledge_prompt_mod.DEFAULT_TOPIC_SUMMARY_DECISION_PROMPT
+DEFAULT_TOPIC_SUMMARY_PROMPT = _knowledge_prompt_mod.DEFAULT_TOPIC_SUMMARY_PROMPT
+DEFAULT_TOPIC_DETAIL_PROMPT = _knowledge_prompt_mod.DEFAULT_TOPIC_DETAIL_PROMPT
+DEFAULT_KNOWLEDGE_REPAIR_PROMPT = _knowledge_prompt_mod.DEFAULT_KNOWLEDGE_REPAIR_PROMPT
+
 
 class Settings(BaseSettings):
     """应用配置"""
@@ -99,6 +119,7 @@ class Settings(BaseSettings):
         env="OBSIDIAN_LOCAL_REST_URL",
     )
     obsidian_local_rest_api_key: str = Field(default="", env="OBSIDIAN_LOCAL_REST_API_KEY")
+    obsidian_write_backend: str = Field(default="obsidian_api", env="OBSIDIAN_WRITE_BACKEND")
 
     # Tavily API（用于日报外部信号搜索）
     tavily_api_key: str = Field(default="", env="TAVILY_API_KEY")
@@ -108,6 +129,15 @@ class Settings(BaseSettings):
         default=120,
         env="KNOWLEDGE_CLASSIFICATION_TIMEOUT",
     )
+
+    # Hierarchical knowledge pipeline prompts
+    knowledge_topic_path_prompt: str = Field(default=DEFAULT_TOPIC_PATH_PROMPT, env="KNOWLEDGE_TOPIC_PATH_PROMPT")
+    knowledge_note_distill_prompt: str = Field(default=DEFAULT_KNOWLEDGE_NOTE_DISTILL_PROMPT, env="KNOWLEDGE_NOTE_DISTILL_PROMPT")
+    knowledge_topic_summary_decision_prompt: str = Field(default=DEFAULT_TOPIC_SUMMARY_DECISION_PROMPT, env="KNOWLEDGE_TOPIC_SUMMARY_DECISION_PROMPT")
+    knowledge_topic_summary_prompt: str = Field(default=DEFAULT_TOPIC_SUMMARY_PROMPT, env="KNOWLEDGE_TOPIC_SUMMARY_PROMPT")
+    knowledge_topic_detail_prompt: str = Field(default=DEFAULT_TOPIC_DETAIL_PROMPT, env="KNOWLEDGE_TOPIC_DETAIL_PROMPT")
+    knowledge_repair_prompt: str = Field(default=DEFAULT_KNOWLEDGE_REPAIR_PROMPT, env="KNOWLEDGE_REPAIR_PROMPT")
+    knowledge_min_body_chars: int = Field(default=80, env="KNOWLEDGE_MIN_BODY_CHARS")
 
     # Instapaper 配置
     instapaper_consumer_key: str = Field(default="", env="INSTAPAPER_CONSUMER_KEY")

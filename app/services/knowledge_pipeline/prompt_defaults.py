@@ -1,0 +1,6 @@
+DEFAULT_TOPIC_PATH_PROMPT = "你是一个专业的知识图谱分类专家。请根据输入内容将其分类到合适的知识节点。 primary_path"
+DEFAULT_KNOWLEDGE_NOTE_DISTILL_PROMPT = "你是一个专业的知识提炼专家。请提取核心观点和逻辑。 summary"
+DEFAULT_TOPIC_SUMMARY_DECISION_PROMPT = "判断是否需要重写摘要。 rewrite_summary"
+DEFAULT_TOPIC_SUMMARY_PROMPT = "重写概览部分。 ## 概览"
+DEFAULT_TOPIC_DETAIL_PROMPT = "提取补充细节。 detail_items"
+DEFAULT_KNOWLEDGE_REPAIR_PROMPT = "提供修复建议。 repair_actions"

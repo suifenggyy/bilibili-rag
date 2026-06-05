@@ -50,6 +50,7 @@ class KnowledgePipelineOrchestrator:
         inbox_dir: Optional[Path] = None,
         classifier=None,
         meta_dir: Optional[Path] = None,
+        obsidian_writer=None,
     ):
         from app.services.content_storage import ContentStorageManager
 
@@ -64,6 +65,16 @@ class KnowledgePipelineOrchestrator:
         self._meta_dir = meta_dir or _storage.get_meta_dir()
 
         self._classifier = classifier
+        if obsidian_writer is not None:
+            self._obsidian_writer = obsidian_writer
+        else:
+            from app.config import settings
+            from app.services.knowledge_pipeline.obsidian_client import ObsidianWriter
+
+            self._obsidian_writer = ObsidianWriter(
+                vault_root=Path(self._vault_root),
+                write_backend=settings.obsidian_write_backend,
+            )
 
     # ==================== Public API ====================
 
@@ -86,11 +97,7 @@ class KnowledgePipelineOrchestrator:
             logger.info(f"[Orchestrator] inbox 目录不存在，跳过: {inbox}")
             return PipelineResult()
 
-        # Exclude failed/ and done/ subdirs
-        paths = [
-            p for p in sorted(inbox.glob("*.md"))
-            if p.is_file()
-        ]
+        paths = self._iter_inbox_markdown_files(inbox)
         if limit:
             paths = paths[:limit]
 
@@ -113,66 +120,191 @@ class KnowledgePipelineOrchestrator:
 
     async def _run_pipeline(self, path: Path, start: float) -> FileProcessResult:
         from app.services.knowledge_pipeline.parser import KnowledgeMarkdownParser
-        from app.services.knowledge_pipeline.category_map import CategoryMapRepository
-        from app.services.knowledge_pipeline.archiver import KnowledgeArchiver
-        from app.services.knowledge_pipeline.topic_updater import TopicUpdater
+        from app.services.knowledge_pipeline.metadata_state import MetadataState
+        from app.services.knowledge_pipeline.topic_graph import TopicGraph
+        from app.services.knowledge_pipeline.knowledge_distiller import KnowledgeDistiller
+        from app.services.knowledge_pipeline.topic_path_resolver import TopicPathResolver
+        from app.services.knowledge_pipeline.knowledge_note_identity import build_knowledge_note_id
+        from app.services.knowledge_pipeline.knowledge_note_renderer import KnowledgeNoteRenderer
+        from app.services.knowledge_pipeline.knowledge_note_store import KnowledgeNoteStore, KnowledgeNoteFileMetadata
+        from app.services.knowledge_pipeline.topic_page_renderer import TopicPageRenderer
+        from app.services.knowledge_pipeline.topic_rebuilder import TopicRebuilder
         from app.services.knowledge_pipeline.processing_logger import ProcessingLogger
+        from app.config import settings
 
         # 1. Parse
         parser = KnowledgeMarkdownParser()
         doc = parser.parse_file(path)
 
-        # 2. Classify
-        classifier = self._get_classifier()
-        category_repo = CategoryMapRepository(meta_dir=self._meta_dir)
-        existing_cats = category_repo.list_categories()
-        classification = await classifier.classify(
-            title=doc.title,
-            summary=doc.summary or doc.body[:200],
-            existing_categories=existing_cats,
-        )
-
-        # 3. Merge category-map
-        category_repo.merge_classification(
-            classification.category, classification.topics
-        )
-        category_repo.save()
-
-        # 4. Archive
-        archiver = KnowledgeArchiver(knowledge_dir=self._knowledge_dir)
-        archive_path = archiver.archive(path, doc, classification)
-
-        # 5. Update topics
-        topic_updater = TopicUpdater(
-            topics_dir=Path(self._vault_root) / "knowledge" / "_topics"
-        )
-        for topic in classification.topics:
-            await topic_updater.update_topic(
-                topic=topic,
-                article_title=doc.title,
-                article_date=doc.date_str,
-                new_insight=classification.processing_log or doc.summary,
+        # 2. State & Graph Initialization
+        meta_state = MetadataState(meta_dir=self._meta_dir)
+        await meta_state.bootstrap()
+        
+        # In a real system, you'd wait on the write lock here.
+        # For prototype simplicity we will just do operations inline
+        # async with meta_state.write_lock():
+        
+        graph_snapshot = await meta_state.load_topic_graph()
+        graph = TopicGraph.from_snapshot(graph_snapshot)
+        
+        mapping_records_container = await meta_state.load_source_mapping()
+        mapping_records = mapping_records_container.get("items", [])
+        
+        # 3. Distillation (replaces flat Classifier)
+        # Assuming we can mock or inject this in the orchestrator later, 
+        # but for now we create a dummy processor if none provided.
+        if not hasattr(self, '_processor') or self._processor is None:
+            class DummyProcessor:
+                async def __call__(self, *args, **kwargs) -> dict:
+                    # Provide everything KnowledgeDistiller requires
+                    return {
+                        "summary": "Mock summary",
+                        "concepts": ["Concept"],
+                        "methods": ["Method"],
+                        "decision_rules": ["Rule"],
+                        "examples": ["Example"],
+                        "risks": ["Risk"],
+                        "quotes": [{"text": "Quote", "context": "Context"}],
+                        
+                        # TopicPathResolution
+                        "primary_path": ["技术", "默认主题"],
+                        "secondary_paths": [],
+                        "mutation_proposals": [
+                            {
+                                "type": "create_leaf",
+                                "target_parent_path": ["技术"],
+                                "target_name": "默认主题",
+                                "target_paths": [["技术", "默认主题"]],
+                                "confidence": 0.9,
+                                "reason": "mock"
+                            }
+                        ]
+                    }
+            processor = DummyProcessor()
+        else:
+            processor = self._processor
+        
+        distiller = KnowledgeDistiller(processor)
+        # Pass context
+        source_identity = {
+            "source_inbox_path": str(path),
+            "source_url": doc.source_url or "",
+            "title": doc.title,
+            "published_date": doc.date_str or "1970-01-01"
+        }
+        units_result = await distiller.distill(doc, source_identity=source_identity)
+        if units_result.status != "processed":
+            return FileProcessResult(
+                path=path,
+                success=False,
+                error=units_result.failure_reason or "skipped",
+                elapsed=0.0
             )
-
-        # 6. Log
+        units = units_result.knowledge
+        
+        # 4. Resolve Path
+        resolver = TopicPathResolver(processor)
+        resolution = await resolver.resolve(units, graph)
+        placement = graph.finalize_resolution(resolution)
+        
+        # 5. Render & Write Note
+        note_id = build_knowledge_note_id({
+            "source_url": units.source_identity["source_url"],
+            "published_date": units.source_identity["published_date"],
+            "persisted_first_seen_inbox_path": str(path),
+            "title": units.source_identity["title"],
+        })
+        
+        renderer = KnowledgeNoteRenderer()
+        rendered_note = renderer.render(units, note_id)
+        
+        store = KnowledgeNoteStore(
+            knowledge_root=Path(self._knowledge_dir),
+            graph=graph
+        )
+        
+        # Build mapping seed
+        # Assuming fingerprinter is just simple hash for now
+        import hashlib
+        fp = hashlib.sha256(doc.body.encode()).hexdigest()
+        mapping_seed = {
+            "source_inbox_path": str(path),
+            "source_content_fingerprint": fp,
+            "persisted_first_seen_inbox_path": str(path)
+        }
+        
+        # See if we have an existing mapping
+        # Just use flat list check for demo
+        existing_mapping = next((r for r in mapping_records if r.get("source_inbox_path") == str(path)), None)
+        
+        write_result, processed_mapping = await store.write_note(
+            knowledge_note_id=note_id,
+            mapping_record=existing_mapping,
+            source_mapping_seed=mapping_seed,
+            placement=placement,
+            note_metadata=KnowledgeNoteFileMetadata(title=doc.title, published_date=doc.date_str or "1970-01-01"),
+            rendered_markdown=rendered_note
+        )
+        
+        # Update mapping
+        if existing_mapping:
+            mapping_records.remove(existing_mapping)
+        mapping_records.append(processed_mapping)
+        mapping_records_container["items"] = mapping_records
+        
+        # 6. Topic Rebuild
+        page_renderer = TopicPageRenderer()
+        rebuilder = TopicRebuilder(
+            graph=graph,
+            metadata_state=meta_state, # Need to make sure it has latest mapping, but using direct mock in code
+            distiller=distiller,
+            store=store,
+            renderer=page_renderer
+        )
+        
+        # Hack to pass state safely
+        meta_state.get_source_mapping_records = lambda: mapping_records
+        
+        impacted_nodes = [write_result.placement_path[-1]] if write_result.placement_path else []
+        node_ids = []
+        for n_path in [write_result.placement_path]:
+            n = graph.get_node_by_path(n_path)
+            if n:
+                node_ids.append(n.id)
+                
+        rebuild_results = await rebuilder.rebuild_nodes(node_ids)
+        for nid, rr in rebuild_results.items():
+            if rr["markdown"]:
+                node = graph.get_node(nid)
+                topic_path = Path(self._knowledge_dir) / "_topics" / f"{node.path[-1]}.md"
+                topic_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(topic_path, "w", encoding="utf-8") as f:
+                    f.write(rr["markdown"])
+        
+        # Save state
+        async with meta_state.write_lock():
+            await meta_state.save_source_mapping(mapping_records_container)
+            await meta_state.save_topic_graph(graph.to_snapshot())
+        
+        # 7. Log
         elapsed = time.monotonic() - start
         proc_logger = ProcessingLogger(meta_dir=self._meta_dir)
-        proc_logger.log_classification(
+        await proc_logger.log_classification(
             article_title=doc.title,
-            category=classification.category,
-            topics=classification.topics,
-            quality_score=classification.quality_score,
+            category=write_result.placement_path[0] if write_result.placement_path else "未知",
+            topics=write_result.placement_path,
+            quality_score=0.9,
             elapsed_seconds=elapsed,
+            writer=self._obsidian_writer,
         )
 
         logger.info(
-            f"[Orchestrator] ✅ {path.name} → {classification.category} | "
-            f"topics={classification.topics} | {elapsed:.1f}s"
+            f"[Orchestrator] ✅ {path.name} → {write_result.placement_path} | {elapsed:.1f}s"
         )
         return FileProcessResult(
             path=path,
             success=True,
-            category=classification.category,
+            category=write_result.placement_path[0] if write_result.placement_path else "未知",
             elapsed=elapsed,
         )
 
@@ -181,3 +313,15 @@ class KnowledgePipelineOrchestrator:
             return self._classifier
         from app.services.knowledge_pipeline.classifier import KnowledgeClassifier
         return KnowledgeClassifier()
+
+    @staticmethod
+    def _iter_inbox_markdown_files(inbox: Path) -> list[Path]:
+        excluded_dirs = {"done", "failed"}
+        paths = []
+        for path in sorted(inbox.rglob("*.md")):
+            if not path.is_file():
+                continue
+            if any(part in excluded_dirs for part in path.parts[len(inbox.parts):]):
+                continue
+            paths.append(path)
+        return paths

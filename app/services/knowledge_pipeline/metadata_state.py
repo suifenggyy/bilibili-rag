@@ -61,3 +61,84 @@ class MetadataState:
     async def save_topic_graph(self, snapshot: dict) -> None:
         self._assert_write_lock_held()
         await self._save_json("topic-graph.json", snapshot)
+
+    async def load_pending_mutations(self) -> dict:
+        return await self._load_json("pending-topic-mutations.json", {"items": []})
+
+    async def save_pending_mutations(self, data: dict) -> None:
+        await self._save_json("pending-topic-mutations.json", data)
+
+    async def merge_pending_mutations(self, records: list[dict]) -> None:
+        self._assert_write_lock_held()
+        snapshot = await self.load_pending_mutations()
+        by_identity = {item["proposal_identity"]: item for item in snapshot["items"]}
+        for record in records:
+            current = by_identity.get(record["proposal_identity"])
+            if current:
+                current["supporting_source_note_paths"] = sorted(set(current["supporting_source_note_paths"]) | set(record["supporting_source_note_paths"]))
+                current["supporting_source_count"] = len(current["supporting_source_note_paths"])
+                current["confidence_score"] = max(current["confidence_score"], record["confidence_score"])
+            else:
+                by_identity[record["proposal_identity"]] = record
+        await self.save_pending_mutations({"items": list(by_identity.values())})
+
+    async def reconcile_pending_mutations(self, records: list[dict]) -> None:
+        self._assert_write_lock_held()
+        snapshot = await self.load_pending_mutations()
+        by_identity = {item["proposal_identity"]: item for item in snapshot["items"]}
+        incoming_identities = {record["proposal_identity"] for record in records}
+        for item in by_identity.values():
+            if item["proposal_identity"] not in incoming_identities and item["lifecycle_status"] == "pending":
+                item["lifecycle_status"] = "superseded"
+        for record in records:
+            current = by_identity.get(record["proposal_identity"])
+            if current and current["lifecycle_status"] in {"rejected", "superseded"}:
+                current["lifecycle_status"] = "pending"
+                current["resolved_at"] = None
+        await self.save_pending_mutations({"items": list(by_identity.values())})
+
+    async def load_source_mapping(self) -> dict:
+        return await self._load_json("source-topic-map.json", {"items": []})
+        
+    async def save_source_mapping(self, data: dict) -> None:
+        await self._save_json("source-topic-map.json", data)
+
+    async def find_source_mapping_by_path(self, source_inbox_path: str) -> dict | None:
+        snapshot = await self.load_source_mapping()
+        for item in snapshot["items"]:
+            if item["source_inbox_path"] == source_inbox_path:
+                return item
+        return None
+
+    async def find_source_mapping_by_fingerprint(self, source_fingerprint: str) -> dict | None:
+        snapshot = await self.load_source_mapping()
+        for item in snapshot["items"]:
+            if item.get("source_content_fingerprint") == source_fingerprint:
+                return item
+        return None
+
+    async def get_or_create_source_identity(self, source_inbox_path: str, source_fingerprint: str, doc) -> dict[str, str]:
+        existing = await self.find_source_mapping_by_path(source_inbox_path)
+        if existing is None:
+            existing = await self.find_source_mapping_by_fingerprint(source_fingerprint)
+        persisted_first_seen = existing["persisted_first_seen_inbox_path"] if existing else source_inbox_path
+        return {
+            "source_inbox_path": source_inbox_path,
+            "persisted_first_seen_inbox_path": persisted_first_seen,
+            "source_url": doc.source_url or "",
+            "published_date": doc.date_str or "",
+            "title": doc.title,
+        }
+
+    async def upsert_source_mapping(self, record: dict) -> None:
+        self._assert_write_lock_held()
+        snapshot = await self.load_source_mapping()
+        items = {item["persisted_first_seen_inbox_path"]: item for item in snapshot["items"]}
+        if record.get("knowledge_note_id"):
+            items = {
+                key: item
+                for key, item in items.items()
+                if item.get("knowledge_note_id") != record["knowledge_note_id"] or key == record["persisted_first_seen_inbox_path"]
+            }
+        items[record["persisted_first_seen_inbox_path"]] = record
+        await self.save_source_mapping({"items": list(items.values())})

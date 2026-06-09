@@ -151,40 +151,11 @@ class KnowledgePipelineOrchestrator:
         mapping_records = mapping_records_container.get("items", [])
         
         # 3. Distillation (replaces flat Classifier)
-        # Assuming we can mock or inject this in the orchestrator later, 
-        # but for now we create a dummy processor if none provided.
-        if not hasattr(self, '_processor') or self._processor is None:
-            class DummyProcessor:
-                async def __call__(self, *args, **kwargs) -> dict:
-                    # Provide everything KnowledgeDistiller requires
-                    return {
-                        "summary": "Mock summary",
-                        "concepts": ["Concept"],
-                        "methods": ["Method"],
-                        "decision_rules": ["Rule"],
-                        "examples": ["Example"],
-                        "risks": ["Risk"],
-                        "quotes": [{"text": "Quote", "context": "Context"}],
-                        
-                        # TopicPathResolution
-                        "primary_path": ["技术", "默认主题"],
-                        "secondary_paths": [],
-                        "mutation_proposals": [
-                            {
-                                "type": "create_leaf",
-                                "target_parent_path": ["技术"],
-                                "target_name": "默认主题",
-                                "target_paths": [["技术", "默认主题"]],
-                                "confidence": 0.9,
-                                "reason": "mock"
-                            }
-                        ]
-                    }
-            processor = DummyProcessor()
-        else:
-            processor = self._processor
-        
-        distiller = KnowledgeDistiller(processor)
+        from app.services.knowledge_pipeline.llm_processor import DistillerProcessor, TopicPathProcessor
+        distill_processor = getattr(self, '_distill_processor', None) or DistillerProcessor()
+        path_processor = getattr(self, '_path_processor', None) or TopicPathProcessor()
+
+        distiller = KnowledgeDistiller(distill_processor)
         # Pass context
         source_identity = {
             "source_inbox_path": str(path),
@@ -203,7 +174,7 @@ class KnowledgePipelineOrchestrator:
         units = units_result.knowledge
         
         # 4. Resolve Path
-        resolver = TopicPathResolver(processor)
+        resolver = TopicPathResolver(path_processor)
         resolution = await resolver.resolve(units, graph)
         placement = graph.finalize_resolution(resolution)
         
@@ -216,7 +187,7 @@ class KnowledgePipelineOrchestrator:
         })
         
         renderer = KnowledgeNoteRenderer()
-        rendered_note = renderer.render(units, note_id)
+        rendered_note = renderer.render(units, note_id, placement=placement)
         
         store = KnowledgeNoteStore(
             knowledge_root=Path(self._knowledge_dir),

@@ -42,6 +42,31 @@ class KnowledgePipelineOrchestratorIntegrationTests(unittest.IsolatedAsyncioTest
                 classifier=mock_classifier,
                 meta_dir=meta_dir
             )
+
+            # Inject test processors for distiller and resolver
+            orchestrator._distill_processor = AsyncMock(return_value={
+                "summary": "Mock summary for test",
+                "concepts": ["概念1"],
+                "methods": ["方法1"],
+                "decision_rules": [],
+                "examples": [],
+                "risks": [],
+                "quotes": [],
+            })
+            orchestrator._path_processor = AsyncMock(return_value={
+                "primary_path": ["技术", "AI"],
+                "secondary_paths": [],
+                "mutation_proposals": [
+                    {
+                        "type": "create_leaf",
+                        "target_parent_path": ["技术"],
+                        "target_name": "AI",
+                        "target_paths": [["技术", "AI"]],
+                        "confidence": 0.9,
+                        "reason": "test"
+                    }
+                ],
+            })
             
             # This requires actual wiring inside the orchestrator
             result = await orchestrator.process_files([md_file])

@@ -62,3 +62,25 @@ class KnowledgeDistiller:
             source_excerpt_fingerprints=[item.get("text", "") for item in payload.get("quotes", [])],
         )
         return DistillationResult(status="processed", knowledge=knowledge, failure_reason=None)
+
+    async def distill_topic_summary(self, topic_name: str, note_contents: list[str]) -> str:
+        """Distill a topic summary from aggregated note contents.
+
+        Uses the summary decision prompt + summary prompt to generate
+        a structured topic summary.
+        """
+        from app.services.knowledge_pipeline.llm_processor import TopicSummaryProcessor
+        summary_processor = TopicSummaryProcessor()
+        try:
+            result = await summary_processor(
+                topic_name=topic_name,
+                note_contents=note_contents,
+            )
+            if isinstance(result, dict):
+                # The LLM may return the summary directly or as markdown
+                return result.get("summary", str(result))
+            return str(result)
+        except Exception as exc:
+            logger.warning(f"[KnowledgeDistiller] topic summary distillation failed: {exc}")
+            # Fallback: return a simple concatenation
+            return "\n".join(note_contents[:3]) if note_contents else ""

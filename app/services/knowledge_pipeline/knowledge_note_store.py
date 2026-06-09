@@ -89,12 +89,23 @@ class KnowledgeNoteStore:
         prior_paths = list((mapping_record or {}).get("prior_knowledge_note_paths", []))
         if write_result.prior_path and str(write_result.prior_path) not in prior_paths:
             prior_paths.append(str(write_result.prior_path))
+        # When the topic node cannot be resolved (deferred placement), mark as skipped
+        # rather than processed — processed requires a valid primary_topic_node_id
+        if primary_node is None:
+            processing_status = "skipped"
+            note_id = None
+            note_path = None
+        else:
+            processing_status = "processed"
+            note_id = write_result.note_id
+            note_path = str(write_result.final_path)
+
         return {
             "source_inbox_path": source_mapping_seed["source_inbox_path"],
             "source_content_fingerprint": source_mapping_seed["source_content_fingerprint"],
-            "source_processing_status": "processed",
-            "knowledge_note_id": write_result.note_id,
-            "knowledge_note_path": str(write_result.final_path),
+            "source_processing_status": processing_status,
+            "knowledge_note_id": note_id,
+            "knowledge_note_path": note_path,
             "prior_knowledge_note_paths": prior_paths,
             "primary_topic_node_id": primary_node.id if primary_node else None,
             "secondary_topic_node_ids": placement.secondary_node_ids,

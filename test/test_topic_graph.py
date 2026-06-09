@@ -1,7 +1,7 @@
 import unittest
 from app.services.knowledge_pipeline.topic_graph import TopicGraph, MutationProposal
 
-class TopicGraphTests(unittest.TestCase):
+class TopicGraphTests(unittest.IsolatedAsyncioTestCase):
     def test_topic_graph_creates_parent_child_nodes(self):
         graph = TopicGraph.empty()
         graph.create_node(
@@ -77,16 +77,31 @@ class TopicGraphTests(unittest.TestCase):
         )
         self.assertEqual(graph.evaluate_mutation(safe).status, "auto_apply")
 
+        # When parent path doesn't exist but no conflicts, create_leaf auto-applies
+        # (it will create the missing ancestor nodes automatically)
         missing_parent = MutationProposal(
             type="create_leaf",
             proposal_identity="leaf", affected_node_ids=[], affected_unresolved_names=[], target_replacement_node_id="", target_paths=[], reason="",
             confidence=0.95,
-            target_parent_path=["投资", "不存在的父节点"],
+            target_parent_path=["投资", "新子主题"],
             target_name="做T",
             impacted_existing_nodes=1,
             replaced_canonical_paths=0,
         )
-        self.assertEqual(graph.evaluate_mutation(missing_parent).status, "pending")
+        self.assertEqual(graph.evaluate_mutation(missing_parent).status, "auto_apply")
+
+        # But if a segment along the path conflicts with a non-active node, defer
+        graph.get_node_by_path(["投资"]).status = "deprecated"
+        conflicting_parent = MutationProposal(
+            type="create_leaf",
+            proposal_identity="leaf", affected_node_ids=[], affected_unresolved_names=[], target_replacement_node_id="", target_paths=[], reason="",
+            confidence=0.95,
+            target_parent_path=["投资", "新子主题"],
+            target_name="做T",
+            impacted_existing_nodes=1,
+            replaced_canonical_paths=0,
+        )
+        self.assertEqual(graph.evaluate_mutation(conflicting_parent).status, "pending")
 
     def test_finalize_resolution_keeps_non_primary_pending_mutations(self):
         from app.services.knowledge_pipeline.topic_graph import TopicResolution

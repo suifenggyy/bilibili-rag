@@ -168,10 +168,32 @@ class TopicGraph:
         return node
 
     def apply_new_leaf(self, parent_path: List[str], child_name: str) -> GraphApplyResult:
+        # Ensure all ancestor nodes exist — create them if missing
+        changed_ids = []
+        impacted_ids = []
+        for i in range(1, len(parent_path) + 1):
+            segment_path = parent_path[:i]
+            if self.get_node_by_path(segment_path) is None:
+                parent_node = self.create_node(
+                    name=segment_path[-1],
+                    parent_path=segment_path[:-1],
+                    aliases=[],
+                    replacement_target_id=None,
+                    lineage=[],
+                    summary_version="",
+                    detail_version="",
+                    status="active",
+                )
+                changed_ids.append(parent_node.id)
+                impacted_ids.append(parent_node.id)
+
         node = self.create_node(name=child_name, parent_path=parent_path, aliases=[], replacement_target_id=None, lineage=[], summary_version="", detail_version="", status="active")
+        changed_ids.append(node.id)
+        impacted_ids.append(node.id)
         parent = self.get_node_by_path(parent_path)
-        impacted = [node.id, *([parent.id] if parent else [])]
-        return GraphApplyResult(changed_node_ids=[node.id], impacted_node_ids=impacted)
+        if parent and parent.id not in impacted_ids:
+            impacted_ids.append(parent.id)
+        return GraphApplyResult(changed_node_ids=changed_ids, impacted_node_ids=impacted_ids)
 
     def get_node(self, node_id: str) -> TopicNode:
         return self.nodes[node_id]
@@ -239,7 +261,17 @@ class TopicGraph:
         ):
             if proposal.type == "create_leaf":
                 parent = self.get_node_by_path(proposal.target_parent_path)
-                if parent is None or parent.status != "active":
+                # If parent doesn't exist but all ancestors can be created (no conflicts),
+                # allow auto-apply — this is safe for building new paths from scratch.
+                if parent is None:
+                    # Check that no existing node (active or not) conflicts with any segment
+                    for i in range(1, len(proposal.target_parent_path) + 1):
+                        segment_path = proposal.target_parent_path[:i]
+                        for node in self.nodes.values():
+                            if node.path == segment_path and node.status != "active":
+                                return MutationDecision(status="pending", impacted_node_ids=proposal.affected_node_ids)
+                    # No conflicts — safe to create the full path
+                elif parent.status != "active":
                     return MutationDecision(status="pending", impacted_node_ids=proposal.affected_node_ids)
             return MutationDecision(status="auto_apply", impacted_node_ids=proposal.affected_node_ids)
         return MutationDecision(status="pending", impacted_node_ids=proposal.affected_node_ids)

@@ -352,6 +352,12 @@ class MetadataState:
 
     async def save_source_mapping(self, data: dict) -> None:
         self._assert_write_lock_held()
+        # Migrate legacy records that have "processed" status but missing required fields
+        for item in data.get("items", []):
+            if item.get("source_processing_status") == "processed" and not item.get("primary_topic_node_id"):
+                item["source_processing_status"] = "skipped"
+                item["knowledge_note_id"] = None
+                item["knowledge_note_path"] = None
         validate_snapshot("source-topic-map.json", data)
         await self._atomic_write_json("source-topic-map.json", data)
 

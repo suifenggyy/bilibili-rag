@@ -59,9 +59,11 @@ class ProcessingStatusService:
         rec.updated_at = datetime.utcnow()
 
     async def mark_completed(
-        self, db: AsyncSession, rec: ContentProcessingRecord
+        self, db: AsyncSession, rec: ContentProcessingRecord, md_path: Optional[str] = None
     ) -> None:
         rec.stage = "completed"
+        if md_path is not None:
+            rec.md_path = md_path
         rec.updated_at = datetime.utcnow()
 
     async def mark_failed(
@@ -78,6 +80,15 @@ class ProcessingStatusService:
 
     def is_completed(self, rec: ContentProcessingRecord) -> bool:
         return rec.stage == "completed"
+
+    def is_exported(self, rec: ContentProcessingRecord) -> bool:
+        """Return True only when DB says completed AND the recorded md file exists."""
+        if rec.stage != "completed":
+            return False
+        if not rec.md_path:
+            return False
+        from pathlib import Path
+        return Path(rec.md_path).exists()
 
     async def list_records(
         self,

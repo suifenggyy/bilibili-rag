@@ -82,11 +82,26 @@ Three backends selected via `.env` `ASR_BACKEND` or `--asr-backend` flag: `dashs
 
 ### Text postprocessing factory (`services/text_postprocessor_factory.py`)
 
-Three backends: `ollama`, `proxy` (OpenAI-compatible), `localopenai`. Selected via `TEXT_MODEL_BACKEND`.
+Three backends: `ollama`, `proxy` (OpenAI-compatible), `localopenai`. Selected via `TEXT_MODEL_BACKEND`. Internally delegates to the unified LLM factory's `ChatCompletionPostProcessor`.
+
+### LLM factory (`services/llm/`)
+
+Unified LLM abstraction layer. All LLM access should go through the factory — never instantiate `ChatOpenAI`, `OpenAI`, or `httpx` clients directly for LLM calls.
+
+| Function | Returns | Use case |
+|---|---|---|
+| `get_llm_service(role)` | `OpenAICompatibleLLMService` | Async `complete()` / `stream()` |
+| `get_langchain_chat(role)` | `ChatOpenAI` | LangChain chains (`prompt \| llm \| parser`) |
+| `get_openai_client(role)` | `OpenAI` | Raw SDK sync/stream calls |
+| `get_embeddings(role)` | `Embeddings` | DashScope or OpenAI embeddings |
+
+**Role-based config**: Each role (e.g., `rag_qa`, `chat`, `chat_routing`, `knowledge_distill`) is independently configurable via env vars `LLM_<ROLE>_{BASE_URL,API_KEY,MODEL,TEMPERATURE,TIMEOUT,MAX_TOKENS}`. Unset roles fall back to global settings (`OPENAI_BASE_URL`+`LLM_MODEL` or `TEXT_MODEL_BASE_URL`+`TEXT_MODEL_NAME`). Zero `.env` changes needed for existing setups.
+
+**Backward compat**: `create_text_postprocessor()` still works — it returns a `ChatCompletionPostProcessor` that implements the `TextPostProcessor` Protocol.
 
 ### RAG service (`services/rag.py`)
 
-Singleton — embeddings and ChromaDB client are expensive to initialize. Access via `get_rag_service()` in `knowledge.py`. Uses `RecursiveCharacterTextSplitter` (chunk_size=1000, overlap=200, Chinese+English separators). Embeddings: DashScope preferred, falls back to OpenAI.
+Singleton — embeddings and ChromaDB client are expensive to initialize. Access via `get_rag_service()` in `knowledge.py`. Uses `RecursiveCharacterTextSplitter` (chunk_size=1000, overlap=200, Chinese+English separators). LLM and embeddings obtained through the factory (`get_langchain_chat("rag_qa")`, `get_embeddings("rag_embedding")`).
 
 ### Knowledge pipeline (`services/knowledge_pipeline/`)
 
@@ -101,6 +116,7 @@ Next.js 16 App Router + React 19 + Tailwind CSS 4. All API calls centralized in 
 - **Config**: All config in `.env` (copy from `.env.example`). `DASHSCOPE_API_KEY` is aliased as `OPENAI_API_KEY` via `AliasChoices` — always use `settings.openai_api_key`.
 - **DB sessions**: `Depends(get_db)` in routers; `async with get_db_context() as db:` in background tasks/scripts. Never use `async_session_factory` directly.
 - **RAG singleton**: Use `get_rag_service()` — do not create `RAGService` instances in hot paths.
+- **LLM factory**: Use `get_llm_service(role)` / `get_langchain_chat(role)` / `get_embeddings(role)` from `app.services.llm` — do not instantiate `ChatOpenAI`, `OpenAI`, or call `httpx` directly for LLM calls.
 - **Logging**: Use `loguru` (`from loguru import logger`). Logs to stdout + `logs/app.log` (7-day rotation).
 - **System dependency**: `ffmpeg` must be on PATH for audio transcoding.
 - **Models file**: `app/models.py` contains both SQLAlchemy ORM and Pydantic schemas — don't split them.

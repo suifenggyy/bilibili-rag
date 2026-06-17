@@ -55,12 +55,12 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
+
 from loguru import logger
 from app.services.processing_status import ProcessingStatusService
 from app.database import get_db_context
 from app.services.content_storage import ContentStorageManager
-
-load_dotenv(ROOT_DIR / ".env")
 
 SESSION_CACHE_FILE = ROOT_DIR / ".instapaper_session.json"
 
@@ -80,7 +80,8 @@ DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r'[\\/:*?"<>|#]', "_", name)
+    name = name.replace("？", "_")
     name = re.sub(r"\s+", " ", name).strip()
     return name[:max_len] if len(name) > max_len else name
 
@@ -187,24 +188,25 @@ async def _export_single_bookmark(
     _proc_svc = ProcessingStatusService()
     pos = f"[{idx:3d}/{total}] " if idx and total else ""
 
-    already_done = False
+    already_exported = False
     try:
         async with get_db_context() as db:
             proc_rec = await _proc_svc.get_or_create(db, "instapaper", bm_id, title)
             await db.commit()
-            already_done = _proc_svc.is_completed(proc_rec)
+            already_exported = _proc_svc.is_exported(proc_rec)
     except Exception as _db_err:
         logger.debug(f"DB 状态检查失败（跳过）: {_db_err}")
 
-    if already_done and md_path.exists():
-        print(f"   {pos}⏭️  已完成，跳过：{title[:50]}")
+    if already_exported:
+        print(f"   {pos}⏭️  已导出，跳过：{title[:50]}")
         return 1, 0
 
-    if md_path.exists() and not already_done:
-        print(f"   {pos}⏭️  已存在，跳过：{title[:50]}")
-        return 1, 0
-
-    print(f"   {pos}🔄 {title[:55]}", end="", flush=True)
+    if proc_rec and _proc_svc.is_completed(proc_rec) and not md_path.exists():
+        print(f"   {pos}🔄 文件丢失，重新处理：{title[:55]}", end="", flush=True)
+    elif md_path.exists():
+        print(f"   {pos}🔄 重新处理（DB 未标记导出）：{title[:55]}", end="", flush=True)
+    else:
+        print(f"   {pos}🔄 {title[:55]}", end="", flush=True)
 
     try:
         content = await fetcher.fetch_content(url, title)
@@ -220,7 +222,7 @@ async def _export_single_bookmark(
                 corrected = content.get("content") or content.get("text") or ""
                 if corrected:
                     await _proc_svc.mark_correction_done(db, rec, corrected)
-                await _proc_svc.mark_completed(db, rec)
+                await _proc_svc.mark_completed(db, rec, md_path=str(md_path.resolve()))
                 await db.commit()
         except Exception as _db_err:
             logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
@@ -285,27 +287,27 @@ async def export_folder(
         safe_title = _safe_filename(title)
         md_path = output_dir / f"{safe_title}_{bm_id}.md"
 
-        # 检查 DB 状态
-        already_done = False
+        # 检查 DB 导出状态（completed + md_path 文件存在）
+        already_exported = False
         try:
             async with get_db_context() as db:
                 proc_rec = await _proc_svc.get_or_create(db, "instapaper", bm_id, title)
                 await db.commit()
-                already_done = _proc_svc.is_completed(proc_rec)
+                already_exported = _proc_svc.is_exported(proc_rec)
         except Exception as _db_err:
             logger.debug(f"DB 状态检查失败（跳过）: {_db_err}")
 
-        if already_done and md_path.exists():
-            print(f"   [{i:3d}/{total}] ⏭️  已完成，跳过：{title[:50]}")
+        if already_exported:
+            print(f"   [{i:3d}/{total}] ⏭️  已导出，跳过：{title[:50]}")
             success += 1
             continue
 
-        if md_path.exists() and not already_done:
-            print(f"   [{i:3d}/{total}] ⏭️  已存在，跳过：{title[:50]}")
-            success += 1
-            continue
-
-        print(f"   [{i:3d}/{total}] 🔄 {title[:55]}", end="", flush=True)
+        if proc_rec and _proc_svc.is_completed(proc_rec) and not md_path.exists():
+            print(f"   [{i:3d}/{total}] 🔄 文件丢失，重新处理：{title[:55]}", end="", flush=True)
+        elif md_path.exists():
+            print(f"   [{i:3d}/{total}] 🔄 重新处理（DB 未标记导出）：{title[:55]}", end="", flush=True)
+        else:
+            print(f"   [{i:3d}/{total}] 🔄 {title[:55]}", end="", flush=True)
 
         try:
             content = await fetcher.fetch_content(url, title)
@@ -322,7 +324,7 @@ async def export_folder(
                     corrected = content.get("content") or content.get("text") or ""
                     if corrected:
                         await _proc_svc.mark_correction_done(db, rec, corrected)
-                    await _proc_svc.mark_completed(db, rec)
+                    await _proc_svc.mark_completed(db, rec, md_path=str(md_path.resolve()))
                     await db.commit()
             except Exception as _db_err:
                 logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
@@ -422,8 +424,8 @@ async def main():
     )
     parser.add_argument(
         "--after-date",
-        default=_get_env("EXPORT_AFTER_DATE", "2026-01-01"),
-        help="只导出该日期（含）之后保存的书签，格式 YYYY-MM-DD（默认 2026-01-01；留空则不限制）",
+        default=_get_env("INSTAPAPER_AFTER_DATE"),
+        help="只导出该日期（含）之后保存的书签，格式 YYYY-MM-DD（留空则不限制）",
     )
     args = parser.parse_args()
 
@@ -505,16 +507,17 @@ async def main():
         sys.exit(0)
 
     # ── 按保存时间过滤 ────────────────────────────────────────────────
-    if args.after_date and args.after_date.strip():
+    effective_after = storage_manager.resolve_after_date("instapaper", args.after_date)
+    if effective_after:
         try:
-            after_ts = int(datetime.strptime(args.after_date.strip(), "%Y-%m-%d").timestamp())
+            after_ts = int(datetime.strptime(effective_after, "%Y-%m-%d").timestamp())
             before = len(all_bookmarks)
             all_bookmarks = [(bm, ft) for bm, ft in all_bookmarks if (bm.get("time") or 0) >= after_ts]
             filtered = before - len(all_bookmarks)
             if filtered:
-                print(f"🗓️  日期过滤：跳过 {filtered} 篇 {args.after_date} 前的书签（剩余 {len(all_bookmarks)} 篇）")
+                print(f"🗓️  日期过滤：跳过 {filtered} 篇 {effective_after} 前的书签（剩余 {len(all_bookmarks)} 篇）")
         except ValueError:
-            print(f"⚠️  --after-date 格式无效: {args.after_date}，将导出全部书签")
+            print(f"⚠️  --after-date 格式无效: {effective_after}，将导出全部书签")
 
     if len(all_bookmarks) == 0:
         print("⚠️  过滤后无可导出书签")

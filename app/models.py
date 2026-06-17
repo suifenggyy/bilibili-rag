@@ -278,6 +278,8 @@ class ContentProcessingRecord(Base):
     corrected_text = Column(Text, nullable=True)     # after text postprocessing
     summary_block = Column(Text, nullable=True)      # after summarization
 
+    md_path = Column(String(1000), nullable=True)    # 导出的 Markdown 文件绝对路径
+
     failed_stage = Column(String(20), nullable=True)  # asr | correction | index
     error_message = Column(Text, nullable=True)
 

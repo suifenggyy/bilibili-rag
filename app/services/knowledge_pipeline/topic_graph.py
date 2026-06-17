@@ -1,7 +1,11 @@
 from dataclasses import dataclass, asdict
 import uuid
-from typing import Optional, List
+from typing import Optional, List, TYPE_CHECKING
+from loguru import logger
 from .metadata_state import MetadataState
+
+if TYPE_CHECKING:
+    from .topic_similarity import TopicSimilarityChecker
 
 @dataclass
 class TopicNode:
@@ -167,7 +171,12 @@ class TopicGraph:
             parent.children_ids.append(node.id)
         return node
 
-    def apply_new_leaf(self, parent_path: List[str], child_name: str) -> GraphApplyResult:
+    async def apply_new_leaf(
+        self,
+        parent_path: List[str],
+        child_name: str,
+        similarity_checker: "TopicSimilarityChecker | None" = None,
+    ) -> GraphApplyResult:
         # Ensure all ancestor nodes exist — create them if missing
         changed_ids = []
         impacted_ids = []
@@ -187,10 +196,65 @@ class TopicGraph:
                 changed_ids.append(parent_node.id)
                 impacted_ids.append(parent_node.id)
 
+        # Check for existing sibling with similar name — reuse instead of creating duplicate
+        parent = self.get_node_by_path(parent_path)
+        if parent and child_name:
+            from .topic_path_resolver import _leaf_names_are_similar
+            # Phase 1: Fast lexical check
+            lexical_match = None
+            for child_id in parent.children_ids:
+                child = self.get_node(child_id)
+                if child and child.status == "active" and _leaf_names_are_similar(child.name, child_name):
+                    lexical_match = child
+                    break
+
+            if lexical_match:
+                logger.info(
+                    f"[TopicGraph] apply_new_leaf: reusing existing node "
+                    f"'{lexical_match.name}' instead of creating similar '{child_name}' "
+                    f"under {'/'.join(parent_path)}"
+                )
+                if child_name not in lexical_match.aliases and child_name != lexical_match.name:
+                    lexical_match.aliases.append(child_name)
+                if parent.id not in impacted_ids:
+                    impacted_ids.append(parent.id)
+                impacted_ids.append(lexical_match.id)
+                return GraphApplyResult(changed_node_ids=changed_ids, impacted_node_ids=impacted_ids)
+
+            # Phase 2: LLM semantic check (only if checker provided and lexical failed)
+            if similarity_checker is not None:
+                from .topic_similarity import SimilarityCandidate
+                candidates = []
+                child_list = []
+                for child_id in parent.children_ids:
+                    child = self.get_node(child_id)
+                    if child and child.status == "active":
+                        candidates.append(SimilarityCandidate(
+                            name_a=child.name,
+                            name_b=child_name,
+                            context_a=list(parent_path),
+                            context_b=list(parent_path),
+                        ))
+                        child_list.append(child)
+                if candidates:
+                    results = await similarity_checker.check_batch(candidates)
+                    for result, child in zip(results, child_list):
+                        if result.is_similar:
+                            logger.info(
+                                f"[TopicGraph] LLM dedup: reusing existing node "
+                                f"'{child.name}' instead of creating '{child_name}' "
+                                f"(confidence={result.confidence:.2f}, reason={result.reason})"
+                            )
+                            if child_name not in child.aliases and child_name != child.name:
+                                child.aliases.append(child_name)
+                            if parent.id not in impacted_ids:
+                                impacted_ids.append(parent.id)
+                            impacted_ids.append(child.id)
+                            return GraphApplyResult(changed_node_ids=changed_ids, impacted_node_ids=impacted_ids)
+
         node = self.create_node(name=child_name, parent_path=parent_path, aliases=[], replacement_target_id=None, lineage=[], summary_version="", detail_version="", status="active")
         changed_ids.append(node.id)
         impacted_ids.append(node.id)
-        parent = self.get_node_by_path(parent_path)
         if parent and parent.id not in impacted_ids:
             impacted_ids.append(parent.id)
         return GraphApplyResult(changed_node_ids=changed_ids, impacted_node_ids=impacted_ids)
@@ -323,11 +387,15 @@ class TopicGraph:
             impacted.update(desc.id for desc in self.get_descendants(node_id))
         return GraphApplyResult(changed_node_ids=sorted(changed), impacted_node_ids=sorted(impacted))
 
-    def split_node(self, source_node_id: str, target_paths: List[List[str]]) -> GraphApplyResult:
+    async def split_node(self, source_node_id: str, target_paths: List[List[str]], similarity_checker: "TopicSimilarityChecker | None" = None) -> GraphApplyResult:
         source = self.get_node(source_node_id)
         source.status = "deprecated"
         source.lineage.append("/".join(source.path))
-        created = [self.apply_new_leaf(parent_path=path[:-1], child_name=path[-1]).changed_node_ids[0] for path in target_paths]
+        created = []
+        for path in target_paths:
+            result = await self.apply_new_leaf(parent_path=path[:-1], child_name=path[-1], similarity_checker=similarity_checker)
+            created.extend(result.changed_node_ids)
+        created = list(dict.fromkeys(created))  # dedup preserving order
         impacted = [source_node_id, *created, *[item.id for item in self.get_descendants(source_node_id)]]
         return GraphApplyResult(changed_node_ids=[source_node_id, *created], impacted_node_ids=impacted)
 
@@ -338,9 +406,9 @@ class TopicGraph:
         source.lineage.append("/".join(source.path))
         impacted = [source_node_id, replacement_node_id, *[item.id for item in self.get_descendants(source_node_id)]]
         return GraphApplyResult(changed_node_ids=[source_node_id, replacement_node_id], impacted_node_ids=impacted)
-    def apply_auto_mutation(self, proposal: MutationProposal) -> GraphApplyResult:
+    async def apply_auto_mutation(self, proposal: MutationProposal, similarity_checker: "TopicSimilarityChecker | None" = None) -> GraphApplyResult:
         if proposal.type == "create_leaf":
-            return self.apply_new_leaf(parent_path=proposal.target_parent_path, child_name=proposal.target_name)
+            return await self.apply_new_leaf(parent_path=proposal.target_parent_path, child_name=proposal.target_name, similarity_checker=similarity_checker)
         if proposal.type == "add_alias":
             node = self.get_node(proposal.affected_node_ids[0])
             node.aliases.append(proposal.target_name)
@@ -373,7 +441,7 @@ class TopicGraph:
                 return proposal
         return None
 
-    def finalize_additional_path(self, requested_path: List[str], proposals: List[MutationProposal], source_identity: dict[str, str]) -> tuple[SecondaryPlacementResult, List[DeferredMutationRecord]]:
+    async def finalize_additional_path(self, requested_path: List[str], proposals: List[MutationProposal], source_identity: dict[str, str], similarity_checker: "TopicSimilarityChecker | None" = None) -> tuple[SecondaryPlacementResult, List[DeferredMutationRecord]]:
         proposal = self._find_primary_path_proposal(requested_path, proposals)
         if proposal is None:
             node = self.get_node_by_path(requested_path)
@@ -386,7 +454,7 @@ class TopicGraph:
             ), []
         decision = self.evaluate_mutation(proposal)
         if decision.status == "auto_apply":
-            self.apply_auto_mutation(proposal)
+            await self.apply_auto_mutation(proposal, similarity_checker=similarity_checker)
             node = self.get_node_by_path(proposal.target_paths[0])
             return SecondaryPlacementResult(
                 requested_path=requested_path,
@@ -404,14 +472,14 @@ class TopicGraph:
             deferred_path=proposal.target_paths[0],
         ), [self.build_deferred_mutation_record(proposal, source_identity)]
 
-    def finalize_resolution(self, resolution: TopicResolution) -> GraphPlacementResult:
+    async def finalize_resolution(self, resolution: TopicResolution, similarity_checker: "TopicSimilarityChecker | None" = None) -> GraphPlacementResult:
         deferred_records: List[DeferredMutationRecord] = []
         primary_path = resolution.requested_primary_path
         primary_proposal = self._find_primary_path_proposal(primary_path, resolution.mutation_proposals)
         for proposal in resolution.mutation_proposals:
             decision = self.evaluate_mutation(proposal)
             if decision.status == "auto_apply":
-                self.apply_auto_mutation(proposal)
+                await self.apply_auto_mutation(proposal, similarity_checker=similarity_checker)
                 if proposal is primary_proposal:
                     primary_path = proposal.target_paths[0]
                 continue
@@ -419,7 +487,7 @@ class TopicGraph:
                 deferred_records.append(self.build_deferred_mutation_record(proposal, resolution.source_identity))
         secondary_placements: List[SecondaryPlacementResult] = []
         for path in resolution.secondary_paths:
-            placement, secondary_records = self.finalize_additional_path(path, resolution.mutation_proposals, resolution.source_identity)
+            placement, secondary_records = await self.finalize_additional_path(path, resolution.mutation_proposals, resolution.source_identity, similarity_checker=similarity_checker)
             secondary_placements.append(placement)
             deferred_records.extend(secondary_records)
             

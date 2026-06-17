@@ -14,11 +14,26 @@ Cookie 获取方式（浏览器手动复制）：
 """
 
 import asyncio
+import re
 from typing import Optional
 
 from loguru import logger
 
 from app.services import douyin_bridge
+
+# 抖音 desc 中 hashtag 的分隔模式：空格 + #xxx 或 空格 + 中文标签
+_HASHTAG_PATTERN = re.compile(r'\s+[#＃].*$')
+
+
+def _strip_trailing_hashtags(desc: str) -> str:
+    """去除抖音描述尾部的 hashtag（如 #皮肤问题 #健康科普），保留纯标题。
+
+    抖音 desc 格式示例：
+      "9种会变丑的常见皮肤病，不用过度治疗！ #皮肤问题 #皮肤健康 #健康科普"
+      "Claude code命令使用指南 cc基本命令使用 #claudecode #AI辅助开发"
+    """
+    cleaned = _HASHTAG_PATTERN.sub('', desc).strip()
+    return cleaned if cleaned else desc
 
 
 class DouyinService:
@@ -81,29 +96,62 @@ class DouyinService:
         result = await douyin_bridge.fetch_collection_videos(
             cookie=self.cookie, cursor=max_cursor, count=count
         )
+        has_more = int(result.get("has_more") or 0)
+        # 收藏夹API返回游标字段为 cursor，创作者API为 max_cursor
+        next_cursor = int(result.get("max_cursor") or result.get("cursor") or 0)
+        logger.debug(f"[Douyin] 收藏夹API返回: has_more={has_more}, cursor={next_cursor}，raw_keys={list(result.keys())}")
         return {
             "aweme_list": result.get("aweme_list") or [],
-            "has_more": int(result.get("has_more") or 0),
-            "max_cursor": int(result.get("max_cursor") or 0),
+            "has_more": has_more,
+            "max_cursor": next_cursor,
         }
 
-    async def get_all_collection_videos(self, max_pages: int = 200) -> list[dict]:
+    async def get_all_collection_videos(
+        self,
+        after_date: Optional[str] = None,
+        max_pages: int = 200,
+    ) -> list[dict]:
         """
-        获取全部收藏夹视频（自动翻页）。
+        获取全部收藏夹视频（自动翻页），可按收藏日期过滤。
+
+        收藏夹 API 按收藏时间倒序返回，max_cursor 即为收藏时间戳。
+        API 不返回单条视频的收藏时间字段，因此：
+        - 翻页时通过 max_cursor 粗粒度提前停止（整页都早于 after_date 时停止）
+        - 页内所有视频均保留（含发布时间早但收藏时间晚的视频）
 
         Args:
+            after_date: 'YYYY-MM-DD' 格式，仅返回此日期之后收藏的视频（含当天）
             max_pages: 最大翻页次数，防止无限循环（默认 200 页 × 20 条 = 4000 个）
 
         Returns:
             视频数据列表，每条为 dict（原始 Douyin API 格式）
         """
+        after_ts: Optional[int] = None
+        if after_date:
+            try:
+                from datetime import datetime as _dt
+                after_ts = int(_dt.strptime(after_date, "%Y-%m-%d").timestamp())
+            except ValueError:
+                logger.warning(f"[Douyin] 无效的 after_date: {after_date}，将忽略日期过滤")
+
+        def _cursor_to_str(cursor: int) -> str:
+            """将游标转为可读日期字符串"""
+            if not cursor:
+                return "0"
+            ts = cursor // 1_000_000 if cursor > 1e12 else cursor
+            try:
+                from datetime import datetime as _dt
+                return _dt.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+            except (OSError, ValueError):
+                return str(cursor)
+
         all_videos: list[dict] = []
         max_cursor = 0
         page = 0
 
         while page < max_pages:
             page += 1
-            logger.debug(f"[Douyin] 获取收藏夹第 {page} 页 (max_cursor={max_cursor})")
+            logger.debug(f"[Douyin] 获取收藏夹第 {page} 页 (cursor={_cursor_to_str(max_cursor)})")
 
             try:
                 data = await self.get_collection_videos_page(max_cursor=max_cursor)
@@ -123,6 +171,14 @@ class DouyinService:
 
             max_cursor = data.get("max_cursor", 0)
             if not max_cursor:
+                break
+
+            # 收藏夹按收藏时间倒序：当前页最后一条的收藏时间（max_cursor）
+            # 早于 after_ts，说明后续页都是更早收藏的，无需继续翻页
+            # 注意：游标可能是微秒（收藏夹 cursor）或秒（创作者 max_cursor），需统一为秒比较
+            cursor_sec = max_cursor // 1_000_000 if max_cursor > 1e12 else max_cursor
+            if after_ts and cursor_sec < after_ts:
+                logger.debug(f"[Douyin] cursor={_cursor_to_str(max_cursor)} 早于 {after_date}，停止翻页")
                 break
 
             await asyncio.sleep(0.8)
@@ -234,7 +290,9 @@ class DouyinService:
             share_url   str   分享 URL
         """
         aweme_id = raw.get("aweme_id") or raw.get("id") or ""
-        title = (raw.get("desc") or "").strip() or aweme_id
+        desc = (raw.get("desc") or "").strip() or aweme_id
+        # 抖音 desc 包含标题 + hashtag，截取纯标题部分
+        title = _strip_trailing_hashtags(desc)
 
         author = raw.get("author") or {}
         author_name = author.get("nickname") or "未知作者"

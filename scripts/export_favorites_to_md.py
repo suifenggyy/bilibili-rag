@@ -40,13 +40,13 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
+
 from loguru import logger
 from app.services.content_summary import append_summary_section
 from app.services.processing_status import ProcessingStatusService
 from app.database import get_db_context
 from app.services.content_storage import ContentStorageManager
-
-load_dotenv(ROOT_DIR / ".env")
 
 # 本地 session 缓存文件（保存在项目根目录，不提交到 git）
 SESSION_CACHE_FILE = ROOT_DIR / ".bili_session.json"
@@ -61,7 +61,8 @@ DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
     """将字符串转为合法文件名"""
-    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r'[\\/:*?"<>|#]', "_", name)
+    name = name.replace("？", "_")
     name = re.sub(r"\s+", " ", name).strip()
     return name[:max_len] if len(name) > max_len else name
 
@@ -349,6 +350,7 @@ async def export_folder(
     fetcher,
     folder: dict,
     output_dir: Path,
+    after_date: str = "",
 ) -> tuple[int, int]:
     """
     导出单个收藏夹
@@ -393,6 +395,18 @@ async def export_folder(
     if invalid_count:
         print(f"   ⚠️  过滤掉 {invalid_count} 个失效视频")
 
+    # 按收藏时间过滤
+    if after_date and after_date.strip():
+        try:
+            after_ts = int(datetime.strptime(after_date.strip(), "%Y-%m-%d").timestamp())
+            before = len(valid_videos)
+            valid_videos = [v for v in valid_videos if (v.get("fav_time") or v.get("pubtime") or v.get("ctime") or 0) >= after_ts]
+            filtered = before - len(valid_videos)
+            if filtered:
+                print(f"   🗓️  日期过滤：跳过 {filtered} 个 {after_date.strip()} 前收藏的视频（剩余 {len(valid_videos)} 个）")
+        except ValueError:
+            print(f"   ⚠️  --after-date 格式无效: {after_date}，将导出全部视频")
+
     _proc_svc = ProcessingStatusService()
 
     for i, video in enumerate(valid_videos, 1):
@@ -404,28 +418,29 @@ async def export_folder(
         safe_title = _safe_filename(title)
         md_path = output_dir / f"{safe_title}_{bvid}.md"
 
-        # 检查 DB 状态，已完成则跳过
-        already_done = False
+        # 检查 DB 导出状态（completed + md_path 文件存在）
+        already_exported = False
         try:
             async with get_db_context() as db:
                 proc_rec = await _proc_svc.get_or_create(db, "bilibili", bvid, title)
                 await db.commit()
-                already_done = _proc_svc.is_completed(proc_rec)
+                already_exported = _proc_svc.is_exported(proc_rec)
         except Exception as _db_err:
             logger.debug(f"DB 状态检查失败（跳过）: {_db_err}")
 
-        if already_done and md_path.exists():
-            print(f"   [{i}/{len(valid_videos)}] ⏭️  已完成，跳过：{title[:40]}")
+        if already_exported:
+            print(f"   [{i}/{len(valid_videos)}] ⏭️  已导出，跳过：{title[:40]}")
             success += 1
             continue
 
-        # 文件存在但 DB 无记录时也跳过（兼容旧数据）
-        if md_path.exists() and not already_done:
-            print(f"   [{i}/{len(valid_videos)}] ⏭️  已存在，跳过：{title[:40]}")
-            success += 1
-            continue
-
-        print(f"   [{i}/{len(valid_videos)}] 🔄 处理中：{title[:50]}", end="", flush=True)
+        # DB 标记完成但文件丢失 → 重新处理
+        if proc_rec and _proc_svc.is_completed(proc_rec) and not md_path.exists():
+            print(f"   [{i}/{len(valid_videos)}] 🔄 文件丢失，重新处理：{title[:40]}")
+        elif md_path.exists():
+            # 文件存在但 DB 未标记导出 → 重新处理并更新 DB
+            print(f"   [{i}/{len(valid_videos)}] 🔄 重新处理（DB 未标记导出）：{title[:40]}")
+        else:
+            print(f"   [{i}/{len(valid_videos)}] 🔄 处理中：{title[:50]}", end="", flush=True)
 
         try:
             from app.models import ContentSource
@@ -462,7 +477,7 @@ async def export_folder(
                     summary = getattr(video_content, "summary_block", None)
                     if summary:
                         await _proc_svc.mark_summary_done(db, rec, summary)
-                    await _proc_svc.mark_completed(db, rec)
+                    await _proc_svc.mark_completed(db, rec, md_path=str(md_path.resolve()))
                     await db.commit()
             except Exception as _db_err:
                 logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
@@ -591,6 +606,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--folder-id", type=int, help="指定收藏夹 ID（media_id）")
     parser.add_argument("--all", action="store_true", help="导出所有收藏夹")
     parser.add_argument(
+        "--after-date",
+        default=_get_env("BILIBILI_AFTER_DATE"),
+        help="只导出该日期（含）之后收藏的视频，格式 YYYY-MM-DD（留空则不限制）",
+    )
+    parser.add_argument(
         "--output-dir",
         default=DEFAULT_OUTPUT_DIR,
         help=f"输出目录（默认写入 {DEFAULT_OUTPUT_DIR}）",
@@ -676,12 +696,17 @@ async def main():
             print("未选择任何收藏夹，退出")
             sys.exit(0)
 
+        # 解析实际 after_date
+        effective_after = storage_manager.resolve_after_date("bilibili", args.after_date)
+        if effective_after:
+            print(f"🗓️  日期过滤：仅获取 {effective_after} 之后收藏的视频")
+
         # 开始导出
         print(f"\n🚀 开始导出 {len(selected)} 个收藏夹 → {output_dir.resolve()}")
         total_success, total_failed = 0, 0
 
         for folder in selected:
-            s, f = await export_folder(bili, asr, fetcher, folder, output_dir)
+            s, f = await export_folder(bili, asr, fetcher, folder, output_dir, after_date=effective_after)
             total_success += s
             total_failed += f
 

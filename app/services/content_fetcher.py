@@ -104,6 +104,34 @@ class ContentFetcher:
         # Level 1: 跳过 AI 摘要，优先使用 ASR
         logger.info(f"[{bvid}] 已跳过 AI 摘要，优先使用 ASR")
 
+        # ========== 工作区缓存复用 ==========
+        # asr_raw.txt 缓存命中 → 跳过下载 + ASR
+        cached_asr = self.storage_manager.read_work_text("bilibili", title, "asr_raw.txt")
+        if cached_asr:
+            logger.info(f"[{bvid}] [CACHE HIT] asr_raw.txt 缓存命中，跳过下载和 ASR")
+            raw_asr = cached_asr
+            asr_text = await self._postprocess_asr_text(bvid, raw_asr, title=title)
+            self._persist_text_artifact(title, "asr_corrected.txt", asr_text)
+
+            # Append top-20 hot comments (best-effort, non-blocking)
+            aid = (video_info or {}).get("aid")
+            if aid:
+                comments = await fetch_bilibili_comments(aid)
+                if comments:
+                    asr_text += format_comments_section(comments)
+
+            summary_block = await self._summarize_content(bvid, asr_text)
+            logger.info(f"[{bvid}] 使用缓存 ASR 文本")
+            return VideoContent(
+                bvid=bvid,
+                title=title,
+                content=asr_text,
+                source=ContentSource.ASR,
+                summary_block=summary_block,
+                asr_raw_text=raw_asr,
+            )
+        # ========== 缓存未命中，走完整 ASR 流程 ==========
+
         asr_text = await self._try_asr(
             bvid,
             cid,
@@ -168,6 +196,22 @@ class ContentFetcher:
     ) -> Optional[str]:
         """尝试进行音频转写"""
         try:
+            # 检查工作区中是否已有音频文件缓存
+            cached_audio = self._find_cached_audio(title or bvid)
+            if cached_audio:
+                logger.info(f"[{bvid}] [CACHE HIT] 音频文件缓存命中，跳过下载 ({cached_audio.name})")
+                # 如果有 WAV 优先用 WAV，否则尝试转码
+                wav_path = self.storage_manager.find_work_file_path("bilibili", title or bvid, "audio.wav")
+                if wav_path and wav_path.exists() and wav_path.stat().st_size >= 1024:
+                    text = await self.asr.transcribe_local_file(str(wav_path), title=title or bvid)
+                else:
+                    text = await self.asr.transcribe_local_file(str(cached_audio), title=title or bvid)
+                if text and len(text) >= 50:
+                    preview = text[:120].replace("\n", " ").strip()
+                    logger.info(f"[{bvid}] 缓存音频 ASR 成功，长度={len(text)}，预览：{preview}")
+                    return text
+                logger.info(f"[{bvid}] 缓存音频 ASR 失败或内容过少，回退完整流程")
+
             audio_url = await self.bili.get_audio_url(bvid, cid)
             if not audio_url:
                 logger.info(f"[{bvid}] 未获取到音频 URL")
@@ -351,6 +395,36 @@ class ContentFetcher:
         if not (text or "").strip():
             return
         self.storage_manager.write_work_text("bilibili", title, filename, text.strip())
+
+    def _find_cached_audio(self, title: str) -> Optional[os.PathLike]:
+        """在工作区中搜索已缓存的音频文件（B站多种命名模式）。"""
+        source_dir = self.storage_manager.workspace_root / self.storage_manager._sanitize_segment("bilibili")
+        if not source_dir.exists():
+            return None
+        safe_title = self.storage_manager._sanitize_segment(title)
+        import re as _re
+        date_pattern = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
+        candidates: list = []
+        for date_dir in source_dir.iterdir():
+            if not date_dir.is_dir() or not date_pattern.match(date_dir.name):
+                continue
+            title_dir = date_dir / safe_title
+            if not title_dir.exists():
+                continue
+            for f in title_dir.iterdir():
+                if not f.is_file():
+                    continue
+                # 匹配 audio.m4s, audio.mp3, audio_<title>.mp3, audio_<title>.m4s 等
+                if f.name.startswith("audio") and f.suffix in (".m4s", ".mp3", ".mp4", ".wav") and f.stat().st_size >= 1024:
+                    # 优先 WAV（已转码），然后其他格式
+                    candidates.append(f)
+        if not candidates:
+            return None
+        # WAV 优先（可直接用于 ASR），否则取最大文件
+        wav_files = [f for f in candidates if f.suffix == ".wav"]
+        if wav_files:
+            return wav_files[0]
+        return max(candidates, key=lambda f: f.stat().st_size)
 
     def _transcode_audio_to_wav(self, bvid: str, file_path: str) -> Optional[str]:
         """使用 ffmpeg 转码为 16k 单声道 wav，提高 ASR 兼容性"""

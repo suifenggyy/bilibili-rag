@@ -275,7 +275,7 @@ class XiaoyuzhouService:
             raise RuntimeError("未登录小宇宙，请先调用 login_with_sms()")
 
         url = f"{self.API_BASE}/v1/inbox/list"
-        body: dict = {}
+        body: dict = {"limit": limit}
         if load_more_key:
             body["loadMoreKey"] = load_more_key
 
@@ -335,7 +335,7 @@ class XiaoyuzhouService:
                 f"{self.API_BASE}/v1/collect/list",
             ]
         )
-        body: dict = {}
+        body: dict = {"limit": limit}
         if load_more_key:
             body["loadMoreKey"] = load_more_key
 

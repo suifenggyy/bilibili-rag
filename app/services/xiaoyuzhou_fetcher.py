@@ -121,6 +121,51 @@ class XiaoyuzhouContentFetcher:
 
         # 使用播客标题+集数标题作为文件目录标识
         storage_title = f"{podcast_title}_{title}" if podcast_title else title
+
+        # ========== 工作区缓存复用 ==========
+        # 1. asr_raw.txt 缓存命中 → 跳过下载 + ASR
+        cached_asr = self.storage_manager.read_work_text("xiaoyuzhou", storage_title, "asr_raw.txt")
+        if cached_asr:
+            logger.info(f"[XiaoyuzhouFetcher] [CACHE HIT] asr_raw.txt 缓存命中，跳过下载和 ASR: {episode_id}")
+            raw_asr = cached_asr
+            base.content = await self._postprocess_asr_text(episode_id, raw_asr, title=title)
+            base.asr_raw_text = raw_asr
+            self.storage_manager.write_work_text("xiaoyuzhou", storage_title, "asr_corrected.txt", base.content.strip())
+            base.content_source = "asr"
+            base.summary_block = await self._summarize_content(episode_id, base.content)
+            return base
+
+        # 2. audio.wav 缓存命中 → 跳过下载，直接 ASR
+        if self.storage_manager.work_file_exists("xiaoyuzhou", storage_title, "audio.wav", min_size=1024):
+            logger.info(f"[XiaoyuzhouFetcher] [CACHE HIT] audio.wav 缓存命中，跳过下载: {episode_id}")
+            wav_path = str(self.storage_manager.find_work_file_path("xiaoyuzhou", storage_title, "audio.wav"))
+            transcript = await self.asr.transcribe_local_file(wav_path, title=title or episode_id)
+            if transcript and len(transcript) >= 50:
+                self.storage_manager.write_work_text("xiaoyuzhou", storage_title, "asr_raw.txt", transcript.strip())
+                raw_asr = transcript.strip()
+                base.content = await self._postprocess_asr_text(episode_id, transcript, title=title)
+                base.asr_raw_text = raw_asr
+                self.storage_manager.write_work_text("xiaoyuzhou", storage_title, "asr_corrected.txt", base.content.strip())
+                base.content_source = "asr"
+                base.summary_block = await self._summarize_content(episode_id, base.content)
+                return base
+
+        # 3. audio.mp3 缓存命中 → 跳过下载，走 ffmpeg + ASR
+        if self.storage_manager.work_file_exists("xiaoyuzhou", storage_title, "audio.mp3", min_size=10 * 1024):
+            logger.info(f"[XiaoyuzhouFetcher] [CACHE HIT] audio.mp3 缓存命中，跳过下载: {episode_id}")
+            mp3_path = str(self.storage_manager.find_work_file_path("xiaoyuzhou", storage_title, "audio.mp3"))
+            transcript = await self._extract_and_transcribe(mp3_path, episode_id, title, storage_title=storage_title)
+            if transcript:
+                self.storage_manager.write_work_text("xiaoyuzhou", storage_title, "asr_raw.txt", transcript.strip())
+                raw_asr = transcript.strip()
+                base.content = await self._postprocess_asr_text(episode_id, transcript, title=title)
+                base.asr_raw_text = raw_asr
+                self.storage_manager.write_work_text("xiaoyuzhou", storage_title, "asr_corrected.txt", base.content.strip())
+                base.content_source = "asr"
+                base.summary_block = await self._summarize_content(episode_id, base.content)
+                return base
+
+        # ========== 无缓存，完整流程 ==========
         tmp_audio = str(
             self.storage_manager.build_work_file_path("xiaoyuzhou", storage_title, "audio.mp3")
         )
@@ -133,7 +178,7 @@ class XiaoyuzhouContentFetcher:
 
             self.storage_manager.cleanup_workspace_if_needed()
 
-            transcript = await self._extract_and_transcribe(tmp_audio, episode_id, title)
+            transcript = await self._extract_and_transcribe(tmp_audio, episode_id, title, storage_title=storage_title)
             if transcript:
                 self.storage_manager.write_work_text("xiaoyuzhou", storage_title, "asr_raw.txt", transcript.strip())
                 raw_asr = transcript.strip()
@@ -197,11 +242,11 @@ class XiaoyuzhouContentFetcher:
             return False
 
     async def _extract_and_transcribe(
-        self, audio_path: str, episode_id: str, title: str
+        self, audio_path: str, episode_id: str, title: str, storage_title: str = ""
     ) -> Optional[str]:
-        storage_title = title
+        effective_title = storage_title or title
         wav_path = str(
-            self.storage_manager.build_work_file_path("xiaoyuzhou", storage_title, "audio.wav")
+            self.storage_manager.build_work_file_path("xiaoyuzhou", effective_title, "audio.wav")
         )
         converted = await asyncio.to_thread(self._to_wav, audio_path, wav_path)
         if not converted:

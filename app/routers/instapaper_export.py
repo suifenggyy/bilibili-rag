@@ -359,9 +359,9 @@ async def download_instapaper_export(job_id: str):
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        export_root = os.path.expanduser(settings.collection_output_dir)
+        inbox_root = str(storage_manager.get_inbox_dir())
         for abs_path in output_files:
-            zf.write(abs_path, os.path.relpath(abs_path, export_root))
+            zf.write(abs_path, os.path.relpath(abs_path, inbox_root))
     zip_buffer.seek(0)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -105,16 +105,41 @@ class KnowledgePipelineOrchestrator:
         return await self.process_files(paths)
 
     async def process_single_file(self, path: Path) -> FileProcessResult:
-        """处理单个文件，执行完整流水线。"""
+        """处理单个文件，执行完整流水线。处理完成后自动归档到 done/ 或 failed/。"""
         start = time.monotonic()
         try:
-            return await self._run_pipeline(path, start)
+            result = await self._run_pipeline(path, start)
         except Exception as exc:
             elapsed = time.monotonic() - start
             logger.error(f"[Orchestrator] 处理失败: {path.name} - {exc}")
-            return FileProcessResult(
+            result = FileProcessResult(
                 path=path, success=False, error=str(exc), elapsed=elapsed
             )
+
+        # Archive: 成功 → done/, 失败 → failed/
+        dest_dir = "done" if result.success else "failed"
+        self._archive_file(path, dest_dir)
+        return result
+
+    def _archive_file(self, path: Path, dest_dir: str) -> None:
+        """将处理后的文件移动到 inbox 下的 done/ 或 failed/ 子目录。"""
+        if not path.exists():
+            return
+        target_dir = Path(self._inbox_dir) / dest_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / path.name
+        # 同名文件已存在时添加序号后缀
+        if target.exists():
+            stem, suffix = path.stem, path.suffix
+            n = 1
+            while target.exists():
+                target = target_dir / f"{stem}_{n}{suffix}"
+                n += 1
+        try:
+            path.replace(target)
+            logger.debug(f"[Orchestrator] 归档: {path.name} → {dest_dir}/")
+        except OSError as e:
+            logger.warning(f"[Orchestrator] 归档失败: {path.name} → {dest_dir}/: {e}")
 
     # ==================== Internal pipeline ====================
 
@@ -151,9 +176,12 @@ class KnowledgePipelineOrchestrator:
         mapping_records = mapping_records_container.get("items", [])
         
         # 3. Distillation (replaces flat Classifier)
-        from app.services.knowledge_pipeline.llm_processor import DistillerProcessor, TopicPathProcessor
+        from app.services.knowledge_pipeline.llm_processor import DistillerProcessor, TopicPathProcessor, TopicDedupProcessor
+        from app.services.knowledge_pipeline.topic_similarity import LLMTopicSimilarityChecker
         distill_processor = getattr(self, '_distill_processor', None) or DistillerProcessor()
         path_processor = getattr(self, '_path_processor', None) or TopicPathProcessor()
+        dedup_processor = getattr(self, '_dedup_processor', None) or TopicDedupProcessor()
+        similarity_checker = LLMTopicSimilarityChecker(processor=dedup_processor)
 
         distiller = KnowledgeDistiller(distill_processor)
         # Pass context
@@ -174,9 +202,9 @@ class KnowledgePipelineOrchestrator:
         units = units_result.knowledge
         
         # 4. Resolve Path
-        resolver = TopicPathResolver(path_processor)
+        resolver = TopicPathResolver(path_processor, similarity_checker=similarity_checker)
         resolution = await resolver.resolve(units, graph)
-        placement = graph.finalize_resolution(resolution)
+        placement = await graph.finalize_resolution(resolution, similarity_checker=similarity_checker)
         
         # 5. Render & Write Note
         note_id = build_knowledge_note_id({

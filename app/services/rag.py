@@ -5,74 +5,56 @@ RAG 服务模块 - 向量存储与问答
 """
 from typing import List, Optional
 from loguru import logger
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.schema import Document
-from langchain.prompts import ChatPromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
-from langchain.schema.output_parser import StrOutputParser
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from app.config import settings
 from app.models import VideoContent
+from app.services.llm.factory import get_langchain_chat, get_embeddings
 
 
 class RAGService:
     """
     RAG 服务
-    
+
     负责：
     1. 向量存储管理
     2. 文档添加与检索
     3. 问答功能
     """
-    
+
     def __init__(self, collection_name: str = "bilibili_videos"):
         """
         初始化 RAG 服务
-        
+
         Args:
             collection_name: 向量集合名称
         """
         self.collection_name = collection_name
-        
-        # 初始化 Embeddings (使用 DashScope 原生支持)
-        try:
-            from langchain_community.embeddings import DashScopeEmbeddings
-            self.embeddings = DashScopeEmbeddings(
-                dashscope_api_key=settings.openai_api_key,
-                model=settings.embedding_model
-            )
-            logger.info("使用 DashScopeEmbeddings 初始化成功")
-        except ImportError:
-            self.embeddings = OpenAIEmbeddings(
-                api_key=settings.openai_api_key,
-                base_url=settings.openai_base_url,
-                model=settings.embedding_model,
-                check_embedding_ctx_length=False
-            )
-        
+
+        # 初始化 Embeddings (通过统一工厂层)
+        self.embeddings = get_embeddings("rag_embedding")
+
         # 初始化向量存储
         self.vectorstore = Chroma(
             collection_name=collection_name,
             embedding_function=self.embeddings,
             persist_directory=settings.chroma_persist_directory
         )
-        
-        # 初始化 LLM
-        self.llm = ChatOpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url,
-            model=settings.llm_model,
-            temperature=0.5
-        )
-        
+
+        # 初始化 LLM (通过统一工厂层)
+        self.llm = get_langchain_chat("rag_qa")
+
         # 文本分割器
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
             separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", " "]
         )
-        
+
         # 问答提示模板
         self.qa_prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个知识库助手，专门基于用户收藏的 B站视频内容来回答问题。
@@ -88,7 +70,7 @@ class RAGService:
 """),
             ("human", "{question}")
         ])
-        
+
         # 无内容时的通用回复模板
         self.fallback_prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个友好的助手。用户在使用一个B站收藏夹知识库系统。
@@ -103,7 +85,7 @@ class RAGService:
 """),
             ("human", "{question}")
         ])
-        
+
         # 摘要提示模板
         self.summary_prompt = ChatPromptTemplate.from_messages([
             ("system", """你是一个内容总结专家。请对以下视频字幕内容进行总结。
@@ -116,24 +98,24 @@ class RAGService:
 字幕内容："""),
             ("human", "{content}")
         ])
-    
+
     def add_video_content(self, video: VideoContent) -> int:
         """
         添加单个视频内容到向量库
-        
+
         Args:
             video: VideoContent 对象
-            
+
         Returns:
             添加的文档块数量
         """
         # 构建完整内容（正文不带标题，避免标题相似度主导召回）
         title = video.title or "未知标题"
         content_parts: List[str] = []
-        
+
         if video.content and video.content.strip():
             content_parts.append(video.content.strip())
-        
+
         # 如果有分段提纲，添加结构化信息
         if video.outline:
             outline_text = "\n## 内容提纲\n"
@@ -146,27 +128,27 @@ class RAGService:
                         outline_text += f"- {point_content}\n"
             if outline_text.strip() != "## 内容提纲":
                 content_parts.append(outline_text)
-        
+
         full_content = "\n\n".join(content_parts).strip()
-        
+
         # 验证内容不为空
         if not full_content or len(full_content.strip()) < 10:
             logger.warning(f"[{video.bvid}] 内容太少，跳过")
             return 0
-        
+
         # 分块
         chunks = self.text_splitter.split_text(full_content)
-        
+
         if not chunks:
             logger.warning(f"[{video.bvid}] 没有生成文档块")
             return 0
-        
+
         # 过滤空内容块
         valid_chunks = [c for c in chunks if c and c.strip() and len(c.strip()) > 5]
         if not valid_chunks:
             logger.warning(f"[{video.bvid}] 没有有效的文档块")
             return 0
-        
+
         # 创建文档
         documents = []
         for i, chunk in enumerate(valid_chunks):
@@ -181,7 +163,7 @@ class RAGService:
                 }
             )
             documents.append(doc)
-        
+
         # 添加到向量库
         try:
             batch_size = 10
@@ -191,43 +173,43 @@ class RAGService:
         except Exception as e:
             logger.error(f"[{video.bvid}] 添加到向量库失败: {e}")
             raise
-        
+
         return len(documents)
-    
+
     def add_videos_batch(self, videos: List[VideoContent], progress_callback=None) -> dict:
         """
         批量添加视频到向量库
-        
+
         Args:
             videos: VideoContent 列表
             progress_callback: 进度回调 callback(current, total, title)
-            
+
         Returns:
             {"success": 成功数, "failed": 失败数, "chunks": 总块数}
         """
         success = 0
         failed = 0
         total_chunks = 0
-        
+
         for i, video in enumerate(videos):
             try:
                 chunks = self.add_video_content(video)
                 total_chunks += chunks
                 success += 1
-                
+
                 if progress_callback:
                     progress_callback(i + 1, len(videos), video.title)
-                    
+
             except Exception as e:
                 logger.error(f"添加视频失败 [{video.bvid}]: {e}")
                 failed += 1
-        
+
         return {
             "success": success,
             "failed": failed,
             "chunks": total_chunks
         }
-    
+
     def search(self, query: str, k: int = 5, bvids: Optional[List[str]] = None) -> List[Document]:
         """
         检索相关内容
@@ -235,7 +217,7 @@ class RAGService:
         if not query or not query.strip():
             logger.warning("检索查询为空")
             return []
-            
+
         try:
             if bvids:
                 docs = self.vectorstore.similarity_search(query, k=k, filter={"bvid": {"$in": bvids}})
@@ -255,15 +237,15 @@ class RAGService:
         except Exception as e:
             logger.warning(f"向量检索失败: {e}")
             return []
-    
+
     async def _fallback_answer(self, question: str, reason: str = "") -> dict:
         """
         当没有检索到内容时，让 AI 自然回复
-        
+
         Args:
             question: 用户问题
             reason: 原因说明
-            
+
         Returns:
             回答结果
         """
@@ -274,7 +256,7 @@ class RAGService:
                 | self.llm
                 | StrOutputParser()
             )
-            
+
             answer = await chain.ainvoke(question)
             return {
                 "answer": answer,
@@ -290,12 +272,12 @@ class RAGService:
     async def answer_question(self, question: str, k: int = 5, bvids: Optional[List[str]] = None) -> dict:
         """
         回答问题
-        
+
         Args:
             question: 用户问题
             k: 检索文档数量
             bvids: 可选，限制在这些视频范围内搜索
-            
+
         Returns:
             {
                 "answer": 回答内容,
@@ -307,31 +289,31 @@ class RAGService:
         if stats["total_chunks"] == 0:
             # 知识库为空时，使用 fallback 让 AI 自然回复
             return await self._fallback_answer(question, "知识库目前还没有内容")
-        
+
         # 检索相关文档
         try:
             docs = self.search(question, k=k, bvids=bvids if bvids else None)
         except Exception as e:
             logger.error(f"检索失败: {e}")
             return await self._fallback_answer(question, f"检索时遇到问题")
-        
+
         if not docs:
             # 没检索到内容时，也让 AI 自然回复
             return await self._fallback_answer(question, "没有找到相关内容")
-        
+
         # 构建上下文
         context_parts = []
         seen_bvids = set()
         sources = []
-        
+
         for doc in docs:
             bvid = doc.metadata.get("bvid", "")
             title = doc.metadata.get("title", "未知标题")
             content = doc.page_content.strip()
-            
+
             if content:  # 只添加有内容的文档
                 context_parts.append(f"【{title}】\n{content}")
-            
+
             if bvid and bvid not in seen_bvids:
                 seen_bvids.add(bvid)
                 sources.append({
@@ -339,23 +321,23 @@ class RAGService:
                     "title": title,
                     "url": doc.metadata.get("url", f"https://www.bilibili.com/video/{bvid}")
                 })
-        
+
         # 如果没有有效内容
         if not context_parts:
             return {
                 "answer": "检索到了相关视频，但没有找到有效的文本内容。可能是视频还未完成内容提取。",
                 "sources": sources
             }
-        
+
         context = "\n\n---\n\n".join(context_parts)
-        
+
         # 确保 context 不为空
         if not context.strip():
             return {
                 "answer": "没有找到可用的内容来回答您的问题。",
                 "sources": sources
             }
-        
+
         # 构建链并执行
         try:
             chain = (
@@ -364,9 +346,9 @@ class RAGService:
                 | self.llm
                 | StrOutputParser()
             )
-            
+
             answer = await chain.ainvoke(question)
-            
+
             return {
                 "answer": answer,
                 "sources": sources
@@ -377,14 +359,14 @@ class RAGService:
                 "answer": f"AI 回答时发生错误: {str(e)}",
                 "sources": sources
             }
-    
+
     async def summarize_content(self, content: str) -> str:
         """
         使用 LLM 总结内容（用于字幕内容）
-        
+
         Args:
             content: 原始内容（字幕文本）
-            
+
         Returns:
             总结后的内容
         """
@@ -392,34 +374,34 @@ class RAGService:
         max_length = 10000
         if len(content) > max_length:
             content = content[:max_length] + "\n...(内容已截断)"
-        
+
         chain = (
             {"content": RunnablePassthrough()}
             | self.summary_prompt
             | self.llm
             | StrOutputParser()
         )
-        
+
         return await chain.ainvoke(content)
-    
+
     def get_collection_stats(self) -> dict:
         """
         获取向量库统计信息
-        
+
         Returns:
             统计信息字典
         """
         try:
             collection = self.vectorstore._collection
             count = collection.count()
-            
+
             # 获取唯一视频数
             result = collection.get(include=["metadatas"])
             bvids = set()
             for meta in result.get("metadatas", []):
                 if meta and "bvid" in meta:
                     bvids.add(meta["bvid"])
-            
+
             return {
                 "total_chunks": count,
                 "total_videos": len(bvids),
@@ -432,7 +414,7 @@ class RAGService:
                 "total_videos": 0,
                 "collection_name": self.collection_name
             }
-    
+
     def clear_collection(self):
         """清空向量库"""
         try:
@@ -441,11 +423,11 @@ class RAGService:
         except Exception as e:
             logger.error(f"清空向量库失败: {e}")
             raise
-    
+
     def delete_video(self, bvid: str):
         """
         删除指定视频的所有文档块
-        
+
         Args:
             bvid: 视频 BV 号
         """

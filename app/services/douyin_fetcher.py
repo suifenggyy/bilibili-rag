@@ -106,13 +106,85 @@ class DouyinContentFetcher:
             share_url=video_info.get("share_url", ""),
         )
 
+        if self.asr is None:
+            logger.warning(f"[DouyinFetcher] 未配置 ASR 服务，仅保存基本信息: {aweme_id}")
+            return base
+
+        # ========== 工作区缓存复用 ==========
+        # 1. asr_raw.txt 缓存命中 → 跳过下载 + ASR
+        cached_asr = self.storage_manager.read_work_text("douyin", title, "asr_raw.txt")
+        if cached_asr:
+            logger.info(f"[DouyinFetcher] [CACHE HIT] asr_raw.txt 缓存命中，跳过下载和 ASR: {aweme_id}")
+            raw_asr = cached_asr
+            base.content = await self._postprocess_asr_text(aweme_id, raw_asr, title=title)
+            base.asr_raw_text = raw_asr
+            self.storage_manager.write_work_text("douyin", title, "asr_corrected.txt", base.content.strip())
+            base.content_source = "asr"
+            # 获取热门评论
+            if self.cookie:
+                logger.info(f"[DouyinFetcher] 正在获取热门评论 aweme_id={aweme_id}...")
+                comments = await fetch_douyin_comments(aweme_id, self.cookie)
+                if comments:
+                    base.comments_section = format_comments_section(comments)
+                    logger.info(f"[DouyinFetcher] 评论获取成功 aweme_id={aweme_id}: {len(comments)} 条")
+                else:
+                    logger.info(f"[DouyinFetcher] 未获取到评论 aweme_id={aweme_id}")
+            else:
+                logger.info(f"[DouyinFetcher] 未配置 Cookie，跳过评论抓取 aweme_id={aweme_id}")
+            summary_input = base.content
+            if base.comments_section:
+                summary_input += base.comments_section
+            base.summary_block = await self._summarize_content(aweme_id, summary_input)
+            return base
+
+        # 2. audio.wav 缓存命中 → 跳过下载，直接 ASR
+        if self.storage_manager.work_file_exists("douyin", title, "audio.wav", min_size=1024):
+            logger.info(f"[DouyinFetcher] [CACHE HIT] audio.wav 缓存命中，跳过下载: {aweme_id}")
+            wav_path = str(self.storage_manager.find_work_file_path("douyin", title, "audio.wav"))
+            transcript = await self.asr.transcribe_local_file(wav_path, title=title or aweme_id)
+            if transcript and len(transcript) >= 50:
+                self.storage_manager.write_work_text("douyin", title, "asr_raw.txt", transcript.strip())
+                raw_asr = transcript.strip()
+                base.content = await self._postprocess_asr_text(aweme_id, transcript, title=title)
+                base.asr_raw_text = raw_asr
+                self.storage_manager.write_work_text("douyin", title, "asr_corrected.txt", base.content.strip())
+                base.content_source = "asr"
+                if self.cookie:
+                    comments = await fetch_douyin_comments(aweme_id, self.cookie)
+                    if comments:
+                        base.comments_section = format_comments_section(comments)
+                summary_input = base.content
+                if base.comments_section:
+                    summary_input += base.comments_section
+                base.summary_block = await self._summarize_content(aweme_id, summary_input)
+                return base
+
+        # 3. video.mp4 缓存命中 → 跳过下载，走 ffmpeg + ASR
+        if self.storage_manager.work_file_exists("douyin", title, "video.mp4", min_size=10 * 1024):
+            logger.info(f"[DouyinFetcher] [CACHE HIT] video.mp4 缓存命中，跳过下载: {aweme_id}")
+            video_path = str(self.storage_manager.find_work_file_path("douyin", title, "video.mp4"))
+            transcript = await self._extract_and_transcribe(video_path, aweme_id, title)
+            if transcript:
+                self.storage_manager.write_work_text("douyin", title, "asr_raw.txt", transcript.strip())
+                raw_asr = transcript.strip()
+                base.content = await self._postprocess_asr_text(aweme_id, transcript, title=title)
+                base.asr_raw_text = raw_asr
+                self.storage_manager.write_work_text("douyin", title, "asr_corrected.txt", base.content.strip())
+                base.content_source = "asr"
+                if self.cookie:
+                    comments = await fetch_douyin_comments(aweme_id, self.cookie)
+                    if comments:
+                        base.comments_section = format_comments_section(comments)
+                summary_input = base.content
+                if base.comments_section:
+                    summary_input += base.comments_section
+                base.summary_block = await self._summarize_content(aweme_id, summary_input)
+                return base
+
+        # ========== 无缓存，完整流程 ==========
         play_urls = video_info.get("play_urls") or []
         if not play_urls:
             logger.warning(f"[DouyinFetcher] 视频无播放 URL: {aweme_id}")
-            return base
-
-        if self.asr is None:
-            logger.warning(f"[DouyinFetcher] 未配置 ASR 服务，仅保存基本信息: {aweme_id}")
             return base
 
         # 尝试每个播放 URL，直到成功

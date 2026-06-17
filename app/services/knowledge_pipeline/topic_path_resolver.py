@@ -1,13 +1,61 @@
-from typing import List, Callable, Awaitable, Any
+from typing import List, Callable, Awaitable, Any, TYPE_CHECKING
 from loguru import logger
 from .knowledge_distiller import DistilledKnowledge
 from .topic_graph import TopicGraph, MutationProposal, TopicResolution, build_mutation_identity
+import re
+
+if TYPE_CHECKING:
+    from .topic_similarity import TopicSimilarityChecker, SimilarityCandidate
+
+
+def _normalize_leaf_name(name: str) -> str:
+    """Normalize a topic leaf name for fuzzy comparison.
+
+    Strips English suffixes appended after Chinese characters
+    (e.g. "财富自由financial-independence" → "财富自由"),
+    removes whitespace, and lowercases.
+    """
+    # Strip trailing English/ASCII suffix after Chinese chars
+    # Pattern: Chinese text followed by a run of ASCII without space
+    cleaned = re.sub(r'([一-鿿])\s*[a-zA-Z][\w\-]*$', r'\1', name)
+    return cleaned.strip().lower()
+
+
+def _leaf_names_are_similar(name_a: str, name_b: str) -> bool:
+    """Check if two leaf names are similar enough to be the same topic.
+
+    Matches when:
+    - Exact match (case-insensitive)
+    - One is a prefix of the other after stripping English suffixes
+    - Normalized forms match
+    """
+    if not name_a or not name_b:
+        return False
+    a_lower = name_a.strip().lower()
+    b_lower = name_b.strip().lower()
+    if a_lower == b_lower:
+        return True
+    norm_a = _normalize_leaf_name(name_a)
+    norm_b = _normalize_leaf_name(name_b)
+    if norm_a == norm_b:
+        return True
+    # One is a prefix of the other
+    if norm_a and norm_b:
+        if norm_a.startswith(norm_b) or norm_b.startswith(norm_a):
+            return True
+    return False
+
 
 class TopicPathResolver:
-    def __init__(self, processor: Callable[..., Awaitable[dict]]):
+    def __init__(
+        self,
+        processor: Callable[..., Awaitable[dict]],
+        similarity_checker: "TopicSimilarityChecker | None" = None,
+    ):
         self.processor = processor
+        self.similarity_checker = similarity_checker
 
-    def _validate_payload(self, payload: dict) -> dict:
+    async def _validate_payload(self, payload: dict, graph: TopicGraph) -> dict:
         primary_path = payload.get("primary_path")
         secondary_paths = payload.get("secondary_paths", [])
         if not isinstance(primary_path, list) or not all(isinstance(item, str) and item.strip() for item in primary_path):
@@ -23,6 +71,177 @@ class TopicPathResolver:
             if key != tuple(primary_path) and key not in seen:
                 normalized_secondary.append(path)
                 seen.add(key)
+        # --- Dedup: drop secondary paths whose leaf is similar to primary leaf ---
+        primary_leaf = primary_path[-1] if primary_path else ""
+        primary_parent = tuple(primary_path[:-1]) if len(primary_path) > 1 else ()
+        filtered_secondary = []
+        # Collect candidates for LLM semantic check
+        llm_candidates_phase1: list[tuple[int, Any]] = []  # (index_in_normalized_secondary, path)
+        for path in normalized_secondary:
+            sec_leaf = path[-1] if path else ""
+            sec_parent = tuple(path[:-1]) if len(path) > 1 else ()
+            # Same parent + similar leaf name → treat as duplicate (lexical)
+            if sec_parent == primary_parent and _leaf_names_are_similar(primary_leaf, sec_leaf):
+                logger.info(
+                    f"[TopicPathResolver] dropping similar secondary path "
+                    f"{path} (leaf '{sec_leaf}' ≈ primary leaf '{primary_leaf}')"
+                )
+                continue
+            # Same parent + no lexical match → collect for LLM check
+            if sec_parent == primary_parent and self.similarity_checker is not None:
+                llm_candidates_phase1.append((len(filtered_secondary), path))
+            filtered_secondary.append(path)
+        normalized_secondary = filtered_secondary
+
+        # --- LLM semantic dedup: check remaining secondaries vs primary ---
+        if llm_candidates_phase1 and self.similarity_checker is not None:
+            from .topic_similarity import SimilarityCandidate
+            candidates = [
+                SimilarityCandidate(
+                    name_a=primary_leaf,
+                    name_b=path[-1] if path else "",
+                    context_a=list(primary_parent),
+                    context_b=list(path[:-1]) if len(path) > 1 else [],
+                )
+                for _, path in llm_candidates_phase1
+            ]
+            try:
+                results = await self.similarity_checker.check_batch(candidates)
+                # Remove secondaries that are semantically similar to primary
+                indices_to_remove = set()
+                for (orig_idx, path), result in zip(llm_candidates_phase1, results):
+                    if result.is_similar:
+                        logger.info(
+                            f"[TopicPathResolver] LLM dedup: dropping similar secondary path "
+                            f"{path} (leaf '{path[-1]}' ≈ primary leaf '{primary_leaf}', "
+                            f"confidence={result.confidence:.2f}, reason={result.reason})"
+                        )
+                        indices_to_remove.add(orig_idx)
+                if indices_to_remove:
+                    normalized_secondary = [
+                        p for i, p in enumerate(normalized_secondary)
+                        if i not in indices_to_remove
+                    ]
+            except Exception as exc:
+                logger.warning(f"[TopicPathResolver] LLM semantic dedup failed, skipping: {exc}")
+        # --- Dedup: merge secondary paths that share the same parent and similar leaves ---
+        deduped_secondary = []
+        seen_pairs = set()
+        for path in normalized_secondary:
+            sec_parent = tuple(path[:-1]) if len(path) > 1 else ()
+            sec_leaf = path[-1] if path else ""
+            pair_key = (sec_parent, _normalize_leaf_name(sec_leaf))
+            if pair_key not in seen_pairs:
+                deduped_secondary.append(path)
+                seen_pairs.add(pair_key)
+            else:
+                logger.info(
+                    f"[TopicPathResolver] dropping duplicate secondary path {path} "
+                    f"(parent={list(sec_parent)}, leaf≈'{_normalize_leaf_name(sec_leaf)}')"
+                )
+        normalized_secondary = deduped_secondary
+        # --- Limit: at most 1 secondary path per parent ---
+        # If multiple secondaries share the same parent, keep only the first.
+        # This prevents the same note from being indexed under many sibling topics
+        # (e.g. 投资/盘口指标, 投资/盘面指标, 投资/短线交易).
+        seen_parents = set()
+        parent_limited_secondary = []
+        for path in normalized_secondary:
+            sec_parent = tuple(path[:-1]) if len(path) > 1 else ()
+            if sec_parent in seen_parents:
+                logger.info(
+                    f"[TopicPathResolver] dropping extra secondary under same parent "
+                    f"{list(sec_parent)}: {path}"
+                )
+                continue
+            seen_parents.add(sec_parent)
+            parent_limited_secondary.append(path)
+        normalized_secondary = parent_limited_secondary
+        # --- Resolve secondary paths to existing graph nodes when possible ---
+        resolved_secondary = []
+        # Collect unresolved paths for LLM semantic redirect
+        unresolved_for_llm: list[tuple[int, list[str], list[str]]] = []  # (index, path, parent_path)
+        for path in normalized_secondary:
+            existing = graph.get_node_by_path(path)
+            if existing:
+                # Path already exists in graph — keep as-is
+                resolved_secondary.append(path)
+                continue
+            # Check if a sibling under the same parent has a similar leaf name (lexical)
+            parent_path = path[:-1] if len(path) > 1 else []
+            leaf = path[-1] if path else ""
+            parent_node = graph.get_node_by_path(parent_path) if parent_path else None
+            if parent_node and leaf:
+                merged = False
+                for child_id in parent_node.children_ids:
+                    child = graph.get_node(child_id)
+                    if child and child.status == "active" and _leaf_names_are_similar(child.name, leaf):
+                        logger.info(
+                            f"[TopicPathResolver] redirecting secondary path {path} → "
+                            f"existing node {child.path} (leaf '{child.name}' ≈ '{leaf}')"
+                        )
+                        resolved_secondary.append(child.path)
+                        merged = True
+                        break
+                if merged:
+                    continue
+                # No lexical match — collect for LLM semantic check
+                if self.similarity_checker is not None:
+                    unresolved_for_llm.append((len(resolved_secondary), path))
+            resolved_secondary.append(path)
+
+        # --- LLM semantic redirect: check unresolved secondaries against existing siblings ---
+        if unresolved_for_llm and self.similarity_checker is not None:
+            from .topic_similarity import SimilarityCandidate
+            # Build candidates: compare each unresolved leaf with all active siblings
+            llm_candidates = []
+            llm_meta = []  # (index_in_resolved, path, list of (child_node, candidate_index))
+            for idx, path in unresolved_for_llm:
+                parent_path = path[:-1] if len(path) > 1 else []
+                leaf = path[-1] if path else ""
+                parent_node = graph.get_node_by_path(parent_path) if parent_path else None
+                if not parent_node or not leaf:
+                    continue
+                meta_children = []
+                for child_id in parent_node.children_ids:
+                    child = graph.get_node(child_id)
+                    if child and child.status == "active":
+                        llm_candidates.append(SimilarityCandidate(
+                            name_a=child.name,
+                            name_b=leaf,
+                            context_a=list(parent_path),
+                            context_b=list(parent_path),
+                        ))
+                        meta_children.append(child)
+                llm_meta.append((idx, path, meta_children))
+
+            if llm_candidates:
+                try:
+                    results = await self.similarity_checker.check_batch(llm_candidates)
+                    # Process results — redirect if any sibling is semantically similar
+                    result_idx = 0
+                    for idx, path, meta_children in llm_meta:
+                        redirected = False
+                        for child in meta_children:
+                            if result_idx < len(results) and results[result_idx].is_similar:
+                                result = results[result_idx]
+                                logger.info(
+                                    f"[TopicPathResolver] LLM redirect: secondary path {path} → "
+                                    f"existing node {child.path} (leaf '{child.name}' ≈ '{path[-1]}', "
+                                    f"confidence={result.confidence:.2f}, reason={result.reason})"
+                                )
+                                # Replace the unresolved path with the existing node's path
+                                resolved_secondary[idx] = child.path
+                                redirected = True
+                                result_idx += 1
+                                break
+                            result_idx += 1
+                        if not redirected:
+                            result_idx += len(meta_children)
+                except Exception as exc:
+                    logger.warning(f"[TopicPathResolver] LLM semantic redirect failed, skipping: {exc}")
+
+        normalized_secondary = resolved_secondary
         proposed_target_paths = {
             tuple(target_path)
             for proposal in payload.get("mutation_proposals", [])
@@ -120,6 +339,7 @@ class TopicPathResolver:
             item.setdefault("target_parent_path", [])
             item.setdefault("target_name", "")
             item.setdefault("affected_node_ids", [])
+            item.setdefault("target_paths", [])
             normalized.append(MutationProposal(**item))
 
         # Ensure primary_path is covered — if no matching mutation exists and path
@@ -158,7 +378,7 @@ class TopicPathResolver:
 
     async def resolve(self, units: DistilledKnowledge, graph: TopicGraph) -> TopicResolution:
         payload_raw = await self.processor(units=units, graph_snapshot=graph.to_snapshot())
-        payload = self._validate_payload(payload_raw)
+        payload = await self._validate_payload(payload_raw, graph)
         mutation_proposals = self._normalize_proposals(
             payload.get("mutation_proposals", []),
             graph,

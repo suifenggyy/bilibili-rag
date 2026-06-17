@@ -54,9 +54,9 @@ def _get_env(key: str, default: str = "") -> str:
 
 
 DEFAULT_OUTPUT_DIR = _get_env(
-    "COLLECTION_OUTPUT_DIR",
+    "OBSIDIAN_VAULT_ROOT",
     str(ROOT_DIR / "data" / "collection"),
-)
+) + "/inbox"
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:

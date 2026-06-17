@@ -62,10 +62,10 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
+
 from loguru import logger
 from app.services.content_storage import ContentStorageManager
-
-load_dotenv(ROOT_DIR / ".env")
 
 
 def _get_env(key: str, default: str = "") -> str:
@@ -78,7 +78,8 @@ DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r'[\\/:*?"<>|#]', "_", name)
+    name = name.replace("？", "_")
     name = re.sub(r"\s+", " ", name).strip()
     return name[:max_len] if len(name) > max_len else name
 
@@ -294,23 +295,29 @@ async def export_episodes(
         safe_title = _safe_filename(full_title)
         md_path = output_dir / f"{safe_title}_{episode_id}.md"
 
-        # Check DB for completion
+        # Check DB export status (completed + md_path file exists)
         try:
             async with get_db_context() as db:
                 proc_rec = await _proc_svc.get_or_create(db, "xiaoyuzhou", episode_id, full_title)
                 await db.commit()
-                already_done = _proc_svc.is_completed(proc_rec)
+                already_exported = _proc_svc.is_exported(proc_rec)
         except Exception as _db_err:
             logger.debug(f"DB 状态检查失败: {_db_err}")
-            already_done = False
+            already_exported = False
+            proc_rec = None
 
-        if already_done and md_path.exists():
-            print(f"  [{i:3d}/{total}] ⏭️  已完成，跳过：{full_title[:50]}")
+        if already_exported:
+            print(f"  [{i:3d}/{total}] ⏭️  已导出，跳过：{full_title[:50]}")
             async with counter_lock:
                 success_count += 1
             return
 
-        print(f"  [{i:3d}/{total}] 🔊 处理中：{full_title[:50]}", flush=True)
+        if proc_rec and _proc_svc.is_completed(proc_rec) and not md_path.exists():
+            print(f"  [{i:3d}/{total}] 🔄 文件丢失，重新处理：{full_title[:50]}", flush=True)
+        elif md_path.exists():
+            print(f"  [{i:3d}/{total}] 🔄 重新处理（DB 未标记导出）：{full_title[:50]}", flush=True)
+        else:
+            print(f"  [{i:3d}/{total}] 🔊 处理中：{full_title[:50]}", flush=True)
 
         try:
             async with sem:
@@ -319,9 +326,11 @@ async def export_episodes(
             md_content = _build_markdown(ec, ec.content_source)
             md_path.parent.mkdir(parents=True, exist_ok=True)
             md_path.write_text(md_content, encoding="utf-8")
+            abs_md_path = str(md_path.resolve())
 
             status = "ASR ✅" if ec.content_source == "asr" else "仅基本信息 ⚠️"
             print(f"       → {status}：{full_title[:40]}")
+            print(f"  [{i:3d}/{total}] 📄 已写入：{abs_md_path}")
 
             try:
                 async with get_db_context() as db:
@@ -332,7 +341,7 @@ async def export_episodes(
                         await _proc_svc.mark_correction_done(db, rec, ec.content)
                     if getattr(ec, "summary_block", None):
                         await _proc_svc.mark_summary_done(db, rec, ec.summary_block)
-                    await _proc_svc.mark_completed(db, rec)
+                    await _proc_svc.mark_completed(db, rec, md_path=abs_md_path)
                     await db.commit()
             except Exception as _db_err:
                 logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
@@ -398,6 +407,11 @@ async def main():
     )
     parser.add_argument("--all", action="store_true", help="导出所有集（不弹出交互选择）")
     parser.add_argument("--limit", type=int, default=0, help="每个播客最多导出最新 N 集（0=不限制）")
+    parser.add_argument(
+        "--after-date",
+        default=_get_env("XIAOYUZHOU_AFTER_DATE"),
+        help="只导出该日期（含）之后发布的单集，格式 YYYY-MM-DD（留空则不限制；按发布时间过滤）",
+    )
     parser.add_argument(
         "--asr-backend",
         default=_get_env("ASR_BACKEND", "whisper"),
@@ -583,8 +597,26 @@ async def main():
             except Exception as e:
                 print(f"   ⚠️  「{podcast_title}」获取失败: {e}")
 
+    # ── 构建存储服务（用于日期过滤） ─────────────────────────────────────────
+    from app.services.content_storage import ContentStorageManager
+
+    storage_manager = ContentStorageManager(export_root=args.output_dir)
+
+    # ── 按发布时间过滤 ───────────────────────────────────────────────
+    effective_after = storage_manager.resolve_after_date("xiaoyuzhou", args.after_date)
+    if effective_after:
+        before = len(all_episodes)
+        all_episodes = [
+            (ep, pt) for ep, pt in all_episodes
+            if not ep.get("pub_date") or ep.get("pub_date", "")[:10] >= effective_after
+        ]
+        filtered = before - len(all_episodes)
+        if filtered:
+            print(f"🗓️  日期过滤：跳过 {filtered} 个 {effective_after} 前的单集（剩余 {len(all_episodes)} 个）")
+
     total = len(all_episodes)
-    if total == 0:
+
+    if len(all_episodes) == 0:
         print("⚠️  未找到任何单集")
         sys.exit(0)
 
@@ -631,11 +663,9 @@ async def main():
                 print("  ⚠️  请输入 1、2、3 或 4")
         print(f"📌 将导出 {len(all_episodes)} 集")
 
-    # ── 构建服务 ──────────────────────────────────────────────────────────
-    from app.services.content_storage import ContentStorageManager
+    # ── 构建输出目录与抓取服务 ─────────────────────────────────────────────
     from app.services.xiaoyuzhou_fetcher import XiaoyuzhouContentFetcher
 
-    storage_manager = ContentStorageManager(export_root=args.output_dir)
     output_dir = storage_manager.get_export_dir("xiaoyuzhou")
     output_dir.mkdir(parents=True, exist_ok=True)
 

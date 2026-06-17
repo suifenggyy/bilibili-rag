@@ -60,10 +60,10 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
+
 from loguru import logger
 from app.services.content_storage import ContentStorageManager
-
-load_dotenv(ROOT_DIR / ".env")
 
 
 def _get_env(key: str, default: str = "") -> str:
@@ -74,7 +74,8 @@ DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r'[\\/:*?"<>|#]', "_", name)
+    name = name.replace("？", "_")
     name = re.sub(r"\s+", " ", name).strip()
     return name[:max_len] if len(name) > max_len else name
 
@@ -220,23 +221,29 @@ async def export_videos(
         safe_title = _safe_filename(title)
         md_path = output_dir / f"{safe_title}_{video_id}.md"
 
-        # Check DB for completion
+        # Check DB export status (completed + md_path file exists)
         try:
             async with get_db_context() as db:
                 proc_rec = await _proc_svc.get_or_create(db, "youtube", video_id, title)
                 await db.commit()
-                already_done = _proc_svc.is_completed(proc_rec)
+                already_exported = _proc_svc.is_exported(proc_rec)
         except Exception as _db_err:
             logger.debug(f"DB 状态检查失败: {_db_err}")
-            already_done = False
+            already_exported = False
+            proc_rec = None
 
-        if already_done and md_path.exists():
-            print(f"  [{i:3d}/{total}] ⏭️  已完成，跳过：{title[:50]}")
+        if already_exported:
+            print(f"  [{i:3d}/{total}] ⏭️  已导出，跳过：{title[:50]}")
             async with counter_lock:
                 success_count += 1
             return
 
-        print(f"  [{i:3d}/{total}] 🔊 处理中：{title[:50]}", flush=True)
+        if proc_rec and _proc_svc.is_completed(proc_rec) and not md_path.exists():
+            print(f"  [{i:3d}/{total}] 🔄 文件丢失，重新处理：{title[:50]}", flush=True)
+        elif md_path.exists():
+            print(f"  [{i:3d}/{total}] 🔄 重新处理（DB 未标记导出）：{title[:50]}", flush=True)
+        else:
+            print(f"  [{i:3d}/{total}] 🔊 处理中：{title[:50]}", flush=True)
 
         try:
             async with sem:
@@ -245,9 +252,11 @@ async def export_videos(
             md_content = _build_markdown(vc, vc.content_source)
             md_path.parent.mkdir(parents=True, exist_ok=True)
             md_path.write_text(md_content, encoding="utf-8")
+            abs_md_path = str(md_path.resolve())
 
             status = "ASR ✅" if vc.content_source == "asr" else "仅基本信息 ⚠️"
             print(f"       → {status}：{title[:40]}")
+            print(f"  [{i:3d}/{total}] 📄 已写入：{abs_md_path}")
 
             try:
                 async with get_db_context() as db:
@@ -258,7 +267,7 @@ async def export_videos(
                         await _proc_svc.mark_correction_done(db, rec, vc.content)
                     if getattr(vc, "summary_block", None):
                         await _proc_svc.mark_summary_done(db, rec, vc.summary_block)
-                    await _proc_svc.mark_completed(db, rec)
+                    await _proc_svc.mark_completed(db, rec, md_path=abs_md_path)
                     await db.commit()
             except Exception as _db_err:
                 logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
@@ -394,6 +403,11 @@ async def main():
     # YOUTUBE_COOKIES 文本优先于文件路径
     yt_service = YouTubeService(cookie_file=cookie_file, cookie_text=cookie_text or None)
 
+    # ── 初始化存储管理器 ──────────────────────────────────────────────────
+    from app.services.content_storage import ContentStorageManager
+
+    storage_manager = ContentStorageManager(export_root=args.output_dir)
+
     # ── 收集视频列表 ──────────────────────────────────────────────────────
     print(f"\n📥 收集视频列表（共 {len(args.url)} 个来源）...", flush=True)
     all_videos: list[dict] = []
@@ -413,7 +427,8 @@ async def main():
                 else:
                     print(f"      ⚠️  无法获取视频信息")
             else:
-                videos = await yt_service.extract_playlist_videos(url, after_date=args.after_date or None)
+                effective_after = storage_manager.resolve_after_date("youtube", args.after_date)
+                videos = await yt_service.extract_playlist_videos(url, after_date=effective_after)
                 if args.limit > 0:
                     videos = videos[:args.limit]
                 all_videos.extend(videos)
@@ -472,10 +487,8 @@ async def main():
         print(f"📌 将导出 {len(all_videos)} 个视频")
 
     # ── 构建服务 ──────────────────────────────────────────────────────────
-    from app.services.content_storage import ContentStorageManager
     from app.services.youtube_fetcher import YouTubeContentFetcher
 
-    storage_manager = ContentStorageManager(export_root=args.output_dir)
     output_dir = storage_manager.get_export_dir("youtube")
     output_dir.mkdir(parents=True, exist_ok=True)
 

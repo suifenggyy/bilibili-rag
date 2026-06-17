@@ -4,16 +4,17 @@ uvicorn[standard]==0.30.6
 httpx==0.27.2
 
 # Database
-sqlalchemy==2.0.35
+sqlalchemy==2.0.50
 aiosqlite==0.20.0
 
 # LangChain + vector store
-langchain==0.3.7
-langchain-openai==0.2.6
+langchain==1.3.7
+langchain-openai==1.3.0
 langchain-chroma==0.1.4
-langchain-community==0.3.7
+langchain-community==0.4.2
+langchain-text-splitters==1.1.2
 chromadb==0.5.15
-openai==1.59.7
+openai==2.41.1
 dashscope==1.20.0
 openai-whisper==20250625
 
@@ -21,9 +22,9 @@ openai-whisper==20250625
 qrcode[pil]==7.4.2
 
 # Settings & validation
-pydantic==2.9.2
-pydantic-settings==2.5.2
-python-dotenv==1.0.1
+pydantic==2.13.4
+pydantic-settings==2.14.1
+python-dotenv==1.2.2
 
 # Logging
 loguru==0.7.2
@@ -32,16 +33,16 @@ loguru==0.7.2
 yt-dlp==2026.3.17
 
 # Instapaper 文章正文提取
-requests==2.32.3
+requests==2.34.2
 trafilatura==2.0.0
 playwright==1.55.0
 
 
 # Douyin_TikTok_Download_API submodule dependencies
-PyYAML==6.0.1
+PyYAML==6.0.3
 pycryptodomex==3.20.0
 gmssl==3.2.2
-tenacity~=9.0.0
+tenacity==9.1.4
 aiofiles==23.2.1
 browser-cookie3==0.19.1
 

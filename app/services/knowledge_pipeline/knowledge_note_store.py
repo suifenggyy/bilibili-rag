@@ -29,10 +29,12 @@ class KnowledgeNoteStore:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
-    def _slugify(text: str) -> str:
+    def _slugify(text: str, max_len: int = 80) -> str:
         text = str(text).lower()
         text = re.sub(r'[^\w\s-]', '', text)
         text = re.sub(r'[-\s]+', '-', text).strip('-')
+        if len(text) > max_len:
+            text = text[:max_len].rstrip('-')
         return text
 
     def choose_storage_primary_path(self, mapping_record: Optional[Dict], placement: GraphPlacementResult) -> List[str]:

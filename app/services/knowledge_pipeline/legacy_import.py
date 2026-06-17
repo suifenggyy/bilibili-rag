@@ -169,7 +169,8 @@ class LegacyCollectionImporter:
 
     @staticmethod
     def _slugify(name: str, max_len: int = 60) -> str:
-        clean = re.sub(r'[\\/:*?"<>|]', "_", name)
+        clean = re.sub(r'[\\/:*?"<>|#]', "_", name)
+        clean = clean.replace("？", "_")
         clean = re.sub(r"\s+", "_", clean).strip("._")
         return clean[:max_len]
 

@@ -28,10 +28,33 @@ async_session_factory = async_sessionmaker(
 )
 
 
+def _migrate_content_processing_records(sync_conn):
+    """Auto-add missing columns for ContentProcessingRecord (SQLite only)."""
+    import sqlalchemy as sa
+    from app.models import ContentProcessingRecord
+
+    table_name = ContentProcessingRecord.__tablename__
+    inspector = sa.inspect(sync_conn)
+    existing = {c['name'] for c in inspector.get_columns(table_name)}
+    cols_to_add = []
+    for col in ContentProcessingRecord.__table__.columns:
+        if col.name not in existing:
+            # Build type string (e.g. VARCHAR(1000), TEXT, DATETIME)
+            col_type = str(col.type)
+            cols_to_add.append((col.name, col_type))
+    for col_name, col_type in cols_to_add:
+        sync_conn.execute(
+            sa.text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}")
+        )
+        sync_conn.commit()
+
+
 async def init_db():
-    """初始化数据库（创建表）"""
+    """初始化数据库（创建表）并自动补全缺失列"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Run column migration via sync_engine
+        await conn.run_sync(_migrate_content_processing_records)
 
 
 async def get_db() -> AsyncSession:

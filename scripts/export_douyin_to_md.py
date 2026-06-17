@@ -57,13 +57,13 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from dotenv import load_dotenv
+load_dotenv(ROOT_DIR / ".env")
+
 from loguru import logger
 from app.services.content_summary import append_summary_section
 from app.services.processing_status import ProcessingStatusService
 from app.database import get_db_context
 from app.services.content_storage import ContentStorageManager
-
-load_dotenv(ROOT_DIR / ".env")
 
 
 def _get_env(key: str, default: str = "") -> str:
@@ -75,7 +75,8 @@ DEFAULT_OUTPUT_DIR = str(ContentStorageManager().get_inbox_dir())
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
     """将字符串转为合法文件名"""
-    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r'[\\/:*?"<>|#]', "_", name)
+    name = name.replace("？", "_")
     name = re.sub(r"\s+", " ", name).strip()
     return name[:max_len] if len(name) > max_len else name
 
@@ -244,6 +245,7 @@ async def export_videos(
 
     success_count = 0
     failed_count = 0
+    completed_count = 0
     total = len(videos)
     _proc_svc = ProcessingStatusService()
     sem = asyncio.Semaphore(concurrency)
@@ -251,59 +253,67 @@ async def export_videos(
     counter_lock = asyncio.Lock()
 
     async def _process_one(i: int, raw_video: dict) -> None:
-        nonlocal success_count, failed_count
+        nonlocal success_count, failed_count, completed_count
 
+        tag = f"[{i:3d}/{total}]"
         video_info = DouyinService.parse_video_info(raw_video)
         aweme_id = video_info["aweme_id"]
         title = video_info["title"]
         safe_title = _safe_filename(title)
         md_path = output_dir / f"{safe_title}_{aweme_id}.md"
 
-        # Check DB completion status
+        # Check DB export status (completed + md file exists at recorded path)
         proc_rec = None
-        already_done = False
+        already_exported = False
         try:
             async with get_db_context() as db:
                 proc_rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
                 await db.commit()
-                already_done = _proc_svc.is_completed(proc_rec)
+                already_exported = _proc_svc.is_exported(proc_rec)
         except Exception as _db_err:
-            logger.debug(f"DB 状态检查失败（跳过）: {_db_err}")
+            logger.debug(f"{tag} DB 状态检查失败（跳过）: {_db_err}")
 
-        # Fast-path: already completed, check if comments need to be added
-        if already_done and md_path.exists():
+        # Fast-path: already exported, check if comments need to be added
+        if already_exported:
             md_text = md_path.read_text(encoding="utf-8")
             needs_comments = cookie.strip() and "## 热门评论" not in md_text
             if not needs_comments:
-                print(f"  [{i:3d}/{total}] ⏭️  已完成，跳过：{title[:50]}")
+                print(f"  {tag} ⏭️  已导出，跳过：{title[:50]}")
                 async with counter_lock:
                     success_count += 1
+                    completed_count += 1
                 return
 
             # Use cached corrected text — only fetch comments, no re-ASR
             if proc_rec and proc_rec.corrected_text:
-                print(f"  [{i:3d}/{total}] 💬 补充评论（无需重新转写）：{title[:50]}", flush=True)
+                print(f"  {tag} 💬 补充评论（无需重新转写）：{title[:50]}", flush=True)
                 comments = await fetch_douyin_comments(aweme_id, cookie)
                 if comments:
                     cs = format_comments_section(comments)
                     md_path.write_text(
                         md_text.rstrip() + "\n\n" + cs.strip() + "\n", encoding="utf-8"
                     )
-                    print(f"       ✅ 评论已补充（{len(comments)} 条）")
+                    async with counter_lock:
+                        completed_count += 1
+                    print(f"  {tag} ✅ 评论已补充（{len(comments)} 条），已完成 {completed_count}/{total}")
                 else:
-                    print(f"       ℹ️  无评论数据（接口未返回，可能无评论或 Cookie 权限不足）")
+                    print(f"  {tag} ℹ️  无评论数据（接口未返回，可能无评论或 Cookie 权限不足）")
                 async with counter_lock:
                     success_count += 1
                 return
 
-            print(f"  [{i:3d}/{total}] 🔄 无缓存文本，重新处理：{title[:50]}", flush=True)
+            print(f"  {tag} 🔄 无缓存文本，重新处理：{title[:50]}", flush=True)
+
+        elif proc_rec and _proc_svc.is_completed(proc_rec) and not md_path.exists():
+            # DB says completed but md file is gone → re-process
+            print(f"  {tag} 🔄 文件丢失，重新处理：{title[:50]}", flush=True)
 
         elif md_path.exists():
-            # File exists but not marked complete in DB — let it re-process
-            print(f"  [{i:3d}/{total}] 🔄 重新处理（DB 未标记完成）：{title[:50]}", flush=True)
+            # File exists but DB not marked exported — re-process to update DB
+            print(f"  {tag} 🔄 重新处理（DB 未标记导出）：{title[:50]}", flush=True)
 
         else:
-            print(f"  [{i:3d}/{total}] 🔄 处理中：{title[:50]}", flush=True)
+            print(f"  {tag} 🔄 处理中：{title[:50]}", flush=True)
 
         # Full processing: download + ASR + comments (via fetcher.cookie)
         try:
@@ -312,11 +322,16 @@ async def export_videos(
 
             md_content = _build_markdown(vc, vc.content, vc.content_source)
             md_path.write_text(md_content, encoding="utf-8")
+            abs_md_path = str(md_path.resolve())
+
+            async with counter_lock:
+                completed_count += 1
 
             has_comments = bool(getattr(vc, "comments_section", ""))
             status = "ASR ✅" if vc.content_source == "asr" else "仅基本信息 ⚠️"
             comment_tag = f" 💬{len(vc.comments_section.splitlines())-2}条评论" if has_comments else " (无评论)"
-            print(f"       → {status}{comment_tag}")
+            print(f"  {tag} → {status}{comment_tag}")
+            print(f"  {tag} 📄 已写入：{abs_md_path}，已完成 {completed_count}/{total}")
 
             try:
                 async with get_db_context() as db:
@@ -327,29 +342,29 @@ async def export_videos(
                         await _proc_svc.mark_correction_done(db, rec, vc.content)
                     if getattr(vc, "summary_block", None):
                         await _proc_svc.mark_summary_done(db, rec, vc.summary_block)
-                    await _proc_svc.mark_completed(db, rec)
+                    await _proc_svc.mark_completed(db, rec, md_path=abs_md_path)
                     await db.commit()
             except Exception as _db_err:
-                logger.debug(f"DB 状态写入失败（不影响导出）: {_db_err}")
+                logger.debug(f"{tag} DB 状态写入失败（不影响导出）: {_db_err}")
 
             async with counter_lock:
                 success_count += 1
 
         except Exception as e:
-            logger.error(f"处理视频失败 [{aweme_id}]: {e}")
-            print(f"       ❌ 失败: {e}")
+            logger.error(f"{tag} 处理视频失败 [{aweme_id}]: {e}")
+            print(f"  {tag} ❌ 失败: {e}")
             try:
                 async with get_db_context() as db:
                     rec = await _proc_svc.get_or_create(db, "douyin", aweme_id, title)
                     await _proc_svc.mark_failed(db, rec, "asr", str(e))
                     await db.commit()
             except Exception as _db_err:
-                logger.debug(f"DB 失败状态写入失败: {_db_err}")
+                logger.debug(f"{tag} DB 失败状态写入失败: {_db_err}")
             async with counter_lock:
                 failed_count += 1
 
     await asyncio.gather(*[_process_one(i, v) for i, v in enumerate(videos, 1)])
-    return success_count, failed_count
+    return success_count, failed_count, completed_count
 
 
 async def interactive_select_limit(total: int) -> int:
@@ -449,8 +464,8 @@ async def main():
     )
     parser.add_argument(
         "--after-date",
-        default=_get_env("EXPORT_AFTER_DATE", "2026-01-01"),
-        help="只导出该日期（含）之后收藏的视频，格式 YYYY-MM-DD（默认 2026-01-01；留空则不限制）",
+        default=_get_env("DOUYIN_AFTER_DATE"),
+        help="只导出该日期（含）之后收藏的视频，格式 YYYY-MM-DD（留空则不限制）",
     )
     args = parser.parse_args()
 
@@ -511,8 +526,11 @@ async def main():
         # ── 获取收藏夹视频列表 ───────────────────────────────────────────
         print("\n📥 获取收藏夹视频列表（可能需要较长时间）...", flush=True)
         start_t = time.time()
+        after_date_arg = storage_manager.resolve_after_date("douyin", args.after_date)
+        if after_date_arg:
+            print(f"🗓️  日期过滤：仅获取 {after_date_arg} 之后收藏的视频")
         try:
-            all_videos = await douyin.get_all_collection_videos()
+            all_videos = await douyin.get_all_collection_videos(after_date=after_date_arg)
         except Exception as e:
             print(f"❌ 获取失败：{e}")
             sys.exit(1)
@@ -520,19 +538,6 @@ async def main():
         elapsed = time.time() - start_t
         total = len(all_videos)
         print(f"✅ 共找到 {total} 个收藏视频（耗时 {elapsed:.1f}s）")
-
-        # ── 按收藏时间过滤 ───────────────────────────────────────────────
-        after_ts: Optional[int] = None
-        if args.after_date and args.after_date.strip():
-            try:
-                after_ts = int(datetime.strptime(args.after_date.strip(), "%Y-%m-%d").timestamp())
-                before = len(all_videos)
-                all_videos = [v for v in all_videos if (v.get("create_time") or 0) >= after_ts]
-                filtered = before - len(all_videos)
-                if filtered:
-                    print(f"🗓️  日期过滤：跳过 {filtered} 个 {args.after_date} 前的视频（剩余 {len(all_videos)} 个）")
-            except ValueError:
-                print(f"⚠️  --after-date 格式无效: {args.after_date}，将导出全部视频")
 
         if total == 0:
             print("⚠️  收藏夹为空，无视频可导出")
@@ -556,16 +561,17 @@ async def main():
 
         # ── 开始导出 ─────────────────────────────────────────────────────
         print(f"\n🚀 开始导出 {len(selected)} 个视频 → {output_dir.resolve()}\n")
-        s, f = await export_videos(
+        s, f, c = await export_videos(
             fetcher,
             selected,
             output_dir,
             cookie=args.cookie,
             concurrency=args.concurrency,
         )
+        total_selected = len(selected)
 
         print(f"\n{'='*60}")
-        print(f"✅ 导出完成！成功：{s} 个，失败：{f} 个")
+        print(f"✅ 导出完成！已完成：{c}/{total_selected}，成功：{s} 个，失败：{f} 个")
         print(f"📂 文件保存在：{output_dir.resolve()}")
         if f > 0:
             print(f"⚠️  {f} 个视频处理失败，请查看上方错误信息")

@@ -61,3 +61,72 @@ class KnowledgeNoteRendererTests(unittest.TestCase):
         self.assertIn("primary_topic_path:", markdown)
         self.assertIn("topic_node_ids:", markdown)
         self.assertIn("generated_at:", markdown)
+
+    def test_renderer_uses_vault_relative_source_inbox_path_in_frontmatter(self):
+        """source_inbox_path in frontmatter should be vault-relative, not absolute."""
+        units = DistilledKnowledge(
+            source_identity={
+                "source_inbox_path": "/Users/gongyongyue/Obsidian/jarvis/inbox/douyin/2026-06-03/test.md",
+                "published_date": "2026-06-03",
+                "title": "T",
+                "source_url": "",
+            },
+            summary="s",
+            concepts=[], methods=[], decision_rules=[], examples=[], risks=[], quotes=[],
+            source_excerpt_fingerprints=[]
+        )
+        markdown = KnowledgeNoteRenderer().render(units, "id-1")
+        # Frontmatter should have vault-relative path
+        self.assertIn("inbox/douyin/2026-06-03/test.md", markdown)
+        # Should NOT contain the absolute path
+        self.assertNotIn("/Users/gongyongyue/Obsidian/jarvis/inbox", markdown)
+
+    def test_renderer_wikilink_strips_special_chars(self):
+        """Wikilinks should not contain ? or # which break Obsidian parsing."""
+        units = DistilledKnowledge(
+            source_identity={
+                "source_inbox_path": "/Users/gongyongyue/Obsidian/jarvis/inbox/douyin/2026-06-03/财富自由要靠投资而不是工作？ #财富思维 #财富自由_7645370844755037475.md",
+                "published_date": "2026-06-03",
+                "title": "财富自由要靠投资而不是工作",
+                "source_url": "https://www.douyin.com/video/7645370844755037475",
+            },
+            summary="s",
+            concepts=[], methods=[], decision_rules=[], examples=[], risks=[], quotes=[],
+            source_excerpt_fingerprints=[]
+        )
+        markdown = KnowledgeNoteRenderer().render(units, "id-2")
+        # The [[wikilink]] should not contain ? or # (half or full width)
+        import re
+        wikilinks = re.findall(r'\[\[(.+?)\]\]', markdown)
+        self.assertTrue(len(wikilinks) >= 1, "Expected at least one wikilink")
+        for link in wikilinks:
+            self.assertNotIn("?", link, f"Wikilink should not contain '?': [[{link}]]")
+            self.assertNotIn("？", link, f"Wikilink should not contain '？': [[{link}]]")
+            self.assertNotIn("#", link, f"Wikilink should not contain '#': [[{link}]]")
+
+    def test_source_inbox_path_to_obsidian_link(self):
+        """Test the path conversion helper."""
+        # Absolute path with special chars
+        sanitized, display = KnowledgeNoteRenderer._source_inbox_path_to_obsidian_link(
+            "/Users/gongyongyue/Obsidian/jarvis/inbox/douyin/2026-06-03/财富自由要靠投资而不是工作？ #财富思维 #财富自由_7645370844755037475.md"
+        )
+        self.assertNotIn("?", sanitized)
+        self.assertNotIn("？", sanitized)
+        self.assertNotIn("#", sanitized)
+        self.assertNotIn("/Users/", sanitized)
+        self.assertIn("inbox/", sanitized)
+        self.assertIn("财富自由", display)
+
+        # Simple path without special chars
+        sanitized2, display2 = KnowledgeNoteRenderer._source_inbox_path_to_obsidian_link(
+            "inbox/douyin/test.md"
+        )
+        self.assertEqual(sanitized2, "inbox/douyin/test.md")
+        self.assertEqual(display2, "test")
+
+        # Path that's already vault-relative
+        sanitized3, display3 = KnowledgeNoteRenderer._source_inbox_path_to_obsidian_link(
+            "inbox/a.md"
+        )
+        self.assertIn("inbox/a.md", sanitized3)
+        self.assertEqual(display3, "a")

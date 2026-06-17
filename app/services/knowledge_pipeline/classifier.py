@@ -1,8 +1,8 @@
 """
 知识库内容分类器。
 
-使用现有 TextPostProcessor 接口（通过 create_text_postprocessor 创建）对文章进行
-自动分类，输出 category / topics / quality_score / processing_log。
+使用统一 LLM 工厂层（通过 get_llm_service）对文章进行自动分类，
+输出 category / topics / quality_score / processing_log。
 """
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from loguru import logger
+
+from app.services.llm.types import LLMMessage
+from app.services.llm.factory import get_llm_service
 
 # ==================== 分类 Prompt ====================
 
@@ -58,22 +61,20 @@ class KnowledgeClassifier:
 
     FALLBACK_CATEGORY = "未分类"
 
-    def __init__(self, processor=None):
+    def __init__(self, llm_service=None, prompt: str | None = None):
         """
         Args:
-            processor: TextPostProcessor 实例（依赖注入，方便测试）；
-                       为 None 时通过 create_text_postprocessor 创建。
+            llm_service: LLMService 实例（依赖注入，方便测试）；
+                         为 None 时通过 get_llm_service("knowledge_classify") 创建。
+            prompt: 自定义分类 prompt，默认使用 CLASSIFICATION_PROMPT。
         """
-        self._processor = processor
+        self._llm = llm_service
+        self._prompt = prompt
 
-    def _get_processor(self):
-        if self._processor is not None:
-            return self._processor
-        from app.services.text_postprocessor_factory import create_text_postprocessor
-        from app.config import settings
-        return create_text_postprocessor(
-            prompt_template=CLASSIFICATION_PROMPT,
-        )
+    def _get_llm(self):
+        if self._llm is not None:
+            return self._llm
+        return get_llm_service("knowledge_classify")
 
     async def classify(
         self,
@@ -92,8 +93,9 @@ class KnowledgeClassifier:
         Returns:
             ClassificationResult（失败时返回安全 fallback）
         """
-        processor = self._get_processor()
-        prompt_input = (
+        llm = self._get_llm()
+        prompt = self._prompt or CLASSIFICATION_PROMPT
+        user_content = (
             f"标题：{title}\n"
             f"摘要：{summary}\n"
             f"已有分类：{', '.join(existing_categories) or '无'}"
@@ -106,8 +108,12 @@ class KnowledgeClassifier:
             timeout = 120
 
         try:
-            raw_output = await processor.postprocess(prompt_input)
-            return self._parse_result(raw_output)
+            messages = [
+                LLMMessage(role="system", content=prompt),
+                LLMMessage(role="user", content=user_content),
+            ]
+            response = await llm.complete(messages, timeout=timeout)
+            return self._parse_result(response.content)
         except Exception as exc:
             logger.warning(f"[KnowledgeClassifier] LLM 分类失败，使用 fallback: {exc}")
             return ClassificationResult(

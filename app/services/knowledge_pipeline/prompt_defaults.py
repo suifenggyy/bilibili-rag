@@ -64,6 +64,35 @@ detail_items:
       - "inbox/douyin/2026-06-03/example.md"
 规则：只输出真正新增的细节；如果全部重复则返回 detail_items: []。"""
 
+DEFAULT_TOPIC_DEDUP_PROMPT = """你会收到若干对主题名称，以及它们在主题树中的上级路径。
+判断每对主题是否属于同一概念或高度重叠（可以合并为同一主题）。
+
+输出 YAML，且只能包含：
+results:
+  - name_a: "副业"
+    name_b: "副业决策"
+    is_similar: true
+    confidence: 0.9
+    reason: "副业决策是副业的子集概念，在同一层级属于重叠"
+  - name_a: "盘口指标"
+    name_b: "盘面指标"
+    is_similar: true
+    confidence: 0.95
+    reason: "盘口与盘面在股票分析中指同一概念"
+  - name_a: "做T"
+    name_b: "价值投资"
+    is_similar: false
+    confidence: 0.1
+    reason: "短线交易策略 vs 长期投资理念，完全不同"
+
+规则：
+- 仅当两个主题在知识库中属于同一层级、描述同一概念时可标记 is_similar=true
+- 同义词（盘口/盘面）、缩写与全称（做T/日内回转）、子集包含关系在同一层级时（副业/副业决策）算相似
+- 仅是相关但不重叠的概念（投资/理财、短线交易/风险控制）不算相似
+- confidence >= 0.8 才视为真正相似，低于 0.8 视为不相似
+- 结果顺序必须与输入顺序一一对应
+- 不要输出解释性文字"""
+
 DEFAULT_KNOWLEDGE_REPAIR_PROMPT = """你会收到 graph snapshot、mapping snapshot、topic detail index、pending mutations、detected issues。
 输出 YAML，且只能包含：
 repair_actions:

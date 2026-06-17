@@ -150,6 +150,10 @@ class DouyinExportRequest(BaseModel):
         ge=0,
         description="最多导出视频数（0=全部）",
     )
+    after_date: Optional[str] = Field(
+        default=None,
+        description="只导出该日期之后发布的视频（YYYY-MM-DD，留空则不限制）",
+    )
     asr_backend: str = Field(
         default="auto",
         description="ASR 后端：auto | dashscope | ollama | whisper",
@@ -275,7 +279,8 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
         _log("开始获取抖音收藏夹视频列表...")
 
         # 获取所有收藏视频
-        all_videos = await douyin.get_all_collection_videos()
+        after_date = req.after_date or getattr(settings, "douyin_after_date", "") or None
+        all_videos = await douyin.get_all_collection_videos(after_date=after_date)
         if req.limit > 0:
             all_videos = all_videos[:req.limit]
 
@@ -508,9 +513,9 @@ async def download_douyin_export(job_id: str):
 
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        export_root = os.path.expanduser(settings.collection_output_dir)
+        inbox_root = str(storage_manager.get_inbox_dir())
         for abs_path in output_files:
-            arc_name = os.path.relpath(abs_path, export_root)
+            arc_name = os.path.relpath(abs_path, inbox_root)
             zf.write(abs_path, arc_name)
     zip_buffer.seek(0)
 

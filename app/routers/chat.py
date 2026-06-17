@@ -10,24 +10,16 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from sqlalchemy import select, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
-from openai import OpenAI
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 from app.database import get_db
 from app.models import ChatRequest, ChatResponse, FavoriteFolder, FavoriteVideo, VideoCache
 from app.config import settings
 from app.routers.knowledge import get_rag_service
+from app.services.llm.types import LLMMessage
+from app.services.llm.factory import get_llm_service
 
 router = APIRouter(prefix="/chat", tags=["对话"])
-
-def _get_llm_client() -> OpenAI:
-    """获取 LLM 客户端"""
-    if not settings.openai_api_key:
-        raise HTTPException(status_code=400, detail="未配置 LLM API Key")
-    return OpenAI(
-        api_key=settings.openai_api_key,
-        base_url=settings.openai_base_url,
-    )
 
 def _build_overview_messages(context: str, question: str) -> list[dict]:
     system = (
@@ -176,31 +168,28 @@ def _route_with_rules(question: str, is_collection_intent: bool, related: bool) 
         return "direct"
     return "vector"
 
-def _route_with_llm(question: str) -> tuple[Optional[str], str]:
+async def _route_with_llm(question: str) -> tuple[Optional[str], str]:
     """使用 LLM 进行路由判断"""
     try:
-        client = _get_llm_client()
+        llm = get_llm_service("chat_routing")
         system = (
             "你是一个路由器，只输出以下之一：direct, db_list, db_content, vector。\n"
             "规则：\n"
             "- direct：寒暄/闲聊/与收藏无关的问题\n"
             "- db_list：清单/列表/目录/有哪些\n"
-            "- db_content：明确要求“全部/所有/整体/概览/全库”内容的总结\n"
-            "- vector：具体主题问题或需要“先检索再总结”的问题\n"
+            "- db_content：明确要求"全部/所有/整体/概览/全库"内容的总结\n"
+            "- vector：具体主题问题或需要"先检索再总结"的问题\n"
             "示例：\n"
             "Q: 中西方文化的差异是什么，简单总结 -> vector\n"
             "Q: 概览我收藏夹里所有王德峰相关内容 -> db_content\n"
             "只输出一个词，不要解释。"
         )
-        resp = client.chat.completions.create(
-            model=settings.llm_model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": question},
-            ],
-            temperature=0,
-        )
-        text = (resp.choices[0].message.content or "").strip()
+        messages = [
+            LLMMessage(role="system", content=system),
+            LLMMessage(role="user", content=question),
+        ]
+        response = await llm.complete(messages)
+        text = response.content.strip()
         match = re.search(r"(direct|db_list|db_content|vector)", text)
         return (match.group(1) if match else None), text
     except Exception as e:
@@ -215,7 +204,7 @@ def _extract_keywords(question: str) -> List[str]:
         "总结", "概括", "分析", "解释", "说明", "评价", "区别", "内容", "视频",
     }
     keywords: List[str] = []
-    for kw in re.findall(r"[\u4e00-\u9fff]{2,}", question):
+    for kw in re.findall(r"[一-鿿]{2,}", question):
         if kw not in stopwords and kw not in keywords:
             keywords.append(kw)
     for kw in re.findall(r"[A-Za-z0-9]{2,}", question):
@@ -393,7 +382,7 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
         is_collection_intent = True
     # 1) LLM 路由优先，失败时降级规则路由
     logger.info(f"路由输入: question={question} folder_ids={folder_ids} has_data={has_data} is_collection_intent={is_collection_intent}")
-    route, route_raw = _route_with_llm(question)
+    route, route_raw = await _route_with_llm(question)
     route_source = "LLM"
     related: Optional[bool] = None
     if not route:
@@ -472,9 +461,10 @@ async def ask_question(request: ChatRequest, db: AsyncSession = Depends(get_db))
         raise HTTPException(status_code=400, detail="问题不能为空")
     try:
         messages, sources, _ = await _prepare_messages(request, db)
-        client = _get_llm_client()
-        response = client.chat.completions.create(model=settings.llm_model, messages=messages, temperature=0.5)
-        return ChatResponse(answer=response.choices[0].message.content or "", sources=sources[:5])
+        llm = get_llm_service("chat")
+        llm_messages = [LLMMessage(role=m["role"], content=m["content"]) for m in messages]
+        response = await llm.complete(llm_messages)
+        return ChatResponse(answer=response.content, sources=sources[:5])
     except HTTPException: raise
     except Exception as e:
         logger.error(f"问答失败: {e}")
@@ -487,13 +477,14 @@ async def ask_question_stream(request: ChatRequest, db: AsyncSession = Depends(g
         raise HTTPException(status_code=400, detail="问题不能为空")
     try:
         messages, sources, _ = await _prepare_messages(request, db)
-        client = _get_llm_client()
-        def generate():
-            stream = client.chat.completions.create(model=settings.llm_model, messages=messages, temperature=0.5, stream=True)
-            for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta and delta.content: yield delta.content
+        llm = get_llm_service("chat")
+        llm_messages = [LLMMessage(role=m["role"], content=m["content"]) for m in messages]
+
+        async def generate():
+            async for delta in llm.stream(llm_messages):
+                yield delta
             yield f"\n[[SOURCES_JSON]]{json.dumps(sources, ensure_ascii=False)}"
+
         return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
     except HTTPException: raise
     except Exception as e:

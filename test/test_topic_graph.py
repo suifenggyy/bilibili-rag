@@ -2,7 +2,7 @@ import unittest
 from app.services.knowledge_pipeline.topic_graph import TopicGraph, MutationProposal
 
 class TopicGraphTests(unittest.IsolatedAsyncioTestCase):
-    def test_topic_graph_creates_parent_child_nodes(self):
+    async def test_topic_graph_creates_parent_child_nodes(self):
         graph = TopicGraph.empty()
         graph.create_node(
             name="",
@@ -14,7 +14,7 @@ class TopicGraphTests(unittest.IsolatedAsyncioTestCase):
             detail_version="d0",
             status="active",
         )
-        graph.apply_new_leaf(parent_path=[""], child_name="T")
+        await graph.apply_new_leaf(parent_path=[""], child_name="T")
         self.assertEqual(graph.get_node_by_path(["", "T"]).parent_id, graph.get_node_by_path([""]).id)
 
     def test_merge_mutation_is_deferred(self):
@@ -103,7 +103,7 @@ class TopicGraphTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(graph.evaluate_mutation(conflicting_parent).status, "pending")
 
-    def test_finalize_resolution_keeps_non_primary_pending_mutations(self):
+    async def test_finalize_resolution_keeps_non_primary_pending_mutations(self):
         from app.services.knowledge_pipeline.topic_graph import TopicResolution
         graph = TopicGraph.empty()
         graph.create_node(name="投资", parent_path=[], aliases=[], replacement_target_id=None, lineage=[], summary_version="s1", detail_version="d1", status="active")
@@ -126,7 +126,7 @@ class TopicGraphTests(unittest.IsolatedAsyncioTestCase):
             ],
             source_identity={"source_inbox_path": "inbox/douyin/a.md"},
         )
-        placement = graph.finalize_resolution(resolution)
+        placement = await graph.finalize_resolution(resolution)
         self.assertEqual(len(placement.deferred_mutation_records), 1)
 
     def test_rename_keeps_node_id_and_backfills_alias_and_lineage(self):
@@ -154,7 +154,7 @@ class TopicGraphTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(parent.id, graph.get_node_by_path(["投资", "短线交易"]).children_ids)
         self.assertIn(parent.id, graph.get_node_by_path(["投资"]).children_ids)
 
-    def test_merge_split_and_replace_backfill_lineage_and_replacement_target(self):
+    async def test_merge_split_and_replace_backfill_lineage_and_replacement_target(self):
         graph = TopicGraph.empty()
         graph.create_node(name="投资", parent_path=[], aliases=[], replacement_target_id=None, lineage=[], summary_version="s1", detail_version="d1", status="active")
         left = graph.create_node(name="短线交易", parent_path=["投资"], aliases=[], replacement_target_id=None, lineage=[], summary_version="s1", detail_version="d1", status="active")
@@ -164,7 +164,7 @@ class TopicGraphTests(unittest.IsolatedAsyncioTestCase):
         merge_result = graph.merge_nodes([left.id, right.id], replacement_node_id=replacement.id)
         self.assertIn(replacement.id, merge_result.changed_node_ids)
         self.assertEqual(graph.get_node(left.id).replacement_target_id, replacement.id)
-        split_result = graph.split_node(source.id, [["投资", "短线交易策略"], ["投资", "波段交易"]])
+        split_result = await graph.split_node(source.id, [["投资", "短线交易策略"], ["投资", "波段交易"]])
         self.assertIn(source.id, split_result.changed_node_ids)
         replace_result = graph.replace_node(left.id, replacement_node_id=replacement.id)
         self.assertEqual(replace_result.changed_node_ids, [left.id, replacement.id])

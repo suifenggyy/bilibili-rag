@@ -42,8 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--collection-dir",
-        default=None,
-        help="collection 根目录（默认读取 COLLECTION_OUTPUT_DIR）",
+        required=True,
+        help="旧版 collection 根目录（必须指定，例如 ~/Obsidian/jarvis/collection）",
     )
     parser.add_argument(
         "--inbox-dir",

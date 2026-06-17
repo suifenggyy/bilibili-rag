@@ -336,9 +336,9 @@ async def download_export(job_id: str):
     # 打包为 ZIP 并流式返回
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        export_root = os.path.expanduser(settings.collection_output_dir)
+        inbox_root = str(storage_manager.get_inbox_dir())
         for abs_path in output_files:
-            arc_name = os.path.relpath(abs_path, export_root)
+            arc_name = os.path.relpath(abs_path, inbox_root)
             zf.write(abs_path, arc_name)
     zip_buffer.seek(0)
 

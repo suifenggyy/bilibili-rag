@@ -4,14 +4,11 @@
 
 from typing import Optional
 
-from app.config import settings
-from app.services.text_model_prompts import DEFAULT_TEXT_MODEL_SUMMARY_PROMPT
 from app.services.text_postprocessor import TextPostProcessor
 from app.services.text_postprocessor_factory import create_text_postprocessor
 
 SUMMARY_BLOCK_START = "<!-- AI_SUMMARY_START -->"
 SUMMARY_BLOCK_END = "<!-- AI_SUMMARY_END -->"
-SUMMARY_PROMPT = DEFAULT_TEXT_MODEL_SUMMARY_PROMPT
 
 
 def _normalize_summary_yaml(summary_yaml: str) -> str:
@@ -53,11 +50,11 @@ def append_summary_section(lines: list[str], summary_block: str) -> None:
 
 
 class ContentSummaryService:
-    """使用现有 ollama_text_model 生成正文总结。"""
+    """使用统一 LLM 工厂生成正文总结。"""
 
     def __init__(self, processor: Optional[TextPostProcessor] = None):
         self.processor = processor or create_text_postprocessor(
-            prompt_template=settings.text_model_summary_prompt,
+            role="content_summary",
         )
 
     async def summarize(self, text: str) -> str:

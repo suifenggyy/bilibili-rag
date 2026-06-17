@@ -6,6 +6,7 @@ YouTube 内容获取器
 """
 import asyncio
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -101,6 +102,50 @@ class YouTubeContentFetcher:
             base.content = self._build_basic_content(base)
             return base
 
+        # ========== 工作区缓存复用 ==========
+        # 1. asr_raw.txt 缓存命中 → 跳过下载 + ASR
+        cached_asr = self.storage_manager.read_work_text("youtube", title, "asr_raw.txt")
+        if cached_asr:
+            logger.info(f"[YouTubeFetcher] [CACHE HIT] asr_raw.txt 缓存命中，跳过下载和 ASR: {video_id}")
+            raw_asr = cached_asr
+            base.content = await self._postprocess_asr_text(video_id, raw_asr, title=title)
+            base.asr_raw_text = raw_asr
+            self.storage_manager.write_work_text("youtube", title, "asr_corrected.txt", base.content.strip())
+            base.content_source = "asr"
+            base.summary_block = await self._summarize_content(video_id, base.content)
+            return base
+
+        # 2. audio.wav 缓存命中 → 跳过下载，直接 ASR
+        if self.storage_manager.work_file_exists("youtube", title, "audio.wav", min_size=1024):
+            logger.info(f"[YouTubeFetcher] [CACHE HIT] audio.wav 缓存命中，跳过下载: {video_id}")
+            wav_path = str(self.storage_manager.find_work_file_path("youtube", title, "audio.wav"))
+            transcript = await self.asr.transcribe_local_file(wav_path, title=title or video_id)
+            if transcript and len(transcript) >= 50:
+                self.storage_manager.write_work_text("youtube", title, "asr_raw.txt", transcript.strip())
+                raw_asr = transcript.strip()
+                base.content = await self._postprocess_asr_text(video_id, transcript, title=title)
+                base.asr_raw_text = raw_asr
+                self.storage_manager.write_work_text("youtube", title, "asr_corrected.txt", base.content.strip())
+                base.content_source = "asr"
+                base.summary_block = await self._summarize_content(video_id, base.content)
+                return base
+
+        # 3. 音频文件缓存命中（glob 匹配，YouTube 音频无固定扩展名）→ 跳过下载
+        cached_audio = self._find_cached_audio(title)
+        if cached_audio:
+            logger.info(f"[YouTubeFetcher] [CACHE HIT] 音频文件缓存命中，跳过下载: {video_id} ({cached_audio.name})")
+            transcript = await self._extract_and_transcribe(str(cached_audio), video_id, title)
+            if transcript:
+                self.storage_manager.write_work_text("youtube", title, "asr_raw.txt", transcript.strip())
+                raw_asr = transcript.strip()
+                base.content = await self._postprocess_asr_text(video_id, transcript, title=title)
+                base.asr_raw_text = raw_asr
+                self.storage_manager.write_work_text("youtube", title, "asr_corrected.txt", base.content.strip())
+                base.content_source = "asr"
+                base.summary_block = await self._summarize_content(video_id, base.content)
+                return base
+
+        # ========== 无缓存，完整流程 ==========
         audio_dest = str(
             self.storage_manager.build_work_file_path("youtube", title, "audio")
         )
@@ -141,6 +186,32 @@ class YouTubeContentFetcher:
         return base
 
     # ==================== 私有方法 ====================
+
+    def _find_cached_audio(self, title: str) -> Optional[Path]:
+        """在工作区中搜索已缓存的音频文件（排除 .txt 和 .wav）。"""
+        source_dir = self.storage_manager.workspace_root / self.storage_manager._sanitize_segment("youtube")
+        if not source_dir.exists():
+            return None
+        safe_title = self.storage_manager._sanitize_segment(title)
+        date_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+        candidates: list[Path] = []
+        for date_dir in source_dir.iterdir():
+            if not date_dir.is_dir() or not date_pattern.match(date_dir.name):
+                continue
+            title_dir = date_dir / safe_title
+            if not title_dir.exists():
+                continue
+            for f in title_dir.iterdir():
+                if (
+                    f.is_file()
+                    and f.name.startswith("audio")
+                    and f.suffix not in (".txt", ".wav")
+                    and f.stat().st_size >= 10 * 1024
+                ):
+                    candidates.append(f)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda f: f.stat().st_size)
 
     async def _extract_and_transcribe(
         self, audio_path: str, video_id: str, title: str

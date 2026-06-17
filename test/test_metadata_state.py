@@ -75,7 +75,7 @@ class MetadataStateTests(unittest.IsolatedAsyncioTestCase):
             graph.create_node(name="短线交易", parent_path=["投资"], aliases=[], replacement_target_id=None, lineage=[], summary_version="", detail_version="", status="active")
 
             resolution = await TopicPathResolver(fake_processor).resolve(units, graph)
-            placement = graph.finalize_resolution(resolution)
+            placement = await graph.finalize_resolution(resolution)
 
             async with state.write_lock():
                 await state.merge_pending_mutations([asdict(item) for item in placement.deferred_mutation_records])

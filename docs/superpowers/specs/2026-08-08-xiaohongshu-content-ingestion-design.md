@@ -49,6 +49,11 @@ Responsibilities:
   header needed by the API client.
 - Close Playwright resources deterministically.
 
+Its public result is an `XhsBrowserSession` dataclass containing `page`,
+`cookie_dict`, `cookie_header`, and `user_agent`. The auth service owns the
+Playwright context for the lifetime of that result; callers close it through
+the service rather than closing the page directly.
+
 The session file is runtime data and must be added to `.gitignore`.
 
 ### `app/services/xhs_client.py`
@@ -77,17 +82,37 @@ knowledge-pipeline logic.
 
 Owns Xiaohongshu domain operations and response normalization.
 
-It provides three entry flows:
+It provides two distinct phases:
 
-1. Parse explicit note URLs and fetch each note detail.
-2. Parse a creator URL or creator ID, paginate creator notes, and fetch their
-   details.
-3. Paginate keyword search results and fetch their details.
+1. Candidate discovery returns lightweight `XhsNoteReference` values.
+2. Detail resolution turns one reference into one `XhsNoteInfo`.
 
-Search and creator list responses provide note IDs and security tokens. The
-service carries those tokens into detail and comment requests. If the detail
-API returns no usable note, the service tries the note-page initial-state
-fallback.
+The discovery methods are:
+
+- `references_from_urls(urls)`
+- `iter_creator_references(creator, limit, after_date)`
+- `iter_search_references(keyword, limit, after_date)`
+
+Supported explicit note forms include full `/explore/<note_id>` URLs, shared
+URLs after redirect resolution, and bare note IDs. Supported creator forms
+include full `/user/profile/<user_id>` URLs and bare user IDs.
+
+`XhsNoteReference` contains `note_id`, `source_url`, `xsec_token`,
+`xsec_source`, and an optional list-result publication timestamp. Discovery
+does not request note details. The CLI combines and deduplicates references by
+note ID before scheduling `resolve_note(reference)`.
+
+Search and creator list responses normally provide note IDs and security
+tokens. The service carries those tokens into detail and comment requests. If
+an explicit URL lacks `xsec_token`, the service first requests and parses the
+note HTML without cookies, then with authenticated cookies if needed. If that
+HTML contains a normalized note, it is used directly. If it only reveals the
+missing security token, the service retries the detail API. A note for which
+neither HTML nor API detail can be obtained is an item-level failure; the
+client must not invent or hard-code a token.
+
+If the detail API returns no usable note for any reference, the service tries
+the same note-page initial-state fallback.
 
 The service maps raw responses into a stable `XhsNoteInfo` dataclass with:
 
@@ -117,9 +142,9 @@ limit is reached, or the available publication date is older than
 Owns media acquisition and content enrichment for one normalized note.
 
 The returned `XhsNoteContent` dataclass contains the normalized note metadata,
-downloaded image paths, original description, formatted tags, video
+downloaded image workspace paths, original description, formatted tags, video
 transcription, content source, summary block, raw ASR text, and formatted
-comments section.
+comments section. `fetch_content(note)` does not write final Markdown.
 
 Processing order:
 
@@ -131,6 +156,10 @@ Processing order:
 5. Fetch and format the configured number of popular comments.
 6. Summarize the combined original description, transcription, and comments
    with `ContentSummaryService`.
+
+"Popular comments" means the first `comment_limit` top-level comments in the
+order returned by Xiaohongshu's web comment endpoint. Nested replies are not
+fetched in the first version.
 
 Images are always downloaded when available. The first version does not run
 OCR. If ASR is unavailable or fails, the note still exports with original
@@ -164,18 +193,21 @@ Common options include:
 
 The script builds authentication, client, service, fetcher, ASR, summary, and
 storage dependencies; gathers candidate notes; processes them with bounded
-concurrency; writes Markdown; reports per-note failures; and closes browser
-and HTTP resources in a `finally` path.
+concurrency; copies successfully downloaded images from the workspace into the
+final export media directory; writes Markdown with export-relative media
+links; reports per-note failures; and closes browser and HTTP resources in a
+`finally` path.
 
 ## Authentication and Signing Flow
 
 Authentication precedence is:
 
-1. Explicit `--cookie`.
-2. `XHS_COOKIE`.
-3. Saved `.xhs_session.json`.
-4. Interactive QR login when `--login` is supplied or no reusable session is
-   available in an interactive terminal.
+1. `--login` forces a new interactive QR login and ignores explicit,
+   environment, and saved cookies for session selection.
+2. Otherwise, explicit `--cookie`.
+3. Otherwise, `XHS_COOKIE`.
+4. Otherwise, saved `.xhs_session.json`.
+5. Otherwise, interactive QR login when running in an interactive terminal.
 
 Non-interactive execution without a usable session fails with an actionable
 message.
@@ -189,9 +221,10 @@ required signed headers. Signature generation failure is a task-level error.
 ## Data Flow
 
 1. The CLI resolves authentication and opens one authenticated browser page.
-2. Each selected entry source yields note references.
+2. Each selected entry source yields `XhsNoteReference` values without
+   resolving details.
 3. References are deduplicated by note ID.
-4. The domain service requests and normalizes note details.
+4. The domain service resolves and normalizes one detail per unique reference.
 5. The fetcher downloads media, transcribes video, fetches comments, and
    generates a summary.
 6. The script renders Markdown and writes it with
@@ -221,7 +254,19 @@ The body contains:
 8. Export timestamp.
 
 The Markdown file and its media directory use sanitized deterministic names
-containing the note ID to avoid collisions.
+containing the note ID to avoid collisions. For a note titled `Example` with
+ID `abc`, the default layout is:
+
+```text
+inbox/xhs/2026-08-08/
+├── Example_abc.md
+└── Example_abc.media/
+    ├── image_01.jpg
+    └── image_02.jpg
+```
+
+The Markdown references `Example_abc.media/image_01.jpg`. Video and WAV files
+remain workspace cache files and are not copied to the final export directory.
 
 ## Configuration
 
@@ -296,9 +341,13 @@ Required coverage:
 - Markdown frontmatter, image references, transcription, tags, summary, and
   comments.
 - Batch continuation after one item-level failure.
+- Forced `--login` precedence over explicit and saved cookies.
+- Explicit note URLs without security tokens using HTML resolution or failing
+  explicitly.
 
 No automated test depends on a live Xiaohongshu account. A documented manual
-smoke check uses one public note with `--limit 1`.
+smoke checklist separately verifies cookie authentication and QR
+authentication against one accessible note with `--limit 1`.
 
 ## Documentation
 
@@ -313,7 +362,11 @@ Update the repository documentation with:
 
 ## Acceptance Criteria
 
-- A user can authenticate with either a cookie or QR login.
+- Automated tests verify cookie/session precedence, QR-login orchestration,
+  session persistence, and authenticated client construction with mocked
+  Playwright state.
+- Manual smoke checks confirm one real export with Cookie authentication and
+  one real export with forced QR authentication.
 - Explicit note URLs, creator pages, and keyword searches all produce
   deduplicated note candidates.
 - Text/image notes export their original text, tags, downloaded images, and
@@ -321,5 +374,5 @@ Update the repository documentation with:
 - Video notes additionally attempt ASR using the configured existing backend.
 - Optional enrichment failures preserve and export available core note data.
 - Output Markdown uses `platform: xhs` and is written to the configured inbox
-  in the same structural style as existing sources.
+  with valid export-relative links to copied images.
 - Targeted unit tests pass without live external services.

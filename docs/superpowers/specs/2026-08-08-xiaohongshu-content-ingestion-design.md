@@ -102,6 +102,18 @@ include full `/user/profile/<user_id>` URLs and bare user IDs.
 does not request note details. The CLI combines and deduplicates references by
 note ID before scheduling `resolve_note(reference)`.
 
+Duplicate references are merged deterministically instead of keeping the
+first arbitrary value:
+
+- Prefer a non-empty `xsec_token` and its paired `xsec_source`.
+- If multiple non-empty token pairs differ, prefer the reference discovered
+  from an explicit note URL, then keyword search, then creator listing.
+- Prefer a canonical full note URL over a bare ID-derived URL.
+- Preserve the first available publication timestamp.
+
+The merged reference records its discovery kind so the precedence rule is
+testable.
+
 Search and creator list responses normally provide note IDs and security
 tokens. The service carries those tokens into detail and comment requests. If
 an explicit URL lacks `xsec_token`, the service first requests and parses the
@@ -190,6 +202,12 @@ Common options include:
 - `--comment-limit`
 - `--output-dir`
 - Existing ASR backend options consistent with other export scripts.
+
+`--limit` is a global maximum number of unique notes for the entire run after
+deduplication. Discovery follows CLI input order and stops requesting further
+pages once the merged unique-reference set reaches that limit. Repeated
+`--note-url` values participate in the same limit. Without `--limit`, each
+paginated source continues until its remote end or `after_date` boundary.
 
 The script builds authentication, client, service, fetcher, ASR, summary, and
 storage dependencies; gathers candidate notes; processes them with bounded
@@ -294,18 +312,27 @@ Task-level failures stop the run:
 - Repeated CAPTCHA or explicit risk-control response.
 - Invalid CLI input with no supported source.
 
-Item-level failures are logged with the note ID and do not stop unrelated
-notes:
+Core item failures are logged with the note ID, mark that note failed, and do
+not stop unrelated notes:
 
 - Note deleted, private, or unavailable.
+- Markdown write failure.
+
+Optional enrichment failures are logged as warnings, mark the note as
+partially successful, and still produce Markdown from available core data:
+
 - Comment request failure.
 - Individual image download failure.
 - Video download, ffmpeg, ASR, postprocessing, or summary failure.
-- Markdown write failure.
 
 An unavailable detail API triggers the HTML fallback before the item is
 declared failed. Optional enrichment failures never erase the original note
 text already obtained.
+
+The CLI prints counts for successful, partial, failed, and skipped notes. It
+returns exit code `0` when every resolved core note was exported, including
+partial exports; exit code `1` when any core note failed or when a task-level
+failure occurred.
 
 Partial downloads use temporary filenames and are renamed only after a
 successful size-checked download. Failed partial files are removed.
@@ -331,6 +358,8 @@ Required coverage:
 - Cookie parsing, precedence, saved-session loading, and QR-session saving.
 - Search and creator pagination termination and limits.
 - Deduplication across mixed input sources.
+- Deterministic duplicate-reference metadata merging.
+- Global `--limit` behavior across mixed input sources.
 - Raw note-detail normalization for image and video notes.
 - Detail API to HTML fallback.
 - Signed-header generation calling the Playwright page under a lock.
@@ -341,6 +370,7 @@ Required coverage:
 - Markdown frontmatter, image references, transcription, tags, summary, and
   comments.
 - Batch continuation after one item-level failure.
+- Successful, partial, and failed batch accounting and exit status.
 - Forced `--login` precedence over explicit and saved cookies.
 - Explicit note URLs without security tokens using HTML resolution or failing
   explicitly.

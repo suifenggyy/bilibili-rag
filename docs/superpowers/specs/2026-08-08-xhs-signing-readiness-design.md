@@ -40,28 +40,35 @@ Authentication is ready only when all of these values are available:
 4. localStorage `b1`
 
 `XhsAuthService` will collect these checks into one internal readiness snapshot so
-polling and timeout diagnostics use identical criteria.
+polling, timeout diagnostics, and the returned session use identical state. A
+successful snapshot includes the cookie dictionary and raw cookie records needed
+to create and persist the session; `open()` will not reread cookies after success.
 
 ### Polling Flow
 
 After navigating to the Xiaohongshu origin, `open()` will poll readiness at the
-existing 250 ms interval until all four requirements are present or
-`login_timeout` expires.
+existing 250 ms interval until all four requirements are present or a monotonic
+deadline based on `login_timeout` expires. The final check occurs at the deadline
+before reporting a timeout.
 
 In QR mode, the browser remains headed and the existing waiting log is retained.
-Cookie, environment, and saved-session modes use the same poll, but preserve their
-configured headless behavior. This accommodates asynchronous page initialization
-without relying on a fixed delay or an extra reload.
+Cookie, environment, and saved-session modes use the same poll, may wait for the
+full `login_timeout`, and preserve their configured headless behavior. This
+accommodates asynchronous page initialization without relying on a fixed delay or
+an extra reload.
 
 The existing one-shot authenticated-state, signing-function, and signing-state
-checks will be replaced by the unified wait. Once ready, `open()` reads the final
-cookies, persists QR cookies, and returns `XhsBrowserSession`.
+checks will be replaced by the unified wait. Once ready, `open()` uses the
+successful snapshot to persist QR cookies and return `XhsBrowserSession`.
 
 ### Error Handling
 
-On timeout, `XhsAuthenticationError` will identify the exact missing fields, using
-stable names such as `web_session cookie`, `a1 cookie`, `window.mnsv2`, and
-`b1 localStorage`.
+On timeout, `XhsAuthenticationError` will identify only the fields missing from the
+final snapshot. Fields appear in this deterministic order:
+`web_session cookie`, `a1 cookie`, `window.mnsv2`, `b1 localStorage`. The message
+format is:
+
+> Xiaohongshu browser session was not ready before timeout; missing: FIELD[, FIELD...]. Refresh the session or log in again.
 
 The message will continue to advise refreshing the session or logging in again.
 Unexpected Playwright errors keep the existing wrapped initialization error.
@@ -83,7 +90,9 @@ Coverage will verify:
 
 - QR login succeeds when cookies appear before `b1`.
 - Readiness succeeds when `window.mnsv2` is delayed.
-- Timeout errors name every field that remains missing.
+- A fully missing timeout reports all four fields in the defined order.
+- Partial-readiness timeouts report only the fields missing from the final
+  snapshot, in the defined order.
 - QR cookies are not persisted before full readiness.
 - Explicit-cookie, environment-cookie, and saved-session precedence is unchanged.
 - Browser cleanup and context-manager behavior remain unchanged.

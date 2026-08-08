@@ -90,8 +90,8 @@ It provides two distinct phases:
 The discovery methods are:
 
 - `references_from_urls(urls)`
-- `iter_creator_references(creator, limit, after_date)`
-- `iter_search_references(keyword, limit, after_date)`
+- `iter_creator_references(creator, after_date)`
+- `iter_search_references(keyword, after_date)`
 
 Supported explicit note forms include full `/explore/<note_id>` URLs, shared
 URLs after redirect resolution, and bare note IDs. Supported creator forms
@@ -208,6 +208,9 @@ deduplication. Discovery follows CLI input order and stops requesting further
 pages once the merged unique-reference set reaches that limit. Repeated
 `--note-url` values participate in the same limit. Without `--limit`, each
 paginated source continues until its remote end or `after_date` boundary.
+The service exposes lazy async iterators; the CLI breaks those iterators when
+the global unique-note limit is reached, so the service does not own a
+separate per-source limit.
 
 The script builds authentication, client, service, fetcher, ASR, summary, and
 storage dependencies; gathers candidate notes; processes them with bounded

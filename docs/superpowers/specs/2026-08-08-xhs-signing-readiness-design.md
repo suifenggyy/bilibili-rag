@@ -90,6 +90,10 @@ Coverage will verify:
 
 - QR login succeeds when cookies appear before `b1`.
 - Readiness succeeds when `window.mnsv2` is delayed.
+- At least one cookie, environment, or saved-session case succeeds after delayed
+  signing-state initialization, proving non-QR modes use the same poll.
+- A successful poll returns the cookie snapshot used by `open()` without an
+  additional cookie read, verified by read count or post-success mutation.
 - A fully missing timeout reports all four fields in the defined order.
 - Partial-readiness timeouts report only the fields missing from the final
   snapshot, in the defined order.

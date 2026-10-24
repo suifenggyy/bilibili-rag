@@ -87,14 +87,25 @@ class OpenAICompatibleLLMService:
     def _should_use_responses_api(self) -> bool:
         """Return True if the model requires the /v1/responses API.
 
-        Reasoning models (o1, o3, o4 series) and some newer GPT models
-        (e.g. gpt-5.4-mini) are designed for the responses API and
-        do not support chat.completions.
+        Reasoning models (o1, o3, o4 series) and GPT-5.4+ models
+        (e.g. gpt-5.4-mini, gpt-5.6-terra) are designed for the
+        responses API and do not support chat.completions.
+        Names like gpt-5-mini stay on chat completions.
         """
         model_lower = self.model.lower()
-        return any(
-            model_lower.startswith(p) for p in ("o1", "o3", "o4", "gpt-5.4")
-        )
+        if model_lower.startswith(("o1", "o3", "o4")):
+            return True
+        prefix = "gpt-5."
+        if not model_lower.startswith(prefix):
+            return False
+        minor_digits: list[str] = []
+        for char in model_lower[len(prefix):]:
+            if not char.isdigit():
+                break
+            minor_digits.append(char)
+        if not minor_digits:
+            return False
+        return int("".join(minor_digits)) >= 4
 
     # ------------------------------------------------------------------
     # Core LLMService methods
@@ -129,7 +140,7 @@ class OpenAICompatibleLLMService:
                         f"Responses API returned empty output_text for model={self.model}, "
                         f"status={response.status}, "
                         f"output_types={[o.type for o in (response.output or [])]}, "
-                        f"max_output_tokens={expanded_max}, "
+                        f"max_output_tokens={create_kwargs.get('max_output_tokens')}, "
                         f"usage={response.usage}"
                     )
                 usage = {}

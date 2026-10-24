@@ -390,6 +390,94 @@ class TestOpenAICompatibleLLMService(unittest.TestCase):
         self.assertIsNotNone(client)
         self.assertIs(service.sync_client, client)
 
+    def test_responses_api_routing(self):
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMService
+
+        responses_models = (
+            "o1",
+            "o3-mini",
+            "o4-mini",
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.6-terra",
+            "GPT-5.10-preview",
+        )
+        chat_models = ("gpt-5-mini", "gpt-5.3", "gpt-4o", "gemma4:e2b", "qwen3-max")
+
+        for model in responses_models:
+            service = OpenAICompatibleLLMService(
+                base_url="http://localhost:4141/v1",
+                api_key="test",
+                model=model,
+            )
+            self.assertTrue(
+                service._should_use_responses_api(),
+                msg=f"{model} should use the responses API",
+            )
+
+        for model in chat_models:
+            service = OpenAICompatibleLLMService(
+                base_url="http://localhost:4141/v1",
+                api_key="test",
+                model=model,
+            )
+            self.assertFalse(
+                service._should_use_responses_api(),
+                msg=f"{model} should stay on chat completions",
+            )
+
+    def test_complete_uses_responses_api_for_gpt_5_6_terra(self):
+        import asyncio
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMService
+
+        service = OpenAICompatibleLLMService(
+            base_url="http://localhost:4141/v1",
+            api_key="test",
+            model="gpt-5.6-terra",
+        )
+        response = MagicMock()
+        response.output_text = "corrected"
+        response.model = "gpt-5.6-terra"
+        response.status = "completed"
+        response.output = []
+        response.usage = None
+        service._async_client = MagicMock()
+        service._async_client.responses.create = AsyncMock(return_value=response)
+        service._async_client.chat.completions.create = AsyncMock()
+
+        result = asyncio.run(service.complete([LLMMessage(role="user", content="hello")]))
+
+        self.assertEqual(result.content, "corrected")
+        service._async_client.responses.create.assert_awaited_once()
+        service._async_client.chat.completions.create.assert_not_called()
+
+    def test_empty_responses_output_does_not_raise(self):
+        import asyncio
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMService
+
+        service = OpenAICompatibleLLMService(
+            base_url="http://localhost:4141/v1",
+            api_key="test",
+            model="gpt-5.6-terra",
+        )
+        response = MagicMock()
+        response.output_text = ""
+        response.model = "gpt-5.6-terra"
+        response.status = "incomplete"
+        response.output = []
+        response.usage = None
+        service._async_client = MagicMock()
+        service._async_client.responses.create = AsyncMock(return_value=response)
+
+        result = asyncio.run(
+            service.complete(
+                [LLMMessage(role="user", content="hello")],
+                max_tokens=128,
+            )
+        )
+
+        self.assertEqual(result.content, "")
+
 
 class TestChatCompletionPostProcessor(unittest.TestCase):
     """Test the backward-compatible ChatCompletionPostProcessor."""

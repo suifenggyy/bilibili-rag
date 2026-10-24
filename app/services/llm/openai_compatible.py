@@ -20,11 +20,12 @@ from app.services.llm.types import LLMMessage, LLMResponse
 
 
 class OpenAICompatibleLLMService:
-    """LLM service using OpenAI-compatible chat completions API.
+    """LLM service using the OpenAI-compatible Responses and chat APIs.
 
-    This single class handles all providers because they all speak
-    the /v1/chat/completions protocol. Provider differences are
-    captured in base_url, api_key, and model name.
+    complete() and stream() call /v1/responses first. If that call fails
+    before any output, the same request is sent to /v1/chat/completions.
+    The endpoint that succeeds is reused for later calls. Provider
+    differences are captured in base_url, api_key, and model name.
 
     Provides bridge methods:
       - as_langchain_chat() → ChatOpenAI for LangChain chains
@@ -50,6 +51,9 @@ class OpenAICompatibleLLMService:
         # Lazy-initialised clients
         self._async_client: AsyncOpenAI | None = None
         self._sync_client: OpenAI | None = None
+        # complete()/stream() try Responses first, then chat completions.
+        # The endpoint that succeeds is reused until it fails.
+        self._preferred_api = "responses"
 
         logger.debug(
             f"LLM service configured: base_url={base_url}, model={model}, "
@@ -84,28 +88,124 @@ class OpenAICompatibleLLMService:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _should_use_responses_api(self) -> bool:
-        """Return True if the model requires the /v1/responses API.
+    def _api_order(self) -> tuple[str, str]:
+        """Responses first, unless a previous call had to switch."""
+        if self._preferred_api == "chat":
+            return ("chat", "responses")
+        return ("responses", "chat")
 
-        Reasoning models (o1, o3, o4 series) and GPT-5.4+ models
-        (e.g. gpt-5.4-mini, gpt-5.6-terra) are designed for the
-        responses API and do not support chat.completions.
-        Names like gpt-5-mini stay on chat completions.
-        """
-        model_lower = self.model.lower()
-        if model_lower.startswith(("o1", "o3", "o4")):
-            return True
-        prefix = "gpt-5."
-        if not model_lower.startswith(prefix):
-            return False
-        minor_digits: list[str] = []
-        for char in model_lower[len(prefix):]:
-            if not char.isdigit():
-                break
-            minor_digits.append(char)
-        if not minor_digits:
-            return False
-        return int("".join(minor_digits)) >= 4
+    def _remember_api(self, api: str) -> None:
+        self._preferred_api = api
+
+    async def _complete_responses(
+        self,
+        dict_messages: list[dict],
+        *,
+        max_tokens: int | None,
+        timeout: int | None,
+    ) -> LLMResponse:
+        # Responses API 的 max_output_tokens 包含 reasoning + 可见输出，
+        # 无法像 chat completions 的 max_tokens 那样只限制可见输出。
+        # 不传 max_output_tokens，让模型自行决定输出长度。
+        create_kwargs: dict = {
+            "model": self.model,
+            "input": dict_messages,  # type: ignore[arg-type]
+            "timeout": timeout if timeout is not None else self.default_timeout,
+        }
+        if max_tokens is not None:
+            create_kwargs["max_output_tokens"] = max_tokens
+        response = await self.async_client.responses.create(**create_kwargs)
+        content = response.output_text or ""
+        if not content:
+            logger.warning(
+                f"Responses API returned empty output_text for model={self.model}, "
+                f"status={response.status}, "
+                f"output_types={[o.type for o in (response.output or [])]}, "
+                f"max_output_tokens={create_kwargs.get('max_output_tokens')}, "
+                f"usage={response.usage}"
+            )
+        usage = {}
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.input_tokens,
+                "completion_tokens": response.usage.output_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+        return LLMResponse(content=content, model=response.model, usage=usage)
+
+    async def _complete_chat(
+        self,
+        dict_messages: list[dict],
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        timeout: int | None,
+    ) -> LLMResponse:
+        response = await self.async_client.chat.completions.create(
+            model=self.model,
+            messages=dict_messages,  # type: ignore[arg-type]
+            temperature=temperature if temperature is not None else self.default_temperature,
+            max_tokens=max_tokens if max_tokens is not None else self.default_max_tokens,
+            timeout=timeout if timeout is not None else self.default_timeout,
+        )
+        choice = response.choices[0]
+        content = choice.message.content or ""
+        usage = {}
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+        return LLMResponse(content=content, model=response.model, usage=usage)
+
+    async def _stream_responses(
+        self,
+        dict_messages: list[dict],
+        *,
+        max_tokens: int | None,
+        timeout: int | None,
+    ) -> AsyncIterator[str]:
+        stream = await self.async_client.responses.create(
+            model=self.model,
+            input=dict_messages,  # type: ignore[arg-type]
+            max_output_tokens=max_tokens if max_tokens is not None else self.default_max_tokens,
+            timeout=timeout if timeout is not None else self.default_timeout,
+            stream=True,
+        )
+        async for event in stream:
+            if event.type == "response.output_text.delta":
+                yield event.delta
+
+    async def _stream_chat(
+        self,
+        dict_messages: list[dict],
+        *,
+        temperature: float | None,
+        max_tokens: int | None,
+        timeout: int | None,
+    ) -> AsyncIterator[str]:
+        stream = await self.async_client.chat.completions.create(
+            model=self.model,
+            messages=dict_messages,  # type: ignore[arg-type]
+            temperature=temperature if temperature is not None else self.default_temperature,
+            max_tokens=max_tokens if max_tokens is not None else self.default_max_tokens,
+            timeout=timeout if timeout is not None else self.default_timeout,
+            stream=True,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                yield delta.content
+
+    def _log_both_failed(self, action: str, errors: list[tuple[str, Exception]]) -> Exception:
+        first_api, first_exc = errors[0]
+        second_api, second_exc = errors[1]
+        logger.error(
+            f"LLM {action} failed (model={self.model}) "
+            f"via {first_api}: {first_exc}; via {second_api}: {second_exc}"
+        )
+        return first_exc
 
     # ------------------------------------------------------------------
     # Core LLMService methods
@@ -119,59 +219,35 @@ class OpenAICompatibleLLMService:
         max_tokens: int | None = None,
         timeout: int | None = None,
     ) -> LLMResponse:
-        """Async completion via /v1/chat/completions or /v1/responses."""
+        """Async completion. Tries /v1/responses, then /v1/chat/completions."""
         dict_messages = [{"role": m.role, "content": m.content} for m in messages]
-        try:
-            if self._should_use_responses_api():
-                # Responses API 的 max_output_tokens 包含 reasoning + 可见输出，
-                # 无法像 chat completions 的 max_tokens 那样只限制可见输出。
-                # 不传 max_output_tokens，让模型自行决定输出长度。
-                create_kwargs: dict = {
-                    "model": self.model,
-                    "input": dict_messages,  # type: ignore[arg-type]
-                    "timeout": timeout if timeout is not None else self.default_timeout,
-                }
-                if max_tokens is not None:
-                    create_kwargs["max_output_tokens"] = max_tokens
-                response = await self.async_client.responses.create(**create_kwargs)
-                content = response.output_text or ""
-                if not content:
-                    logger.warning(
-                        f"Responses API returned empty output_text for model={self.model}, "
-                        f"status={response.status}, "
-                        f"output_types={[o.type for o in (response.output or [])]}, "
-                        f"max_output_tokens={create_kwargs.get('max_output_tokens')}, "
-                        f"usage={response.usage}"
+        errors: list[tuple[str, Exception]] = []
+        order = self._api_order()
+        for index, api in enumerate(order):
+            try:
+                if api == "responses":
+                    result = await self._complete_responses(
+                        dict_messages,
+                        max_tokens=max_tokens,
+                        timeout=timeout,
                     )
-                usage = {}
-                if response.usage:
-                    usage = {
-                        "prompt_tokens": response.usage.input_tokens,
-                        "completion_tokens": response.usage.output_tokens,
-                        "total_tokens": response.usage.total_tokens,
-                    }
-                return LLMResponse(content=content, model=response.model, usage=usage)
-
-            response = await self.async_client.chat.completions.create(
-                model=self.model,
-                messages=dict_messages,  # type: ignore[arg-type]
-                temperature=temperature if temperature is not None else self.default_temperature,
-                max_tokens=max_tokens if max_tokens is not None else self.default_max_tokens,
-                timeout=timeout if timeout is not None else self.default_timeout,
-            )
-            choice = response.choices[0]
-            content = choice.message.content or ""
-            usage = {}
-            if response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                }
-            return LLMResponse(content=content, model=response.model, usage=usage)
-        except Exception as e:
-            logger.error(f"LLM complete failed (model={self.model}): {e}")
-            raise
+                else:
+                    result = await self._complete_chat(
+                        dict_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=timeout,
+                    )
+            except Exception as exc:
+                errors.append((api, exc))
+                if index + 1 < len(order):
+                    logger.warning(
+                        f"LLM {api} failed (model={self.model}), switching endpoint: {exc}"
+                    )
+                continue
+            self._remember_api(api)
+            return result
+        raise self._log_both_failed("complete", errors)
 
     async def stream(
         self,
@@ -181,37 +257,45 @@ class OpenAICompatibleLLMService:
         max_tokens: int | None = None,
         timeout: int | None = None,
     ) -> AsyncIterator[str]:
-        """Async streaming completion — yields content deltas."""
-        dict_messages = [{"role": m.role, "content": m.content} for m in messages]
-        try:
-            if self._should_use_responses_api():
-                stream = await self.async_client.responses.create(
-                    model=self.model,
-                    input=dict_messages,  # type: ignore[arg-type]
-                    max_output_tokens=max_tokens if max_tokens is not None else self.default_max_tokens,
-                    timeout=timeout if timeout is not None else self.default_timeout,
-                    stream=True,
-                )
-                async for event in stream:
-                    if event.type == "response.output_text.delta":
-                        yield event.delta
-                return
+        """Async streaming completion. Tries Responses, then chat completions.
 
-            stream = await self.async_client.chat.completions.create(
-                model=self.model,
-                messages=dict_messages,  # type: ignore[arg-type]
-                temperature=temperature if temperature is not None else self.default_temperature,
-                max_tokens=max_tokens if max_tokens is not None else self.default_max_tokens,
-                timeout=timeout if timeout is not None else self.default_timeout,
-                stream=True,
-            )
-            async for chunk in stream:
-                delta = chunk.choices[0].delta
-                if delta and delta.content:
-                    yield delta.content
-        except Exception as e:
-            logger.error(f"LLM stream failed (model={self.model}): {e}")
-            raise
+        A failure after the first token is not retried on the other endpoint.
+        """
+        dict_messages = [{"role": m.role, "content": m.content} for m in messages]
+        errors: list[tuple[str, Exception]] = []
+        order = self._api_order()
+        for index, api in enumerate(order):
+            yielded = False
+            try:
+                if api == "responses":
+                    generator = self._stream_responses(
+                        dict_messages,
+                        max_tokens=max_tokens,
+                        timeout=timeout,
+                    )
+                else:
+                    generator = self._stream_chat(
+                        dict_messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        timeout=timeout,
+                    )
+                async for delta in generator:
+                    yielded = True
+                    yield delta
+            except Exception as exc:
+                if yielded:
+                    logger.error(f"LLM stream failed (model={self.model}) via {api}: {exc}")
+                    raise
+                errors.append((api, exc))
+                if index + 1 < len(order):
+                    logger.warning(
+                        f"LLM {api} failed (model={self.model}), switching endpoint: {exc}"
+                    )
+                continue
+            self._remember_api(api)
+            return
+        raise self._log_both_failed("stream", errors)
 
     # ------------------------------------------------------------------
     # Bridge methods for legacy code

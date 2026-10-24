@@ -390,42 +390,6 @@ class TestOpenAICompatibleLLMService(unittest.TestCase):
         self.assertIsNotNone(client)
         self.assertIs(service.sync_client, client)
 
-    def test_responses_api_routing(self):
-        from app.services.llm.openai_compatible import OpenAICompatibleLLMService
-
-        responses_models = (
-            "o1",
-            "o3-mini",
-            "o4-mini",
-            "gpt-5.4-mini",
-            "gpt-5.5",
-            "gpt-5.6-terra",
-            "GPT-5.10-preview",
-        )
-        chat_models = ("gpt-5-mini", "gpt-5.3", "gpt-4o", "gemma4:e2b", "qwen3-max")
-
-        for model in responses_models:
-            service = OpenAICompatibleLLMService(
-                base_url="http://localhost:4141/v1",
-                api_key="test",
-                model=model,
-            )
-            self.assertTrue(
-                service._should_use_responses_api(),
-                msg=f"{model} should use the responses API",
-            )
-
-        for model in chat_models:
-            service = OpenAICompatibleLLMService(
-                base_url="http://localhost:4141/v1",
-                api_key="test",
-                model=model,
-            )
-            self.assertFalse(
-                service._should_use_responses_api(),
-                msg=f"{model} should stay on chat completions",
-            )
-
     def test_complete_uses_responses_api_for_gpt_5_6_terra(self):
         import asyncio
         from app.services.llm.openai_compatible import OpenAICompatibleLLMService
@@ -477,6 +441,125 @@ class TestOpenAICompatibleLLMService(unittest.TestCase):
         )
 
         self.assertEqual(result.content, "")
+
+    def test_complete_falls_back_to_chat_and_remembers_it(self):
+        import asyncio
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMService
+
+        service = OpenAICompatibleLLMService(
+            base_url="http://localhost:4141/v1",
+            api_key="test",
+            model="qwen3-max",
+        )
+        chat_response = MagicMock()
+        chat_response.choices[0].message.content = "from-chat"
+        chat_response.model = "qwen3-max"
+        chat_response.usage = None
+        service._async_client = MagicMock()
+        service._async_client.responses.create = AsyncMock(
+            side_effect=RuntimeError("responses unsupported")
+        )
+        service._async_client.chat.completions.create = AsyncMock(return_value=chat_response)
+
+        result = asyncio.run(service.complete([LLMMessage(role="user", content="hello")]))
+
+        self.assertEqual(result.content, "from-chat")
+        self.assertEqual(service._preferred_api, "chat")
+        service._async_client.responses.create.assert_awaited_once()
+        service._async_client.chat.completions.create.assert_awaited_once()
+
+        service._async_client.responses.create.reset_mock()
+        service._async_client.chat.completions.create.reset_mock()
+        second = asyncio.run(service.complete([LLMMessage(role="user", content="again")]))
+
+        self.assertEqual(second.content, "from-chat")
+        service._async_client.responses.create.assert_not_called()
+        service._async_client.chat.completions.create.assert_awaited_once()
+
+    def test_complete_raises_responses_error_when_both_endpoints_fail(self):
+        import asyncio
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMService
+
+        service = OpenAICompatibleLLMService(
+            base_url="http://localhost:4141/v1",
+            api_key="test",
+            model="gpt-5.6-terra",
+        )
+        service._async_client = MagicMock()
+        service._async_client.responses.create = AsyncMock(
+            side_effect=RuntimeError("responses down")
+        )
+        service._async_client.chat.completions.create = AsyncMock(
+            side_effect=RuntimeError("chat down")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "responses down"):
+            asyncio.run(service.complete([LLMMessage(role="user", content="hello")]))
+
+        self.assertEqual(service._preferred_api, "responses")
+        service._async_client.chat.completions.create.assert_awaited_once()
+
+    def test_stream_falls_back_before_any_token(self):
+        import asyncio
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMService
+
+        service = OpenAICompatibleLLMService(
+            base_url="http://localhost:4141/v1",
+            api_key="test",
+            model="qwen3-max",
+        )
+
+        async def chat_create(*args, **kwargs):
+            async def gen():
+                chunk = MagicMock()
+                chunk.choices[0].delta.content = "hi"
+                yield chunk
+            return gen()
+
+        service._async_client = MagicMock()
+        service._async_client.responses.create = AsyncMock(
+            side_effect=RuntimeError("responses unsupported")
+        )
+        service._async_client.chat.completions.create = chat_create
+
+        async def collect():
+            return [chunk async for chunk in service.stream([LLMMessage(role="user", content="hello")])]
+
+        self.assertEqual(asyncio.run(collect()), ["hi"])
+        self.assertEqual(service._preferred_api, "chat")
+
+    def test_stream_does_not_switch_after_first_token(self):
+        import asyncio
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMService
+
+        service = OpenAICompatibleLLMService(
+            base_url="http://localhost:4141/v1",
+            api_key="test",
+            model="gpt-5.6-terra",
+        )
+
+        async def responses_create(*args, **kwargs):
+            async def gen():
+                event = MagicMock()
+                event.type = "response.output_text.delta"
+                event.delta = "partial"
+                yield event
+                raise RuntimeError("mid-stream")
+            return gen()
+
+        service._async_client = MagicMock()
+        service._async_client.responses.create = responses_create
+        service._async_client.chat.completions.create = AsyncMock(
+            side_effect=AssertionError("chat completions should not be called")
+        )
+
+        async def collect():
+            return [chunk async for chunk in service.stream([LLMMessage(role="user", content="hello")])]
+
+        with self.assertRaisesRegex(RuntimeError, "mid-stream"):
+            asyncio.run(collect())
+
+        self.assertEqual(service._preferred_api, "responses")
 
 
 class TestChatCompletionPostProcessor(unittest.TestCase):

@@ -177,8 +177,8 @@ async def _route_with_llm(question: str) -> tuple[Optional[str], str]:
             "规则：\n"
             "- direct：寒暄/闲聊/与收藏无关的问题\n"
             "- db_list：清单/列表/目录/有哪些\n"
-            "- db_content：明确要求"全部/所有/整体/概览/全库"内容的总结\n"
-            "- vector：具体主题问题或需要"先检索再总结"的问题\n"
+            '- db_content：明确要求"全部/所有/整体/概览/全库"内容的总结\n'
+            '- vector：具体主题问题或需要"先检索再总结"的问题\n'
             "示例：\n"
             "Q: 中西方文化的差异是什么，简单总结 -> vector\n"
             "Q: 概览我收藏夹里所有王德峰相关内容 -> db_content\n"

@@ -97,19 +97,19 @@ class Settings(BaseSettings):
             "model_spec": "dashscope:{llm_model}",
             "temperature": 0.5,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
         "rag_summarize": {
             "model_spec": "dashscope:{llm_model}",
             "temperature": 0.5,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
         "chat": {
             "model_spec": "dashscope:{llm_model}",
             "temperature": 0.5,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
         "chat_routing": {
             "model_spec": "dashscope:{llm_model}",
@@ -121,57 +121,59 @@ class Settings(BaseSettings):
             "model_spec": "localopenai:{local_openai_model}",
             "temperature": 0.3,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
         "knowledge_topic_path": {
             "model_spec": "localopenai:{local_openai_model}",
             "temperature": 0.3,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
         "knowledge_topic_summary": {
             "model_spec": "localopenai:{local_openai_model}",
             "temperature": 0.3,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
         "knowledge_topic_detail": {
             "model_spec": "localopenai:{local_openai_model}",
             "temperature": 0.3,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
         "knowledge_classify": {
             "model_spec": "localopenai:{local_openai_model}",
             "temperature": 0.1,
             "timeout": 120,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
         "knowledge_topic_dedup": {
             "model_spec": "localopenai:{local_openai_model}",
             "temperature": 0.0,
             "timeout": 60,
-            "max_tokens": 2048,
+            "max_tokens": 8192,
         },
         "asr_correction": {
             "model_spec": "localopenai:{local_openai_model}",
             "temperature": 0.3,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "prompt": "{text_model_correction_prompt}",
         },
         "content_summary": {
             "model_spec": "localopenai:{local_openai_model}",
             "temperature": 0.3,
             "timeout": 300,
-            "max_tokens": 4096,
+            # 摘要只需一组 summary/key_points/tags，过大的预算会让本地模型在
+            # 输出完成后继续漫游、重复输出第二组。8192 足够详细摘要使用。
+            "max_tokens": 8192,
             "prompt": "{text_model_summary_prompt}",
         },
         "rag_embedding": {
             "model_spec": "dashscope:{embedding_model}",
             "temperature": 0.0,
             "timeout": 300,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
         },
     }
 
@@ -325,10 +327,16 @@ class Settings(BaseSettings):
         default=DEFAULT_TEXT_MODEL_SUMMARY_PROMPT,
         env="TEXT_MODEL_SUMMARY_PROMPT",
     )
-    # ASR 纠错分块大小（字符数），超过此长度的文本将分段纠错
+    # ASR 纠错分块阈值（字符数）：超过此长度的纠错文本将分段处理，避免 LLM 截断输出
     text_model_correction_chunk_size: int = Field(
-        default=4000,
+        default=10240,
         env="TEXT_MODEL_CORRECTION_CHUNK_SIZE",
+    )
+    # 摘要分块阈值（字符数）：超过此长度的摘要文本将分段处理。摘要优先整篇一次生成，
+    # 阈值设大以减少分块（分块会丢失全局视角），仅在超长文本时兜底。
+    text_model_summary_chunk_size: int = Field(
+        default=40960,
+        env="TEXT_MODEL_SUMMARY_CHUNK_SIZE",
     )
 
     # 本地 OpenAI 兼容接口（如 LM Studio / Jan / LocalAI，默认 http://localhost:4141）
@@ -353,6 +361,13 @@ class Settings(BaseSettings):
     youtube_after_date: str = Field(default="", env="YOUTUBE_AFTER_DATE")
     xiaoyuzhou_after_date: str = Field(default="", env="XIAOYUZHOU_AFTER_DATE")
     bilibili_after_date: str = Field(default="", env="BILIBILI_AFTER_DATE")
+
+    # 小红书导出配置
+    xhs_cookie: str = Field(default="", env="XHS_COOKIE")
+    xhs_after_date: str = Field(default="", env="XHS_AFTER_DATE")
+    xhs_comment_limit: int = Field(default=20, env="XHS_COMMENT_LIMIT")
+    xhs_request_interval: float = Field(default=1.0, env="XHS_REQUEST_INTERVAL")
+    xhs_session_file: str = Field(default=".xhs_session.json", env="XHS_SESSION_FILE")
 
     # 抓取工作目录 / 最终导出目录
     content_workspace_root: str = Field(default="~/.bilibili-rag", env="CONTENT_WORKSPACE_ROOT")
@@ -425,6 +440,7 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         extra = "ignore"
+        env_ignore_empty=True
 
 
 # 全局配置实例

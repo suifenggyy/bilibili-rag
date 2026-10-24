@@ -20,11 +20,16 @@ from app.services.llm.types import LLMMessage, LLMResponse
 from app.services.llm.factory import get_llm_service
 
 
-def _parse_yaml_output(text: str) -> dict:
-    """Try to parse LLM output as YAML (or JSON fallback)."""
+def _try_parse_dict(text: str) -> dict | None:
+    """Try to parse LLM output as YAML or JSON dict. Returns None on failure.
+
+    Strips a surrounding ``` code fence (yaml/yml/json) if present.
+    """
     import yaml
-    text = text.strip()
-    # Strip markdown code fences if present
+    import json
+    text = (text or "").strip()
+    if not text:
+        return None
     if text.startswith("```"):
         text = re.sub(r"^```(?:yaml|yml|json)?\s*\n?", "", text)
         text = re.sub(r"\n?```\s*$", "", text)
@@ -35,15 +40,50 @@ def _parse_yaml_output(text: str) -> dict:
             return result
     except Exception:
         pass
-    # JSON fallback
-    import json
     try:
         result = json.loads(text)
         if isinstance(result, dict):
             return result
     except Exception:
         pass
-    raise ValueError(f"LLM output is not valid YAML/JSON: {text[:200]}")
+    return None
+
+
+def _parse_yaml_output(text: str) -> dict:
+    """Try to parse LLM output as YAML (or JSON fallback)."""
+    result = _try_parse_dict(text)
+    if result is None:
+        raise ValueError(f"LLM output is not valid YAML/JSON: {text[:200]}")
+    return result
+
+
+def _parse_summary_output(text: str) -> dict:
+    """Lenient parser for topic summary output. Never raises.
+
+    The topic summary prompt asks for markdown, but the model may instead
+    return a YAML/JSON dict (e.g. ``{"summary": "..."}``). Accept both:
+
+    - If the output parses to a dict with a usable ``summary`` string, use it.
+    - Otherwise treat the raw text (fences stripped) as the summary itself.
+
+    Returning ``{"summary": text}`` lets the pipeline keep a usable summary
+    instead of failing and falling back to raw note concatenation.
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"summary": ""}
+    body = text
+    if body.startswith("```"):
+        stripped = re.sub(r"^```(?:yaml|yml|json|markdown|md)?\s*\n?", "", body)
+        stripped = re.sub(r"\n?```\s*$", "", stripped)
+        body = stripped.strip() or body
+    parsed = _try_parse_dict(body)
+    if isinstance(parsed, dict):
+        summary = parsed.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return {"summary": summary.strip()}
+    # Lenient fallback: treat the raw markdown as the summary.
+    return {"summary": body}
 
 
 class DistillerProcessor:
@@ -153,7 +193,12 @@ class TopicSummaryDecisionProcessor:
 
 
 class TopicSummaryProcessor:
-    """Adapter for rewriting a topic summary."""
+    """Adapter for rewriting a topic summary.
+
+    The prompt asks for markdown (not YAML/JSON), so this adapter is lenient:
+    it accepts a YAML/JSON dict (``{"summary": ...}``) OR raw markdown text.
+    See ``_parse_summary_output``.
+    """
 
     def __init__(self, llm_service=None, prompt: str | None = None):
         self._llm = llm_service
@@ -173,7 +218,7 @@ class TopicSummaryProcessor:
             LLMMessage(role="user", content=str(kwargs)),
         ]
         response = await llm.complete(messages)
-        return _parse_yaml_output(response.content)
+        return _parse_summary_output(response.content)
 
 
 class TopicDetailProcessor:

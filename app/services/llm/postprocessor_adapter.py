@@ -75,7 +75,12 @@ class ChatCompletionPostProcessor:
         if not raw_text:
             return raw_text
 
-        chunk_size = settings.text_model_correction_chunk_size
+        # 按角色选择分块阈值：摘要(content_summary)优先整篇一次生成，
+        # 阈值远大于纠错；其他角色（如 asr_correction）走纠错阈值。
+        if self._role == "content_summary":
+            chunk_size = settings.text_model_summary_chunk_size
+        else:
+            chunk_size = settings.text_model_correction_chunk_size
         if chunk_size <= 0 or len(raw_text) <= chunk_size:
             result = await self._postprocess_single(raw_text, title=title)
             return self._strip_meta_labels(result)
@@ -116,7 +121,34 @@ class ChatCompletionPostProcessor:
             # Use corrected tail (not raw) for context continuity.
             prev_corrected_tail = result[-200:] if len(result) > 200 else result
 
+        # 摘要角色：分块各自产出 YAML 摘要后，拼接所有结果再发一次摘要请求做汇总，
+        # 得到一份完整连贯的总结（而非按纠错的重叠去重合并）。
+        if self._role == "content_summary":
+            return await self._consolidate_summary(results)
         return self._merge_corrected_chunks(results)
+
+    async def _consolidate_summary(self, chunk_summaries: list[str]) -> str:
+        """将多块摘要合并为一份完整总结：拼接所有分块摘要后再调用一次摘要请求。
+
+        分块摘要各自只覆盖原文片段、缺少全局视角，直接拼接会产生多组
+        summary/key_points/tags。这里把所有分块摘要作为输入，再请求一次摘要，
+        让 LLM 输出一份连贯、不重复的汇总摘要（单组 YAML）。
+        """
+        valid = [s.strip() for s in chunk_summaries if s and s.strip()]
+        if not valid:
+            return ""
+        if len(valid) == 1:
+            return valid[0]
+        logger.info(
+            f"[ChatCompletionPostProcessor] 合并 {len(valid)} 段分块摘要，发起汇总摘要请求"
+        )
+        combined = (
+            "以下是同一篇长文按段落分块各自得到的摘要，请将它们合并为一份完整、"
+            "连贯、不重复的总结，严格按原 YAML 格式（summary/key_points/tags）输出，"
+            "且只输出一份：\n\n"
+        ) + "\n\n".join(valid)
+        result = await self._postprocess_single(combined, title=None, context_hint="")
+        return self._strip_meta_labels(result)
 
     async def _postprocess_single(
         self,
@@ -131,14 +163,20 @@ class ChatCompletionPostProcessor:
         """
         llm = self._get_llm()
 
-        # Build system prompt: base + title context + continuity hint
+        # Build system prompt: base + title context + continuity hint.
+        # 文案按角色区分：摘要用「萃取/总结」，纠错用「纠错」，避免摘要输出里混入纠错措辞。
+        is_summary = self._role == "content_summary"
         system_parts: list[str] = [self._system_prompt]
         if title:
-            system_parts.append(f"\n【上下文】这是一段关于「{title}」的播客/视频转写文本，请结合主题方向进行纠错。")
+            action = "信息萃取与总结" if is_summary else "纠错"
+            system_parts.append(f"\n【上下文】这是一段关于「{title}」的播客/视频转写文本，请结合主题方向进行{action}。")
         if context_hint:
             # Truncate context hint to avoid bloating the prompt
             hint = context_hint[-200:] if len(context_hint) > 200 else context_hint
-            system_parts.append(f"\n【衔接提示】这是同一音频转写的后续内容，前一段的结尾是：「{hint}」。请保持语气和用词一致，继续纠错。")
+            if is_summary:
+                system_parts.append(f"\n【衔接提示】这是同一篇内容的后续段落，前一段的结尾是：「{hint}」。请继续萃取要点，并保持与前文一致的 YAML 结构化输出。")
+            else:
+                system_parts.append(f"\n【衔接提示】这是同一音频转写的后续内容，前一段的结尾是：「{hint}」。请保持语气和用词一致，继续纠错。")
         system_content = "\n".join(system_parts)
 
         messages = [

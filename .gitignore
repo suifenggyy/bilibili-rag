@@ -56,6 +56,9 @@ logs/
 # B站登录 session 缓存（含敏感 Cookie，不提交）
 .bili_session.json
 
+# Xiaohongshu login session cache (contains sensitive cookies)
+.xhs_session.json
+
 # Instapaper xAuth token 缓存（不提交）
 .instapaper_session.json
 

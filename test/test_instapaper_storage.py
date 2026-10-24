@@ -50,6 +50,11 @@ class ArticleFetcherStorageTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 fetcher,
+                "_extract_from_next_data",
+                return_value=("", ""),
+            ) as next_data_extract,
+            patch.object(
+                fetcher,
                 "_extract_with_requests",
                 return_value=("足够长的正文" * 40, "正常标题"),
             ) as requests_extract,
@@ -57,6 +62,7 @@ class ArticleFetcherStorageTests(unittest.IsolatedAsyncioTestCase):
         ):
             content = await fetcher.fetch_content("https://example.com/post", "原始标题")
 
+        next_data_extract.assert_called_once_with("https://example.com/post")
         requests_extract.assert_called_once_with("https://example.com/post")
         playwright_extract.assert_not_called()
         self.assertEqual(content["source"], "trafilatura")
@@ -71,6 +77,11 @@ class ArticleFetcherStorageTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 fetcher,
+                "_extract_from_next_data",
+                return_value=("", ""),
+            ) as next_data_extract,
+            patch.object(
+                fetcher,
                 "_extract_with_requests",
                 return_value=("这是一个看起来存在内容但不可信的正文片段" * 4, "环境异常"),
             ) as requests_extract,
@@ -82,6 +93,7 @@ class ArticleFetcherStorageTests(unittest.IsolatedAsyncioTestCase):
         ):
             content = await fetcher.fetch_content("https://example.com/post", "原始标题")
 
+        next_data_extract.assert_called_once_with("https://example.com/post")
         requests_extract.assert_called_once_with("https://example.com/post")
         playwright_extract.assert_called_once_with("https://example.com/post")
         self.assertEqual(content["title"], "真实标题")
@@ -96,6 +108,11 @@ class ArticleFetcherStorageTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(
                 fetcher,
+                "_extract_from_next_data",
+                return_value=("", ""),
+            ) as next_data_extract,
+            patch.object(
+                fetcher,
                 "_extract_with_requests",
                 return_value=("正文过短", "正常标题"),
             ) as requests_extract,
@@ -104,11 +121,18 @@ class ArticleFetcherStorageTests(unittest.IsolatedAsyncioTestCase):
                 "_extract_with_playwright",
                 return_value=("", ""),
             ) as playwright_extract,
+            patch.object(
+                fetcher,
+                "_extract_with_playwright_relaxed",
+                return_value=("", ""),
+            ) as relaxed_playwright_extract,
         ):
             content = await fetcher.fetch_content("https://example.com/post", "原始标题")
 
+        next_data_extract.assert_called_once_with("https://example.com/post")
         requests_extract.assert_called_once_with("https://example.com/post")
         playwright_extract.assert_called_once_with("https://example.com/post")
+        relaxed_playwright_extract.assert_called_once_with("https://example.com/post")
         self.assertEqual(content["source"], "basic_info")
         self.assertEqual(content["text"], "")
 
@@ -269,6 +293,7 @@ class InstapaperCliExportStorageTests(unittest.TestCase):
 class InstapaperWebExportStorageTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_instapaper_export_writes_markdown_to_shared_output_dir(self):
         from app.routers import instapaper_export
+        from app.services.content_storage import ContentStorageManager
 
         req = instapaper_export.InstapaperExportRequest(
             consumer_key="key",
@@ -280,6 +305,10 @@ class InstapaperWebExportStorageTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with tempfile.TemporaryDirectory() as workspace_dir, tempfile.TemporaryDirectory() as output_dir:
+            storage_manager = ContentStorageManager(
+                workspace_root=workspace_dir,
+                export_root=output_dir,
+            )
             job_id = "job-1"
             instapaper_export.instapaper_export_tasks[job_id] = {
                 "job_id": job_id,
@@ -322,8 +351,10 @@ class InstapaperWebExportStorageTests(unittest.IsolatedAsyncioTestCase):
                         }
                     ),
                 ),
-                patch("app.routers.instapaper_export.settings.content_workspace_root", workspace_dir),
-                patch("app.routers.instapaper_export.settings.collection_output_dir", output_dir),
+                patch(
+                    "app.routers.instapaper_export.ContentStorageManager",
+                    return_value=storage_manager,
+                ),
                 patch("app.routers.instapaper_export.asyncio.sleep", AsyncMock()),
             ):
                 await instapaper_export._run_instapaper_export(job_id, req)

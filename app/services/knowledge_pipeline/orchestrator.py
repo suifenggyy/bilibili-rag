@@ -6,12 +6,40 @@
 """
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
+
+# Matches a YYYY-MM-DD date segment inside an inbox path (e.g. .../douyin/2026-06-12/xxx.md).
+_DATE_IN_PATH_RE = re.compile(r"(?:^|/)(\d{4}-\d{2}-\d{2})(?:/|$)")
+
+# Body markers written by the export scripts when content fetch / ASR failed.
+# A file whose body contains any of these is treated as having no usable
+# content and is skipped before the LLM pipeline runs (no distill / topic work).
+# Sources:
+#   - article_fetcher (instapaper): "_（正文提取失败，请访问原始链接查看）_"
+#   - export_favorites/douyin/youtube/xiaoyuzhou_to_md (ASR fallback): "_（未获取到有效内容）_"
+_BODY_FETCH_FAILED_MARKERS: tuple[str, ...] = (
+    "正文提取失败",
+    "正文获取失败",
+    "未获取到有效内容",
+)
+
+
+def _has_failed_body(doc) -> bool:
+    """Return True if the parsed doc's body indicates a fetch/extraction failure.
+
+    Export scripts write a fixed placeholder line into the body when the
+    content could not be fetched (ASR failed, article extraction failed, …).
+    Detecting it lets us skip these files instead of feeding placeholder text
+    through the LLM pipeline.
+    """
+    body = doc.body or ""
+    return any(marker in body for marker in _BODY_FETCH_FAILED_MARKERS)
 
 
 @dataclass
@@ -36,11 +64,14 @@ class KnowledgePipelineOrchestrator:
 
     职责（每个文件依次执行）：
     1. parse（KnowledgeMarkdownParser）
-    2. classify（KnowledgeClassifier）
-    3. merge category-map（CategoryMapRepository）
-    4. archive（KnowledgeArchiver）
-    5. update topics（TopicUpdater）
+    2. distill（KnowledgeDistiller）
+    3. resolve topic path（TopicPathResolver）
+    4. render & write knowledge note（KnowledgeNoteStore）
+    5. rebuild topic pages（TopicRebuilder）
     6. write daily log（ProcessingLogger）
+
+    inbox 文件处理完成后保留在原位，不再移动到 done/failed 目录；是否已处理以
+    source mapping 记录为准（见 process_inbox 的分界日期逻辑）。
     """
 
     def __init__(
@@ -91,55 +122,122 @@ class KnowledgePipelineOrchestrator:
         return result
 
     async def process_inbox(self, limit: Optional[int] = None) -> PipelineResult:
-        """扫描 inbox 目录并处理全部 pending Markdown 文件。"""
+        """扫描 inbox 目录并处理 pending Markdown 文件。
+
+        处理范围由 source mapping 记录决定：
+          1. 已存在于 source mapping 记录中的文件视为已处理，跳过。
+          2. 按日期（路径中的 YYYY-MM-DD 段）倒序判断：找到最近一个已在
+             source mapping 中出现过的日期作为分界点 cutoff_date，更早的
+             日期视为已整体处理完成，跳过。
+          3. 从 cutoff_date 开始按日期正序获取待处理文件。
+        """
         inbox = Path(self._inbox_dir)
         if not inbox.exists():
             logger.info(f"[Orchestrator] inbox 目录不存在，跳过: {inbox}")
             return PipelineResult()
 
-        paths = self._iter_inbox_markdown_files(inbox)
+        all_paths = self._iter_inbox_markdown_files(inbox)
+
+        processed_paths, cutoff_date = await self._load_processed_state()
+
+        # 过滤：已处理过的文件跳过；早于分界日期的文件视为已处理完成跳过。
+        pending: list[tuple[str, Path]] = []
+        skipped_done = 0
+        skipped_old = 0
+        for path in all_paths:
+            if str(path) in processed_paths:
+                skipped_done += 1
+                continue
+            path_date = self._extract_date_from_path(str(path))
+            if path_date and cutoff_date and path_date < cutoff_date:
+                skipped_old += 1
+                continue
+            pending.append((path_date or "", path))
+
+        # 按日期正序处理（无日期的文件排到最后）。
+        pending.sort(key=lambda t: t[0])
+        paths = [p for _, p in pending]
+
+        logger.info(
+            f"[Orchestrator] inbox 待处理 {len(paths)} 个"
+            f"（跳过已处理 {skipped_done}、早于分界日期 {skipped_old}）"
+            f"{f'，分界日期={cutoff_date}' if cutoff_date else ''}"
+        )
         if limit:
             paths = paths[:limit]
-
-        logger.info(f"[Orchestrator] 开始处理 {len(paths)} 个 inbox 文件")
         return await self.process_files(paths)
 
     async def process_single_file(self, path: Path) -> FileProcessResult:
-        """处理单个文件，执行完整流水线。处理完成后自动归档到 done/ 或 failed/。"""
+        """处理单个文件，执行完整流水线。文件处理完成后保留在 inbox 原位，
+        是否已处理以 source mapping 记录为准（不再移动到 done/failed 目录）。"""
         start = time.monotonic()
         try:
             result = await self._run_pipeline(path, start)
+            if result.success:
+                # best-effort：在 source 目录下记录逐文件进度，防止异常 kill 丢进度。
+                await self._record_source_progress(path)
         except Exception as exc:
             elapsed = time.monotonic() - start
             logger.error(f"[Orchestrator] 处理失败: {path.name} - {exc}")
             result = FileProcessResult(
                 path=path, success=False, error=str(exc), elapsed=elapsed
             )
-
-        # Archive: 成功 → done/, 失败 → failed/
-        dest_dir = "done" if result.success else "failed"
-        self._archive_file(path, dest_dir)
         return result
 
-    def _archive_file(self, path: Path, dest_dir: str) -> None:
-        """将处理后的文件移动到 inbox 下的 done/ 或 failed/ 子目录。"""
-        if not path.exists():
-            return
-        target_dir = Path(self._inbox_dir) / dest_dir
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / path.name
-        # 同名文件已存在时添加序号后缀
-        if target.exists():
-            stem, suffix = path.stem, path.suffix
-            n = 1
-            while target.exists():
-                target = target_dir / f"{stem}_{n}{suffix}"
-                n += 1
+    async def _record_source_progress(self, path: Path) -> None:
+        """在所属 source 目录的 _pipeline_progress.log 中标记该文件已处理。
+
+        纯可见性/冗余记录，失败仅告警、不影响流水线；不参与跳过逻辑。
+        """
         try:
-            path.replace(target)
-            logger.debug(f"[Orchestrator] 归档: {path.name} → {dest_dir}/")
-        except OSError as e:
-            logger.warning(f"[Orchestrator] 归档失败: {path.name} → {dest_dir}/: {e}")
+            from app.services.knowledge_pipeline.source_progress_logger import (
+                SourceProgressLogger,
+            )
+
+            await SourceProgressLogger(inbox_root=self._inbox_dir).record_processed(
+                path
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[Orchestrator] 更新 source 进度日志失败: {path.name} - {exc}"
+            )
+
+    # ==================== Inbox selection ====================
+
+    async def _load_processed_state(self) -> tuple[set[str], Optional[str]]:
+        """读取 source mapping 记录，返回 (已处理的 source_inbox_path 集合, 分界日期)。
+
+        分界日期 = 记录中出现的最近日期（路径中的 YYYY-MM-DD 段），按日期倒序
+        判断时的第一个命中日期；更早的日期视为已整体处理完成。
+        """
+        from app.services.knowledge_pipeline.metadata_state import MetadataState
+
+        meta_state = MetadataState(meta_dir=self._meta_dir)
+        await meta_state.bootstrap()
+        try:
+            container = await meta_state.load_source_mapping()
+        except ValueError:
+            logger.warning("[Orchestrator] source mapping 不可读，按全量处理")
+            return set(), None
+
+        processed_paths: set[str] = set()
+        dates: list[str] = []
+        for record in container.get("items", []):
+            sp = record.get("source_inbox_path")
+            if sp:
+                processed_paths.add(sp)
+                d = self._extract_date_from_path(sp)
+                if d:
+                    dates.append(d)
+
+        cutoff_date = max(dates) if dates else None
+        return processed_paths, cutoff_date
+
+    @staticmethod
+    def _extract_date_from_path(path_str: str) -> Optional[str]:
+        """从路径中提取 YYYY-MM-DD 日期段，找不到时返回 None。"""
+        m = _DATE_IN_PATH_RE.search(path_str)
+        return m.group(1) if m else None
 
     # ==================== Internal pipeline ====================
 
@@ -160,6 +258,20 @@ class KnowledgePipelineOrchestrator:
         # 1. Parse
         parser = KnowledgeMarkdownParser()
         doc = parser.parse_file(path)
+
+        # 1b. Skip files whose body indicates content fetch/extraction failed —
+        # the export scripts write a fixed placeholder in this case, so there is
+        # no real content to distill. Avoids wasting an LLM call on placeholder
+        # text and prevents garbage notes from entering the knowledge base.
+        if _has_failed_body(doc):
+            elapsed = time.monotonic() - start
+            logger.info(f"[Orchestrator] 跳过（正文获取失败）: {path.name}")
+            return FileProcessResult(
+                path=path,
+                success=False,
+                error="body_fetch_failed",
+                elapsed=elapsed,
+            )
 
         # 2. State & Graph Initialization
         meta_state = MetadataState(meta_dir=self._meta_dir)

@@ -60,10 +60,47 @@ from dotenv import load_dotenv
 load_dotenv(ROOT_DIR / ".env")
 
 from loguru import logger
-from app.services.content_summary import append_summary_section
+from app.services.content_summary import (
+    ContentSummaryService,
+    append_summary_section,
+    build_summary_block,
+)
 from app.services.processing_status import ProcessingStatusService
 from app.database import get_db_context
 from app.services.content_storage import ContentStorageManager
+
+
+class _LoggingContentSummaryService(ContentSummaryService):
+    """总结服务：将调用 LLM 时的输入 prompt 与输出内容完整写入日志。
+
+    继承自 ContentSummaryService，仅在 summarize() 前后增加日志输出，
+    不改变原有总结逻辑。系统提示词取自 content_summary 角色配置。
+    """
+
+    async def summarize(self, text: str) -> str:
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+
+        # Read the latest prompt each call in case it was mutated.
+        system_prompt = getattr(self.processor, "_system_prompt", "")
+        logger.info("[DouyinExport] ══════════ 总结 LLM 调用开始 ══════════")
+        logger.info(
+            f"[DouyinExport] ▶ 输入系统提示词 (system prompt):\n{system_prompt}"
+        )
+        logger.info(
+            f"[DouyinExport] ▶ 输入用户内容 ({len(cleaned)} chars):\n{cleaned}"
+        )
+
+        try:
+            result = await self.processor.postprocess(cleaned)
+        except Exception:
+            logger.exception("[DouyinExport] 总结 LLM 调用失败")
+            raise
+
+        logger.info(f"[DouyinExport] ◀ 输出内容 (LLM 返回):\n{result}")
+        logger.info("[DouyinExport] ══════════ 总结 LLM 调用结束 ══════════")
+        return build_summary_block(result)
 
 
 def _get_env(key: str, default: str = "") -> str:
@@ -260,7 +297,7 @@ async def export_videos(
         aweme_id = video_info["aweme_id"]
         title = video_info["title"]
         safe_title = _safe_filename(title)
-        md_path = output_dir / f"{safe_title}_{aweme_id}.md"
+        md_path = output_dir / f"{safe_title}.md"
 
         # Check DB export status (completed + md file exists at recorded path)
         proc_rec = None
@@ -274,7 +311,7 @@ async def export_videos(
             logger.debug(f"{tag} DB 状态检查失败（跳过）: {_db_err}")
 
         # Fast-path: already exported, check if comments need to be added
-        if already_exported:
+        if already_exported and md_path.exists():
             md_text = md_path.read_text(encoding="utf-8")
             needs_comments = cookie.strip() and "## 热门评论" not in md_text
             if not needs_comments:
@@ -519,6 +556,7 @@ async def main():
         asr_service=asr,
         storage_manager=storage_manager,
         cookie=args.cookie,   # ← pass cookie so comments are fetched
+        summary_service=_LoggingContentSummaryService(),  # 日志记录总结 prompt/输出
     )
     print(f"🔀 并发度：{args.concurrency}（可通过 --concurrency 或 ASR_CONCURRENCY 配置）")
 

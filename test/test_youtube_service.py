@@ -79,7 +79,10 @@ class YouTubeServiceBuildOptsTests(unittest.TestCase):
         svc = YouTubeService()
         opts = svc._build_ydl_opts(download=True, output_path="/tmp/audio")
         self.assertFalse(opts["extract_flat"])
-        self.assertEqual(opts["format"], "bestaudio/best")
+        self.assertEqual(
+            opts["format"],
+            "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best[height<=480]/best",
+        )
         self.assertEqual(opts["outtmpl"], "/tmp/audio")
 
     def test_build_ydl_opts_includes_cookiefile_when_set(self):

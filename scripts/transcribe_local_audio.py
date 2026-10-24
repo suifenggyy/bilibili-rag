@@ -26,12 +26,25 @@
     python scripts/transcribe_local_audio.py audio.mp3 --no-correction
     python scripts/transcribe_local_audio.py audio.mp3 --no-summary
 
+    # 指定主题类型，按类型选用不同摘要 prompt
+    python scripts/transcribe_local_audio.py audio.mp3 --topic-type interview   # 面试
+    python scripts/transcribe_local_audio.py audio.mp3 --topic-type speech      # 演讲
+    python scripts/transcribe_local_audio.py audio.mp3 --topic-type meeting     # 会议
+    python scripts/transcribe_local_audio.py audio.mp3 --topic-type lecture     # 讲座/课程
+
     # 直接输出到终端，不写文件
     python scripts/transcribe_local_audio.py audio.mp3 --stdout
+
+中间产物缓存：
+    转码后的 WAV 与 ASR 原始文本会持久化到 ~/.bilibili-rag/local_audio_cache/
+    （即抓取工作目录），重跑时若已存在则直接复用，避免重复转码与转写（ASR 缓存
+    命中时连音频复制都会跳过）。缓存超 CONTENT_WORKSPACE_MAX_SIZE_BYTES（默认 1GB）
+    时按修改时间从旧到新清理。加 --force 可忽略缓存、重新走完整流程。
 """
 
 import argparse
 import asyncio
+import importlib.util
 import os
 import re
 import shutil
@@ -46,6 +59,15 @@ sys.path.insert(0, str(ROOT_DIR))
 from dotenv import load_dotenv
 from loguru import logger
 
+# 直接按文件路径加载 text_model_prompts，避免触发 app/services/__init__.py 的重依赖
+# （与 app/config.py 的加载方式一致）。
+_prompts_path = ROOT_DIR / "app" / "services" / "text_model_prompts.py"
+_spec = importlib.util.spec_from_file_location("text_model_prompts", _prompts_path)
+_prompts_mod = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+_spec.loader.exec_module(_prompts_mod)  # type: ignore[union-attr]
+DEFAULT_TOPIC_SUMMARY_PROMPTS: dict[str, str] = _prompts_mod.DEFAULT_TOPIC_SUMMARY_PROMPTS
+TOPIC_TYPE_LABELS: dict[str, str] = _prompts_mod.TOPIC_TYPE_LABELS
+
 load_dotenv(ROOT_DIR / ".env")
 
 
@@ -57,6 +79,14 @@ DEFAULT_OUTPUT_DIR = _get_env(
     "OBSIDIAN_VAULT_ROOT",
     str(ROOT_DIR / "data" / "collection"),
 ) + "/inbox"
+
+# 中间产物缓存目录：放到 ~/.bilibili-rag 抓取工作目录下，与导出脚本共用同一空间，
+# 复用 ContentStorageManager 的清理策略（超 CONTENT_WORKSPACE_MAX_SIZE_BYTES 时
+# 按修改时间从旧到新删除，默认保留 3 天内的文件）。
+LOCAL_AUDIO_CACHE_DIR = (
+    Path(_get_env("CONTENT_WORKSPACE_ROOT", "~/.bilibili-rag")).expanduser()
+    / "local_audio_cache"
+)
 
 
 def _safe_filename(name: str, max_len: int = 80) -> str:
@@ -235,6 +265,20 @@ async def main() -> None:
     )
     parser.add_argument("--no-correction", action="store_true", help="跳过 ASR 文本纠错步骤")
     parser.add_argument("--no-summary", action="store_true", help="跳过 AI 内容总结步骤")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="忽略缓存（WAV / ASR 文本），强制重新转码与转写",
+    )
+    parser.add_argument(
+        "--topic-type",
+        default="general",
+        choices=list(DEFAULT_TOPIC_SUMMARY_PROMPTS.keys()),
+        help=(
+            "内容主题类型，按类型选用不同的摘要 prompt（默认: general）。"
+            f"可选：{', '.join(f'{k}（{v}）' for k, v in TOPIC_TYPE_LABELS.items())}"
+        ),
+    )
     args = parser.parse_args()
 
     # ── 检查输入文件 ────────────────────────────────────────────────────────
@@ -250,59 +294,94 @@ async def main() -> None:
     print(f"\n🎵 音频文件：{audio_path}")
     print(f"📝 标题：{title}")
 
-    # ── 构建 ASR 服务 ───────────────────────────────────────────────────────
-    asr = await _build_asr_service(
-        backend=args.asr_backend,
-        api_key=args.api_key,
-        ollama_url=args.ollama_url,
-        ollama_model=args.ollama_model,
-        ollama_language=args.ollama_language,
-    )
-
-    # ── 准备临时目录 ────────────────────────────────────────────────────────
-    tmp_dir = ROOT_DIR / "data" / "local_audio_tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    # ── 准备缓存目录 ────────────────────────────────────────────────────────
+    # 中间产物（输入音频副本、16kHz WAV、ASR 原始文本）持久化到缓存目录，重跑时若
+    # 已存在则直接复用，避免重复转码与转写。ASR 文本缓存命中时连音频复制都会跳过。
+    # 缓存目录位于 ~/.bilibili-rag 抓取工作目录下，复用 ContentStorageManager 的清理
+    # 策略：超 CONTENT_WORKSPACE_MAX_SIZE_BYTES 时按修改时间从旧到新删除。
+    cache_dir = LOCAL_AUDIO_CACHE_DIR
+    cache_dir.mkdir(parents=True, exist_ok=True)
     safe_stem = _safe_filename(title)
-    wav_path = str(tmp_dir / f"{safe_stem}.wav")
+    input_copy_path = cache_dir / f"{safe_stem}{audio_path.suffix.lower()}"
+    wav_path = cache_dir / f"{safe_stem}.wav"
+    asr_cache_path = cache_dir / f"{safe_stem}.asr.txt"
 
-    # ── 音频转换 ────────────────────────────────────────────────────────────
-    src = str(audio_path)
-    if audio_path.suffix.lower() != ".wav":
-        print("🔄 转换音频格式（ffmpeg → 16kHz WAV）...", end="", flush=True)
-        converted = _to_wav(src, wav_path)
-        if converted:
-            print(" ✅")
-            transcribe_path = wav_path
-        else:
-            print(" ⚠️  转换失败，使用原始文件")
-            transcribe_path = src
-    else:
-        transcribe_path = src
-
-    # ── ASR 转写 ────────────────────────────────────────────────────────────
-    print("🔊 ASR 转写中...", end="", flush=True)
-    try:
-        asr_raw = await asr.transcribe_local_file(transcribe_path, title=title)
-        asr_raw = (asr_raw or "").strip()
+    # ── ASR 转写（命中缓存则跳过音频复制 / 转码 / 转写）─────────────────────
+    asr_raw = ""
+    if asr_cache_path.exists() and not args.force:
+        asr_raw = asr_cache_path.read_text(encoding="utf-8").strip()
         if asr_raw:
-            print(f" ✅（{len(asr_raw)} 字）")
+            print(f"💾 ASR 缓存命中，跳过转写：{asr_cache_path.name}（{len(asr_raw)} 字）")
         else:
-            print(" ⚠️  转写结果为空")
-    except Exception as e:
-        print(f" ❌ 转写失败：{e}")
-        logger.exception("ASR 转写异常")
-        sys.exit(1)
-    finally:
-        # 清理临时 WAV
-        if transcribe_path == wav_path and os.path.exists(wav_path):
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
+            print("⚠️  ASR 缓存为空，将重新转写")
+            asr_raw = ""
 
     if not asr_raw:
-        print("❌ ASR 未产生任何文本，退出")
-        sys.exit(1)
+        # ── 构建 ASR 服务 ───────────────────────────────────────────────────
+        asr = await _build_asr_service(
+            backend=args.asr_backend,
+            api_key=args.api_key,
+            ollama_url=args.ollama_url,
+            ollama_model=args.ollama_model,
+            ollama_language=args.ollama_language,
+        )
+
+        # 先复制到项目目录下再交给 ffmpeg / ASR SDK 读取，避免 macOS 对 Desktop、Downloads
+        # 等隐私目录的子进程访问限制导致 “Operation not permitted”。
+        if audio_path.resolve() != input_copy_path.resolve():
+            try:
+                shutil.copy2(audio_path, input_copy_path)
+            except Exception as e:
+                print(f"❌ 无法读取音频文件：{audio_path}")
+                print(f"   {e}")
+                print("   如果文件位于 Desktop/Downloads/Documents，请将文件复制到项目目录后重试，")
+                print("   或在 macOS 系统设置中为终端授予完整磁盘访问权限。")
+                sys.exit(1)
+
+        # ── 音频转换 ────────────────────────────────────────────────────────
+        src = str(input_copy_path)
+        if audio_path.suffix.lower() != ".wav":
+            if wav_path.exists() and not args.force:
+                print("💾 WAV 缓存命中，跳过转码")
+                transcribe_path = str(wav_path)
+            else:
+                print("🔄 转换音频格式（ffmpeg → 16kHz WAV）...", end="", flush=True)
+                converted = _to_wav(src, str(wav_path))
+                if converted:
+                    print(" ✅")
+                    transcribe_path = str(wav_path)
+                else:
+                    print(" ⚠️  转换失败，使用原始文件")
+                    transcribe_path = src
+        else:
+            transcribe_path = src
+
+        # ── ASR 转写 ────────────────────────────────────────────────────────
+        print("🔊 ASR 转写中...", end="", flush=True)
+        try:
+            asr_raw = await asr.transcribe_local_file(transcribe_path, title=title)
+            asr_raw = (asr_raw or "").strip()
+            if asr_raw:
+                asr_cache_path.write_text(asr_raw, encoding="utf-8")
+                print(f" ✅（{len(asr_raw)} 字）")
+            else:
+                print(" ⚠️  转写结果为空")
+        except Exception as e:
+            print(f" ❌ 转写失败：{e}")
+            logger.exception("ASR 转写异常")
+            sys.exit(1)
+
+        # 缓存写入后触发清理：复用 ContentStorageManager 的超限清理策略
+        # （按修改时间从旧到新删除），workspace_root 指向缓存目录，仅清理本地音频缓存。
+        try:
+            from app.services.content_storage import ContentStorageManager
+            ContentStorageManager(workspace_root=str(cache_dir)).cleanup_workspace_if_needed()
+        except Exception as exc:
+            logger.debug(f"缓存清理跳过: {exc}")
+
+        if not asr_raw:
+            print("❌ ASR 未产生任何文本，退出")
+            sys.exit(1)
 
     # ── 文本纠错 ────────────────────────────────────────────────────────────
     corrected = ""
@@ -325,10 +404,15 @@ async def main() -> None:
     # ── 内容总结 ────────────────────────────────────────────────────────────
     summary_block = ""
     if not args.no_summary:
-        print("📋 AI 总结中...", end="", flush=True)
+        topic_prompt = DEFAULT_TOPIC_SUMMARY_PROMPTS[args.topic_type]
+        print(
+            f"📋 AI 总结中（主题类型：{TOPIC_TYPE_LABELS[args.topic_type]}）...",
+            end="",
+            flush=True,
+        )
         try:
             from app.services.content_summary import ContentSummaryService
-            summary_svc = ContentSummaryService()
+            summary_svc = ContentSummaryService(prompt_template=topic_prompt)
             summary_block = await summary_svc.summarize(corrected)
             if summary_block:
                 print(" ✅")

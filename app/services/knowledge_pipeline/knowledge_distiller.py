@@ -1,5 +1,8 @@
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Callable, Awaitable
+
+from loguru import logger
+
 from .parser import ParsedKnowledgeDocument
 
 @dataclass

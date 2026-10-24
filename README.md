@@ -18,6 +18,7 @@
 | 💬 RAG 对话问答 | 基于收藏内容回答问题，附来源溯源 |
 | 📝 B 站收藏夹导出 | 将收藏夹视频转写内容批量导出为 Markdown 文件 |
 | 🎵 抖音收藏夹导出 | 获取抖音收藏视频，音频 ASR 转写后导出 Markdown |
+| 📕 小红书笔记导出 | 按笔记链接、作者、关键词或收藏夹导出图文/视频笔记 Markdown |
 | 📖 Instapaper 书签导出 | 获取书签列表，按 requests → Playwright → 基本信息 的链路提取正文，无需 Premium |
 
 ---
@@ -652,7 +653,7 @@ python scripts/generate_daily_report.py --date 2026-05-28
 
 ### 导出脚本自动写入 inbox
 
-所有导出脚本（B站、抖音、小宇宙、YouTube、Instapaper）产出的 Markdown 文件均自动添加 YAML frontmatter，并写入 `OBSIDIAN_VAULT_ROOT/inbox/` 目录（当 `OBSIDIAN_VAULT_ROOT` 已配置时）。
+所有导出脚本（B站、抖音、小红书、小宇宙、YouTube、Instapaper）产出的 Markdown 文件均自动添加 YAML frontmatter，并写入 `OBSIDIAN_VAULT_ROOT/inbox/` 目录（当 `OBSIDIAN_VAULT_ROOT` 已配置时）。
 
 ```yaml
 ---
@@ -663,6 +664,30 @@ platform: bilibili
 summary: AI 生成摘要...
 ---
 ```
+
+## 📕 小红书笔记导出
+
+`scripts/export_xhs_to_md.py` 支持导出指定笔记、某位作者的笔记、关键词搜索结果或当前登录账号的收藏夹：
+
+```bash
+python scripts/export_xhs_to_md.py --note-url "https://www.xiaohongshu.com/explore/..."
+python scripts/export_xhs_to_md.py --creator "https://www.xiaohongshu.com/user/profile/..."
+python scripts/export_xhs_to_md.py --keyword "知识管理" --limit 20
+python scripts/export_xhs_to_md.py --favorites --limit 20
+python scripts/export_xhs_to_md.py --login --note-url "https://www.xiaohongshu.com/explore/..."
+```
+
+首次使用 Playwright 时，如本机尚未安装浏览器，运行 `playwright install chromium`。
+认证优先级为 `--login`（强制扫码）→ `--cookie` → `XHS_COOKIE` → 已保存的
+`.xhs_session.json`；扫码成功会更新保存的会话。Cookie 可从已登录的小红书浏览器
+开发者工具的 Cookies 中复制，切勿提交到仓库。
+`--favorites` 会遍历当前登录账号收藏的全部笔记；`--all-favorite-boards` 保留为兼容别名。
+多个来源会按笔记 ID 去重，`--limit` 仍是整个导出任务的总上限。
+
+笔记输出到 `OBSIDIAN_VAULT_ROOT/inbox/xhs/YYYY-MM-DD/<title>_<id>.md`，下载的图片
+复制到同名 `.media/` 目录并使用相对链接；视频和 WAV 仅保留在工作缓存中。视频笔记会
+尝试使用现有 ASR 配置转写，失败时仍保留原文、标签、图片和可用评论。小红书的验证码、
+风控或失效会话需要在浏览器完成验证或用 `--login` 刷新会话后重试。
 
 ---
 

@@ -128,6 +128,7 @@ Use `loguru` (`from loguru import logger`) throughout the backend. Logs go to st
 ### System dependency
 
 `ffmpeg` must be on `PATH` for audio transcoding. Without it, ASR falls back to basic video info only.
+Managing the `Python` environment with `UV`
 
 ### Scripts must run from project root
 

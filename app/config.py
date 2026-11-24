@@ -353,6 +353,14 @@ class Settings(BaseSettings):
 
     # 抖音导出配置
     douyin_cookie: str = Field(default="", env="DOUYIN_COOKIE")
+    douyin_api_base_url: str = Field(default="https://www-hj.douyin.com", env="DOUYIN_API_BASE_URL")
+    douyin_user_agent: str = Field(
+        default=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+        ),
+        env="DOUYIN_USER_AGENT",
+    )
     douyin_output_dir: str = Field(default="douyin_output", env="DOUYIN_OUTPUT_DIR")
     douyin_after_date: str = Field(default="", env="DOUYIN_AFTER_DATE")
 

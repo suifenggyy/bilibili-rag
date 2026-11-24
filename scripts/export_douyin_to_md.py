@@ -544,8 +544,8 @@ async def main():
     cookie_ok = await douyin.check_cookie_valid()
     if not cookie_ok:
         print(
-            "\n⚠️  Cookie 校验失败，可能已过期或格式不正确。\n"
-            "   请重新从浏览器复制最新 Cookie。\n"
+            "\n⚠️  收藏夹请求校验失败，不一定是 Cookie 过期。\n"
+            "   请查看日志中的 HTTP/签名错误，并确认 Cookie 完整、DOUYIN_USER_AGENT 与浏览器一致。\n"
             "   （将继续尝试，实际结果可能有误）"
         )
     else:

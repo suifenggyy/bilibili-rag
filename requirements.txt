@@ -38,7 +38,9 @@ trafilatura==2.0.0
 playwright==1.55.0
 
 
-# Douyin_TikTok_Download_API submodule dependencies
+# Douyin_TikTok_Download_API v5 library dependencies (Python 3.12+)
+wreq>=0.13.0,<1.0
+structlog>=24.4
 PyYAML==6.0.3
 pycryptodomex==3.20.0
 gmssl==3.2.2

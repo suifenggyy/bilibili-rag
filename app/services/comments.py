@@ -3,19 +3,10 @@
 
 支持 B站 和 抖音两个平台的热门评论获取，抓取失败时静默跳过（非阻断性）。
 """
-import sys
-from pathlib import Path
 from typing import Optional
 
 import httpx
 from loguru import logger
-
-# Ensure submodule is on sys.path (mirrors douyin_bridge.py setup)
-_SUBMODULE_ROOT = Path(__file__).resolve().parents[2] / "douyin_tiktok_download_api"
-_SUBMODULE_ROOT_STR = str(_SUBMODULE_ROOT)
-if _SUBMODULE_ROOT_STR not in sys.path:
-    sys.path.append(_SUBMODULE_ROOT_STR)
-
 
 def format_comments_section(comments: list[dict]) -> str:
     """
@@ -101,7 +92,7 @@ async def fetch_douyin_comments(
     """
     获取抖音视频热门评论（需要有效 Cookie）。
 
-    直接使用 httpx 请求，绕过 BaseCrawler，完整打印请求/响应用于调试。
+    使用 v5 桥接层，与收藏夹共享签名和浏览器传输逻辑。
     """
     if not cookie:
         logger.info(
@@ -112,79 +103,9 @@ async def fetch_douyin_comments(
     logger.info(f"[Comments] 开始获取抖音热门评论 aweme_id={aweme_id}，最多 {limit} 条")
 
     try:
-        import yaml  # noqa: PLC0415
+        from app.services import douyin_bridge
 
-        from crawlers.douyin.web.endpoints import DouyinAPIEndpoints  # noqa: PLC0415
-        from crawlers.douyin.web.models import PostComments  # noqa: PLC0415
-        from crawlers.douyin.web.utils import BogusManager  # noqa: PLC0415
-
-        _config_path = (
-            _SUBMODULE_ROOT / "crawlers" / "douyin" / "web" / "config.yaml"
-        )
-        with open(_config_path, "r", encoding="utf-8") as f:
-            _cfg = yaml.safe_load(f)
-        douyin_cfg = _cfg["TokenManager"]["douyin"]
-
-        headers = {
-            "Accept-Language": douyin_cfg["headers"]["Accept-Language"],
-            "User-Agent": douyin_cfg["headers"]["User-Agent"],
-            "Referer": douyin_cfg["headers"]["Referer"],
-            "Cookie": cookie,
-        }
-        proxy_http = douyin_cfg["proxies"].get("http") or ""
-        proxy_https = douyin_cfg["proxies"].get("https") or ""
-        proxies = {}
-        if proxy_http:
-            proxies["http://"] = proxy_http
-        if proxy_https:
-            proxies["https://"] = proxy_https
-
-        params = PostComments(aweme_id=aweme_id, cursor=0, count=limit)
-        endpoint = BogusManager.xb_model_2_endpoint(
-            DouyinAPIEndpoints.POST_COMMENT,
-            params.dict(),
-            headers["User-Agent"],
-        )
-
-        # Log full request details (mask most of the cookie for privacy)
-        cookie_preview = cookie[:20] + "..." if len(cookie) > 20 else cookie
-        logger.info(
-            f"[Comments] 接口: POST_COMMENT = {DouyinAPIEndpoints.POST_COMMENT}\n"
-            f"  Cookie（前20字符）: {cookie_preview}\n"
-            f"  User-Agent: {headers['User-Agent'][:60]}\n"
-            f"  完整请求 URL: {endpoint}"
-        )
-
-        async with httpx.AsyncClient(
-            timeout=20.0,
-            follow_redirects=True,
-            headers=headers,
-            proxies=proxies or None,
-        ) as client:
-            resp = await client.get(endpoint)
-
-        logger.info(
-            f"[Comments] 响应状态码: {resp.status_code}，"
-            f"Content-Type: {resp.headers.get('content-type', '未知')}，"
-            f"响应长度: {len(resp.content)} 字节"
-        )
-        logger.info(
-            f"[Comments] 响应正文（前500字符）: {resp.text[:500]}"
-        )
-
-        if resp.status_code != 200:
-            logger.warning(f"[Comments] HTTP 错误 status={resp.status_code} aweme_id={aweme_id}")
-            return []
-
-        if not resp.text.strip():
-            logger.warning(f"[Comments] 响应正文为空 aweme_id={aweme_id}（Cookie 可能已失效或被风控）")
-            return []
-
-        try:
-            data = resp.json()
-        except Exception as json_err:
-            logger.warning(f"[Comments] JSON 解析失败 aweme_id={aweme_id}: {json_err}，原始: {resp.text[:200]}")
-            return []
+        data = await douyin_bridge.fetch_comments(cookie, aweme_id, count=limit)
 
         # status_code 0 or missing = success
         status = data.get("status_code")

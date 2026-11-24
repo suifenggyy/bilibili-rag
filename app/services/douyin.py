@@ -96,6 +96,11 @@ class DouyinService:
         result = await douyin_bridge.fetch_collection_videos(
             cookie=self.cookie, cursor=max_cursor, count=count
         )
+        if result.get("status_code") not in (0, None) or not isinstance(result.get("aweme_list"), list):
+            raise RuntimeError(
+                f"抖音收藏夹请求失败或响应不完整（status_code={result.get('status_code')}），"
+                "不能据此判断 Cookie 已过期"
+            )
         has_more = int(result.get("has_more") or 0)
         # 收藏夹API返回游标字段为 cursor，创作者API为 max_cursor
         next_cursor = int(result.get("max_cursor") or result.get("cursor") or 0)
@@ -157,7 +162,7 @@ class DouyinService:
                 data = await self.get_collection_videos_page(max_cursor=max_cursor)
             except Exception as e:
                 logger.error(f"[Douyin] 获取第 {page} 页失败: {e}")
-                break
+                raise
 
             videos = data.get("aweme_list", [])
             if not videos:
@@ -200,7 +205,7 @@ class DouyinService:
             dict 包含：aweme_list, has_more, max_cursor
         """
         result = await douyin_bridge.fetch_user_post_videos(
-            sec_user_id=sec_uid, max_cursor=max_cursor, count=count
+            sec_user_id=sec_uid, max_cursor=max_cursor, count=count, cookie=self.cookie
         )
         return {
             "aweme_list": result.get("aweme_list") or [],
@@ -245,7 +250,7 @@ class DouyinService:
                 data = await self.get_creator_videos_page(sec_uid, max_cursor=max_cursor)
             except Exception as e:
                 logger.error(f"[Douyin] 获取创作者视频第 {page} 页失败: {e}")
-                break
+                raise
 
             videos = data.get("aweme_list", [])
             if not videos:
@@ -331,4 +336,3 @@ class DouyinService:
             "play_urls": play_urls,
             "share_url": share_url,
         }
-

@@ -380,28 +380,37 @@ $OBSIDIAN_VAULT_ROOT/$OBSIDIAN_INBOX_DIR/
 
 ### 前提条件
 
-**1. 初始化子模块**（Evil0ctal API 已作为 git submodule 集成，无需单独部署）
+**1. 初始化子模块**（Evil0ctal v5 已作为 git submodule 集成，无需单独部署）
+
+抖音桥接要求 **Python 3.12+**，直接复用 v5 的平台参数、原生签名和 `wreq` 浏览器传输层；不需要运行其 PostgreSQL、Redis 或 API 服务。收藏夹使用带完整签名的表单 POST，作者作品和评论也使用同一桥接。
 
 ```bash
 # 首次克隆时
 git submodule update --init
 
-# 更新子模块至最新版本
-git submodule update --remote douyin_tiktok_download_api
+# 安装本项目依赖（不要安装子模块整套服务端依赖）
+uv pip install -r requirements.txt
 ```
+
+子模块按本仓库记录的提交版本初始化；升级上游大版本时需同步检查桥接兼容性。
 
 **2. 获取抖音 Cookie**（抖音不提供扫码 API，需手动复制）
 
 1. Chrome/Edge 打开 [https://www.douyin.com](https://www.douyin.com) 并登录
-2. 按 F12 → Application → Cookies → `douyin.com`
-3. 将所有字段拼接为 `"key1=val1; key2=val2; ..."` 格式
-4. 填入 `.env` 的 `DOUYIN_COOKIE` 或通过 `--cookie` 参数传入
+2. 按 F12 → Network，打开收藏夹，选择 `listcollection` 的 POST 请求
+3. 从 Request Headers 复制完整 `Cookie`（`"key1=val1; key2=val2; ..."`），同时复制 `User-Agent`
+4. Cookie 填入 `.env` 的 `DOUYIN_COOKIE` 或通过 `--cookie` 参数传入，User-Agent 填入 `DOUYIN_USER_AGENT`
+
+不要把请求 URL 当成 Cookie。403 也不一定意味着 Cookie 过期，日志会区分 HTTP 拒绝与签名/风控信号；请保留 `UIFID`/`UIFID_TEMP`、`s_v_web_id` 等浏览器会话字段，不要公开 Cookie 或签名 URL。
 
 ### 配置
 
 ```bash
 # .env
 DOUYIN_COOKIE=ttwid=xxx; sessionid=xxx; odin_tt=xxx; msToken=xxx; ...
+DOUYIN_API_BASE_URL=https://www-hj.douyin.com
+# 从同一浏览器的 Request Headers 复制完整值
+DOUYIN_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36
 OBSIDIAN_VAULT_ROOT=~/Obsidian/jarvis
 OBSIDIAN_INBOX_DIR=inbox
 ```

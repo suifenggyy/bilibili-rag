@@ -120,10 +120,10 @@ class ASRModelFallbackTests(unittest.TestCase):
                 self.assertNotEqual(output, source)
                 self.assertNotEqual(run.call_args.args[0][-1], source)
 
-    def test_sdk_and_rest_use_chinese_only_for_8k_recorded_model(self):
+    def test_language_hints_are_only_sent_to_supported_recorded_model(self):
         for model, languages in (
             ("paraformer-v2", ["zh", "en"]),
-            ("paraformer-8k-v2", ["zh"]),
+            ("paraformer-8k-v2", None),
         ):
             with self.subTest(model=model):
                 response = SimpleNamespace(
@@ -134,7 +134,10 @@ class ASRModelFallbackTests(unittest.TestCase):
                     self.service._try_transcribe_with_model(
                         "https://example.com/audio.mp3", model
                     )
-                self.assertEqual(submit.call_args.kwargs["language_hints"], languages)
+                if languages is None:
+                    self.assertNotIn("language_hints", submit.call_args.kwargs)
+                else:
+                    self.assertEqual(submit.call_args.kwargs["language_hints"], languages)
 
                 rest_response = Mock(status_code=HTTPStatus.OK)
                 rest_response.json.return_value = {"output": {"task_id": "task"}}
@@ -143,10 +146,293 @@ class ASRModelFallbackTests(unittest.TestCase):
                     self.service._submit_transcription_task_restful(
                         "oss://audio.mp3", model
                     )
-                self.assertEqual(
-                    post.call_args.kwargs["json"]["parameters"]["language_hints"],
-                    languages,
-                )
+                parameters = post.call_args.kwargs["json"].get("parameters", {})
+                if languages is None:
+                    self.assertNotIn("language_hints", parameters)
+                else:
+                    self.assertEqual(parameters["language_hints"], languages)
+
+    def test_temporary_oss_requests_enable_resource_resolution(self):
+        response = Mock(status_code=HTTPStatus.OK)
+        response.json.return_value = {"output": {"task_id": "task"}}
+        with patch("app.services.asr.httpx.post", return_value=response) as post:
+            self.service._submit_transcription_task_restful("oss://private/audio.wav", "paraformer-v2")
+        self.assertEqual(
+            post.call_args.kwargs["headers"].get("X-DashScope-OssResourceResolve"), "enable",
+        )
+
+    def test_public_audio_requests_do_not_enable_oss_resolution(self):
+        response = Mock(status_code=HTTPStatus.OK)
+        response.json.return_value = {"output": {"task_id": "task"}}
+        with patch("app.services.asr.httpx.post", return_value=response) as post:
+            self.service._submit_transcription_task_restful("https://example.com/audio.wav", "paraformer-v2")
+        self.assertNotIn("X-DashScope-OssResourceResolve", post.call_args.kwargs["headers"])
+
+    def test_submission_error_reports_fields_without_dumping_response_body(self):
+        response = Mock(status_code=HTTPStatus.BAD_REQUEST)
+        response.json.return_value = {
+            "code": "InvalidParameter", "message": "invalid audio", "request_id": "submit-request",
+            "input": {"api_key": "test-key", "file_urls": ["oss://private/audio.wav"]},
+        }
+        response.text = "test-key oss://private/audio.wav"
+        with (
+            patch("app.services.asr.httpx.post", return_value=response),
+            patch("app.services.asr.logger.warning") as warning,
+        ):
+            self.assertIsNone(self.service._submit_transcription_task_restful("oss://audio", "paraformer-v2"))
+        messages = "\n".join(entry.args[0].format(*entry.args[1:]) for entry in warning.call_args_list)
+        for expected in ("400", "InvalidParameter", "invalid audio", "submit-request"):
+            self.assertIn(expected, messages)
+        self.assertNotIn("test-key", messages)
+        self.assertNotIn("oss://private", messages)
+
+    def test_polling_api_error_stops_immediately_with_request_id(self):
+        response = Mock(status_code=HTTPStatus.FORBIDDEN)
+        response.json.return_value = {
+            "code": "AccessDenied", "message": "workspace denied", "request_id": "poll-request",
+        }
+        response.text = "access denied"
+        self.service.timeout = 1
+        with (
+            patch.object(self.service, "_submit_transcription_task_restful", return_value="task"),
+            patch("app.services.asr.httpx.get", return_value=response),
+            patch("app.services.asr.time.time", side_effect=[0, 0, 2]),
+            patch("app.services.asr.time.sleep") as sleep,
+            patch("app.services.asr.logger.warning") as warning,
+        ):
+            self.assertIsNone(self.service._transcribe_sync_restful("oss://audio", "paraformer-v2"))
+        sleep.assert_not_called()
+        messages = "\n".join(entry.args[0].format(*entry.args[1:]) for entry in warning.call_args_list)
+        self.assertIn("AccessDenied", messages)
+        self.assertIn("poll-request", messages)
+
+    def test_sdk_submission_error_reports_request_id(self):
+        response = SimpleNamespace(
+            status_code=HTTPStatus.BAD_REQUEST, code="InvalidParameter",
+            message="invalid model", request_id="sdk-submit-request", output={},
+        )
+        with (
+            patch("app.services.asr.Transcription.async_call", return_value=response),
+            patch("app.services.asr.logger.warning") as warning,
+        ):
+            self.assertIsNone(self.service._try_transcribe_with_model("https://example.com/audio.wav", "paraformer-v2"))
+        messages = "\n".join(entry.args[0].format(*entry.args[1:]) for entry in warning.call_args_list)
+        self.assertIn("InvalidParameter", messages)
+        self.assertIn("sdk-submit-request", messages)
+
+    def test_error_messages_redact_urls_and_api_key_at_all_log_levels(self):
+        output = {
+            "task_status": "FAILED",
+            "status_message": "cannot read oss://private/audio.wav?token=secret",
+            "results": [{"subtask_status": "FAILED", "error_code": "DownloadError",
+                         "error_message": "test-key https://example.com/audio?signature=secret"}],
+        }
+        with (
+            patch.object(self.service, "_submit_transcription_task_restful", return_value="task"),
+            patch.object(self.service, "_fetch_transcription_task_restful", return_value=output),
+            patch("app.services.asr.logger") as log,
+        ):
+            self.assertIsNone(self.service._transcribe_sync_restful("oss://audio", "paraformer-v2"))
+        messages = "\n".join(
+            entry.args[0].format(*entry.args[1:])
+            for entry in log.info.call_args_list + log.warning.call_args_list
+        )
+        self.assertIn("DownloadError", messages)
+        for secret in ("test-key", "oss://private", "signature=secret", "token=secret"):
+            self.assertNotIn(secret, messages)
+
+    def test_rest_failure_logs_nested_codes_messages_and_request_ids(self):
+        response = {
+            "request_id": "top-request",
+            "output": {
+                "task_status": "FAILED", "code": "SERVER_ERROR",
+                "results": [{
+                    "subtask_status": "FAILED", "code": "SERVER_ERROR",
+                    "message": "/ by zero", "request_id": "sub-request",
+                    "file_url": "oss://private/audio.wav",
+                    "results": [{"code": "DECODE_ERROR", "message": "bad audio", "request_id": "deep-request"}],
+                }],
+            },
+        }
+        fetch_response = Mock(status_code=HTTPStatus.OK)
+        fetch_response.json.return_value = response
+        with (
+            patch.object(self.service, "_submit_transcription_task_restful", return_value="task"),
+            patch("app.services.asr.httpx.get", return_value=fetch_response),
+            patch("app.services.asr.logger.warning") as warning,
+        ):
+            self.assertIsNone(self.service._transcribe_sync_restful("oss://audio", "paraformer-v2"))
+        messages = "\n".join(entry.args[0].format(*entry.args[1:]) for entry in warning.call_args_list)
+        for expected in ("SERVER_ERROR", "/ by zero", "top-request", "sub-request", "deep-request", "DECODE_ERROR"):
+            self.assertIn(expected, messages)
+        self.assertNotIn("oss://private", messages)
+
+    def test_sdk_failure_logs_nested_error_details(self):
+        response = SimpleNamespace(
+            status_code=HTTPStatus.OK, request_id="sdk-request", code=None, message=None,
+            output={"task_id": "task", "task_status": "FAILED", "results": [
+                {"subtask_status": "FAILED", "code": "SERVER_ERROR", "message": "/ by zero"}
+            ]},
+        )
+        with (
+            patch("app.services.asr.Transcription.async_call", return_value=response),
+            patch("app.services.asr.logger.warning") as warning,
+        ):
+            self.assertIsNone(self.service._try_transcribe_with_model("https://example.com/audio.wav", "paraformer-v2"))
+        messages = "\n".join(entry.args[0].format(*entry.args[1:]) for entry in warning.call_args_list)
+        self.assertIn("SERVER_ERROR", messages)
+        self.assertIn("/ by zero", messages)
+        self.assertIn("sdk-request", messages)
+
+    def test_failed_and_canceled_subtasks_inherit_response_request_id(self):
+        for transport in ("rest", "sdk"):
+            for status in ("FAILED", "CANCELED", "CANCELLED"):
+                with self.subTest(transport=transport, status=status):
+                    output = {
+                        "task_id": "task", "task_status": "SUCCEEDED",
+                        "results": [{"subtask_status": status, "error_code": "AudioError",
+                                     "error_message": "subtask rejected"}],
+                    }
+                    with patch("app.services.asr.logger.warning") as warning:
+                        if transport == "rest":
+                            with (
+                                patch.object(self.service, "_submit_transcription_task_restful", return_value="task"),
+                                patch.object(self.service, "_fetch_transcription_task_restful",
+                                             return_value={**output, "request_id": "enclosing-request"}),
+                            ):
+                                self.assertIsNone(self.service._transcribe_sync_restful("oss://audio", "paraformer-v2"))
+                        else:
+                            response = SimpleNamespace(status_code=HTTPStatus.OK, output=output,
+                                                       request_id="enclosing-request")
+                            with patch("app.services.asr.Transcription.async_call", return_value=response):
+                                self.assertIsNone(self.service._try_transcribe_with_model(
+                                    "https://example.com/audio", "paraformer-v2",
+                                ))
+                    messages = "\n".join(entry.args[0].format(*entry.args[1:]) for entry in warning.call_args_list)
+                    for expected in ("AudioError", "subtask rejected", "enclosing-request"):
+                        self.assertIn(expected, messages)
+
+    def test_canceled_rest_task_stops_polling_and_logs_reason(self):
+        self.service.timeout = 1
+        with (
+            patch.object(self.service, "_submit_transcription_task_restful", return_value="task"),
+            patch.object(self.service, "_fetch_transcription_task_restful",
+                         return_value={"task_status": "CANCELED", "code": "CANCELED", "message": "task canceled"}),
+            patch("app.services.asr.time.time", side_effect=[0, 0, 2]),
+            patch("app.services.asr.time.sleep") as sleep,
+            patch("app.services.asr.logger.warning") as warning,
+        ):
+            self.assertIsNone(self.service._transcribe_sync_restful("oss://audio", "paraformer-v2"))
+        sleep.assert_not_called()
+        messages = "\n".join(entry.args[0].format(*entry.args[1:]) for entry in warning.call_args_list)
+        self.assertIn("task canceled", messages)
+
+    def test_recognition_quota_error_is_not_reported_as_empty_transcript(self):
+        self.service.local_models = ["paraformer-realtime-v2"]
+        result = Mock(
+            status_code=44, code="AllocationQuota.FreeTierOnly", message="free tier rejected",
+            request_id="quota-request",
+        )
+        with (
+            patch("app.services.asr.os.path.exists", return_value=True),
+            patch.object(self.service, "_prepare_recognition_input", return_value="audio.pcm"),
+            patch("app.services.asr.Recognition") as recognition,
+            patch("app.services.asr.logger.warning") as warning,
+        ):
+            recognition.return_value.call.return_value = result
+            self.assertIsNone(self.service._recognize_local_file("audio.wav"))
+        result.get_sentence.assert_not_called()
+        messages = "\n".join(entry.args[0].format(*entry.args[1:]) for entry in warning.call_args_list)
+        self.assertIn("AllocationQuota.FreeTierOnly", messages)
+        self.assertIn("quota-request", messages)
+        self.assertIn("工作空间", messages)
+
+    def test_quota_rejected_model_is_skipped_for_subsequent_audio(self):
+        self.service.models = ["paraformer-v2", "paraformer-8k-v2"]
+        quota = SimpleNamespace(
+            status_code=HTTPStatus.OK, request_id="quota-request",
+            output={"task_id": "task", "task_status": "FAILED", "results": [
+                {"subtask_status": "FAILED", "code": "AllocationQuota.FreeTierOnly", "message": "quota rejected"}
+            ]},
+        )
+        success = SimpleNamespace(
+            status_code=HTTPStatus.OK,
+            output={"task_id": "success", "task_status": "SUCCEEDED", "results": [
+                {"subtask_status": "SUCCEEDED", "transcription_url": "https://example.com/result"}
+            ]},
+        )
+        with (
+            patch("app.services.asr.Transcription.async_call", side_effect=[quota, success, success]) as submit,
+            patch.object(self.service, "_download_transcription", return_value="transcript"),
+        ):
+            self.assertEqual(self.service._transcribe_sync("https://example.com/first.wav"), "transcript")
+            self.assertEqual(self.service._transcribe_sync("https://example.com/second.wav"), "transcript")
+        self.assertEqual(
+            [entry.kwargs["model"] for entry in submit.call_args_list],
+            ["paraformer-v2", "paraformer-8k-v2", "paraformer-8k-v2"],
+        )
+
+    def test_audio_specific_server_error_does_not_disable_model(self):
+        self.service.models = ["paraformer-v2"]
+        failure = SimpleNamespace(
+            status_code=HTTPStatus.OK,
+            output={"task_id": "task", "task_status": "FAILED", "results": [
+                {"subtask_status": "FAILED", "code": "SERVER_ERROR", "message": "/ by zero"}
+            ]},
+        )
+        with patch("app.services.asr.Transcription.async_call", return_value=failure) as submit:
+            self.service._transcribe_sync("https://example.com/first.wav")
+            self.service._transcribe_sync("https://example.com/second.wav")
+        self.assertEqual(submit.call_count, 2)
+
+    def test_recognition_quota_rejection_is_skipped_on_next_item(self):
+        self.service.local_models = ["paraformer-realtime-v2"]
+        result = SimpleNamespace(
+            status_code=44, code="AllocationQuota.FreeTierOnly",
+            message="quota rejected", request_id="quota-request",
+        )
+        with (
+            patch("app.services.asr.os.path.exists", return_value=True),
+            patch.object(self.service, "_prepare_recognition_input", return_value="audio.pcm") as prepare,
+            patch("app.services.asr.Recognition") as recognition,
+        ):
+            recognition.return_value.call.return_value = result
+            self.assertIsNone(self.service._recognize_local_file("first.wav"))
+            self.assertIsNone(self.service._recognize_local_file("second.wav"))
+        recognition.assert_called_once()
+        prepare.assert_called_once()
+
+    def test_unavailable_recorded_models_are_skipped_before_upload(self):
+        self.service.models = ["paraformer-v2"]
+        with (
+            patch("app.services.asr.httpx.post") as post,
+            patch("app.services.asr.os.path.exists", return_value=True),
+            patch.object(self.service, "_transcode_audio_to_wav", return_value="audio.wav") as transcode,
+            patch.object(self.service, "_upload_temp_file", return_value="oss://audio") as upload,
+            patch.object(self.service, "_recognize_local_file", return_value=None),
+        ):
+            response = Mock(status_code=HTTPStatus.FORBIDDEN)
+            response.json.return_value = {"code": "AccessDenied", "message": "model denied"}
+            post.return_value = response
+            self.service._transcribe_local_file_sync("first.wav")
+            self.service._transcribe_local_file_sync("second.wav")
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(upload.call_count, 1)
+        self.assertEqual(transcode.call_count, 1)
+
+    def test_new_service_does_not_inherit_model_rejections(self):
+        self.service.models = ["paraformer-v2"]
+        failure = SimpleNamespace(
+            status_code=HTTPStatus.FORBIDDEN, code="AccessDenied", message="denied", output={},
+        )
+        with (
+            patch("app.services.asr.Transcription.async_call", return_value=failure) as submit,
+            patch("app.services.asr.ASRTempFileManager"),
+        ):
+            self.service._transcribe_sync("https://example.com/first.wav")
+            restarted = ASRService(api_key="test-key", model="paraformer-v2")
+            restarted._transcribe_sync("https://example.com/second.wav")
+        self.assertEqual(submit.call_count, 2)
 
 
 class ASRLocalFileFallbackTests(unittest.IsolatedAsyncioTestCase):

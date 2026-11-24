@@ -140,6 +140,9 @@ async def douyin_delete_session(session_id: str, db: AsyncSession = Depends(get_
 
 class DouyinExportRequest(BaseModel):
     """抖音导出请求"""
+    refresh_collection_cache: bool = Field(
+        default=False, description="忽略收藏列表 DB 缓存，重新完整拉取并更新缓存",
+    )
     cookie: str = Field(..., description="抖音浏览器 Cookie 字符串")
     evil0ctal_url: str = Field(
         default="",
@@ -152,7 +155,7 @@ class DouyinExportRequest(BaseModel):
     )
     after_date: Optional[str] = Field(
         default=None,
-        description="只导出该日期之后发布的视频（YYYY-MM-DD，留空则不限制）",
+        description="只导出该日期之后收藏的视频（YYYY-MM-DD，留空则不限制）",
     )
     asr_backend: str = Field(
         default="auto",
@@ -280,7 +283,9 @@ async def _run_douyin_export(job_id: str, req: DouyinExportRequest):
 
         # 获取所有收藏视频
         after_date = req.after_date or getattr(settings, "douyin_after_date", "") or None
-        all_videos = await douyin.get_all_collection_videos(after_date=after_date)
+        all_videos = await douyin.get_all_collection_videos(
+            after_date=after_date, refresh_cache=req.refresh_collection_cache,
+        )
         if req.limit > 0:
             all_videos = all_videos[:req.limit]
 

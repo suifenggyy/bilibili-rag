@@ -195,8 +195,11 @@ class TestDouyinCollectionRequest(unittest.IsolatedAsyncioTestCase):
         from app.services.douyin import DouyinService
 
         service = DouyinService(cookie="test")
-        with patch.object(
-            service, "get_collection_videos_page", new=AsyncMock(side_effect=RuntimeError("HTTP 403"))
+        with (
+            patch.object(service, "_load_collection_cache", new=AsyncMock(return_value=[])),
+            patch.object(
+                service, "get_collection_videos_page", new=AsyncMock(side_effect=RuntimeError("HTTP 403"))
+            ),
         ):
             with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
                 await service.get_all_collection_videos()

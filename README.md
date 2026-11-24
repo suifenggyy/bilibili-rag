@@ -456,6 +456,10 @@ $OBSIDIAN_VAULT_ROOT/$OBSIDIAN_INBOX_DIR/
 
 每个 Markdown 文件包含：视频信息表格（ID 超链接、作者、时长、发布日期）、封面图、ASR 转写全文。
 
+抖音视频 ASR 失败或未返回有效文本时，该条目记为失败，不生成或覆盖 Markdown，也不降级导出基本信息。已有有效转写缓存仍可复用。DashScope 在同一次脚本运行中会记录因额度、鉴权或模型不存在而不可用的模型，后续视频跳过这些模型；重新启动脚本后重新尝试。网络异常、音频错误等单次失败不会禁用模型，程序不会自动开启付费调用。
+
+收藏视频原始列表会缓存到 SQLite。后续运行仍请求最新页，遇到已缓存的视频就停止翻页，刷新当前页信息并合并缓存中的历史条目；因此未处理或处理失败的条目仍可重试。缓存按账号（Cookie 中的账号/会话标识）、日期过滤条件及翻页上限隔离，不按视频发布时间过滤收藏。增量模式不会主动发现历史取消收藏，且旧播放链接可能过期；需要重新完整同步时运行 `python scripts/export_douyin_to_md.py --refresh-collection-cache`。Web API 的 `/douyin-export/start` 也接受 `refresh_collection_cache: true`。
+
 ### 与 B站导出对比
 
 | 维度 | B站 | 抖音 |

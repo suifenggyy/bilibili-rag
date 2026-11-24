@@ -6,6 +6,7 @@ ASR 服务 - 使用 DashScope 录音文件识别
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -44,6 +45,8 @@ class ASRService:
         self.timeout = timeout or getattr(settings, "asr_timeout", 600)
         self.input_format = getattr(settings, "asr_input_format", "pcm")
         self.temp_file_manager = ASRTempFileManager()
+        self._unavailable_models: dict[str, str] = {}
+        self._availability_lock = threading.Lock()
 
         # Support comma-separated model lists for automatic fallback
         _raw_model = model or getattr(settings, "asr_model", "paraformer-v2")
@@ -71,10 +74,75 @@ class ASRService:
         return 8000 if "-8k-" in model else 16000
 
     def _transcription_parameters(self, model: str) -> dict:
-        if "paraformer" not in model:
+        if model != "paraformer-v2":
             return {}
-        languages = ["zh"] if self._model_sample_rate(model) == 8000 else ["zh", "en"]
-        return {"language_hints": languages}
+        return {"language_hints": ["zh", "en"]}
+
+    def _skip_unavailable_model(self, model: str) -> bool:
+        with self._availability_lock:
+            code = self._unavailable_models.get(model)
+        if code:
+            logger.warning("[ASR] 跳过本次运行已不可用的模型 {}: code={}", model, code)
+            return True
+        return False
+
+    def _record_model_error(self, model: str, code: Any) -> None:
+        if not isinstance(code, str):
+            return
+        unavailable = code.startswith("AllocationQuota.") or code in {
+            "InvalidApiKey", "InvalidApiKeyError", "AccessDenied", "Unauthorized",
+            "ModelNotFound", "ModelNotExist", "InvalidModel",
+        }
+        if not unavailable:
+            return
+        with self._availability_lock:
+            if model in self._unavailable_models:
+                return
+            self._unavailable_models[model] = code
+        logger.warning(
+            "[ASR] 模型 {} 已标记为本次运行不可用: code={}；后续条目跳过，下次启动重新尝试",
+            model, code,
+        )
+
+    def _log_asr_errors(self, model: str, stage: str, response: Any, task_id: Optional[str] = None) -> None:
+        """Log error fields only, including nested file results, without signed URLs."""
+        def safe(value: Any) -> str:
+            text = str(value if value is not None else "-")
+            if self.api_key:
+                text = text.replace(self.api_key, "[REDACTED]")
+            return re.sub(r"(?:https?|oss|wss?)://\S+", "[URL]", text)
+
+        def visit(node: Any, path: str, request_id: Any = None, force: bool = False) -> None:
+            request_id = self._get_output_value(node, "request_id") or request_id
+            code = self._get_output_value(node, "code") or self._get_output_value(node, "error_code")
+            self._record_model_error(model, code)
+            messages = [
+                self._get_output_value(node, key)
+                for key in ("status_message", "error_message", "message")
+            ]
+            message = "; ".join(str(value) for value in messages if value)
+            status = (
+                self._get_output_value(node, "task_status")
+                or self._get_output_value(node, "subtask_status")
+            )
+            if force or code or message or status in ("FAILED", "CANCELED", "CANCELLED"):
+                logger.warning(
+                    "[ASR] 模型 {} {} 失败详情: path={}, task_id={}, status={}, "
+                    "status_code={}, code={}, message={}, request_id={}",
+                    model, stage, path, task_id or "-", safe(status),
+                    safe(self._get_output_value(node, "status_code")), safe(code),
+                    safe(message or None), safe(request_id),
+                )
+            output = self._get_output_value(node, "output")
+            if isinstance(output, dict):
+                visit(output, f"{path}.output", request_id)
+            results = self._get_output_value(node, "results", [])
+            if isinstance(results, list):
+                for index, item in enumerate(results):
+                    if isinstance(item, dict):
+                        visit(item, f"{path}.results[{index}]", request_id)
+
+        visit(response, "response", force=True)
 
     def _transcode_audio_to_pcm(self, file_path: str, sample_rate: int = 16000) -> Optional[str]:
         """按模型采样率转码为单声道 s16le PCM，适配 Recognition"""
@@ -162,6 +230,8 @@ class ASRService:
             return None
 
         for model in self.local_models:
+            if self._skip_unavailable_model(model):
+                continue
             sample_rate = self._model_sample_rate(model)
             input_path = self._prepare_recognition_input(file_path, sample_rate=sample_rate)
             if not input_path:
@@ -178,14 +248,24 @@ class ASRService:
                     sample_rate=sample_rate,
                 )
                 with ASRService._recognition_lock:
+                    if self._skip_unavailable_model(model):
+                        continue
                     result = recognizer.call(input_path)
+                    status_code = getattr(result, "status_code", None)
+                    if isinstance(status_code, int) and status_code != HTTPStatus.OK:
+                        self._log_asr_errors(model, "Recognition", result)
                 logger.info(
-                    "ASR Recognition 结果: status_code={}, code={}, message={}, request_id={}",
-                    getattr(result, "status_code", None),
-                    getattr(result, "code", None),
-                    getattr(result, "message", None),
-                    getattr(result, "request_id", None),
+                    "ASR Recognition 结果: model={}, status_code={}",
+                    model, status_code,
                 )
+                if isinstance(status_code, int) and status_code != HTTPStatus.OK:
+                    if getattr(result, "code", None) == "AllocationQuota.FreeTierOnly":
+                        logger.warning(
+                            "[ASR] 模型 {} 被服务端免费额度策略拒绝；请核对 API Key 所属账号、"
+                            "地域和工作空间的额度，不会自动开启付费调用",
+                            model,
+                        )
+                    continue
                 sentences = result.get_sentence() or []
                 if isinstance(sentences, dict):
                     sentences = [sentences]
@@ -245,6 +325,16 @@ class ASRService:
             base_url = "https://dashscope.aliyuncs.com/api/v1"
         return join_url(base_url, *parts)
 
+    @staticmethod
+    def _rest_response_data(response: httpx.Response) -> dict:
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"code": "InvalidResponse", "message": "ASR 响应不是有效 JSON"}
+        if not isinstance(data, dict):
+            data = {"code": "InvalidResponse", "message": "ASR 响应不是 JSON 对象"}
+        return {**data, "status_code": response.status_code}
+
     def _submit_transcription_task_restful(self, audio_url: str, model: str) -> Optional[str]:
         url = self._build_api_url("services", "audio", "asr", "transcription")
         headers = {
@@ -252,6 +342,8 @@ class ASRService:
             "Content-Type": "application/json",
             "X-DashScope-Async": "enable",
         }
+        if audio_url.startswith("oss://"):
+            headers["X-DashScope-OssResourceResolve"] = "enable"
         parameters = self._transcription_parameters(model)
         payload = {"model": model, "input": {"file_urls": [audio_url]}}
         if parameters:
@@ -263,16 +355,18 @@ class ASRService:
             logger.warning(f"ASR RESTful 提交失败: {e}")
             return None
 
-        if resp.status_code != HTTPStatus.OK:
-            logger.warning(f"ASR RESTful 提交失败: status_code={resp.status_code}, body={resp.text[:300]}")
+        data = self._rest_response_data(resp)
+        if resp.status_code != HTTPStatus.OK or data.get("code"):
+            self._log_asr_errors(model, "RESTful 提交", data)
             return None
 
-        data = resp.json()
         task_id = data.get("task_id")
         if not task_id:
             output = data.get("output") if isinstance(data, dict) else None
             if isinstance(output, dict):
                 task_id = output.get("task_id")
+        if not task_id:
+            self._log_asr_errors(model, "RESTful 提交未返回 task_id", data)
         return task_id
 
     def _fetch_transcription_task_restful(self, task_id: str) -> Optional[dict]:
@@ -284,17 +378,20 @@ class ASRService:
             logger.warning(f"ASR RESTful 查询失败: {e}")
             return None
 
-        if resp.status_code != HTTPStatus.OK:
-            logger.warning(f"ASR RESTful 查询失败: status_code={resp.status_code}, body={resp.text[:300]}")
-            return None
-
-        data = resp.json()
+        data = self._rest_response_data(resp)
+        if resp.status_code != HTTPStatus.OK or data.get("code"):
+            return data
         if isinstance(data, dict) and isinstance(data.get("output"), dict):
-            return data["output"]
+            return {
+                **data["output"], "status_code": resp.status_code,
+                "request_id": data.get("request_id") or data["output"].get("request_id"),
+            }
         return data if isinstance(data, dict) else None
 
     def _transcribe_sync_restful(self, audio_url: str, model: str, title: Optional[str] = None) -> Optional[str]:
         self._configure()
+        if self._skip_unavailable_model(model):
+            return None
         task_id = self._submit_transcription_task_restful(audio_url, model)
         if not task_id:
             logger.warning(f"[ASR] 模型 {model} RESTful 未返回 task_id")
@@ -312,30 +409,37 @@ class ASRService:
                 time.sleep(1.5)
                 continue
             status = self._get_output_value(output, "task_status")
-            if status in ("SUCCEEDED", "FAILED"):
+            status_code = output.get("status_code")
+            if (
+                (status_code is not None and status_code != HTTPStatus.OK)
+                or (not status and (output.get("code") or output.get("error_code")))
+            ):
+                self._log_asr_errors(model, "RESTful 查询", output, task_id=task_id)
+                return None
+            if status in ("SUCCEEDED", "FAILED", "CANCELED", "CANCELLED"):
                 break
             time.sleep(1.5)
 
         task_status = self._get_output_value(output, "task_status")
-        status_message = self._get_output_value(output, "status_message") or ""
         results = self._get_output_value(output, "results", []) or []
         logger.info(
-            "[ASR] 模型 {} 任务状态(RESTful): task_id={}, task_status={}, status_message={}, results={}",
-            model, task_id, task_status, status_message, len(results),
+            "[ASR] 模型 {} 任务状态(RESTful): task_id={}, task_status={}, results={}",
+            model, task_id, task_status, len(results),
         )
 
-        if task_status == "FAILED":
-            logger.warning(f"[ASR] 模型 {model} 任务失败(RESTful): {status_message}")
+        if task_status in ("FAILED", "CANCELED", "CANCELLED"):
+            self._log_asr_errors(model, "RESTful", output, task_id=task_id)
             return None
 
+        if any(item.get("subtask_status") in ("FAILED", "CANCELED", "CANCELLED") for item in results):
+            self._log_asr_errors(model, "RESTful 子任务", output, task_id=task_id)
         for item in results:
             sub_status = item.get("subtask_status")
             transcription_url = item.get("transcription_url")
-            error_message = item.get("error_message") or item.get("message")
             if sub_status:
                 logger.info(
-                    "[ASR] 模型 {} 子任务(RESTful): subtask_status={}, has_url={}, error={}",
-                    model, sub_status, bool(transcription_url), error_message,
+                    "[ASR] 模型 {} 子任务(RESTful): subtask_status={}, has_url={}",
+                    model, sub_status, bool(transcription_url),
                 )
             if sub_status == "SUCCEEDED" and transcription_url:
                 return self._download_transcription(transcription_url, title=title)
@@ -355,6 +459,8 @@ class ASRService:
 
     def _try_transcribe_with_model(self, audio_url: str, model: str, title: Optional[str] = None) -> Optional[str]:
         """使用指定单个模型转写，失败返回 None"""
+        if self._skip_unavailable_model(model):
+            return None
         if audio_url.startswith("oss://"):
             return self._transcribe_sync_restful(audio_url, model, title=title)
 
@@ -373,14 +479,19 @@ class ASRService:
         output = getattr(resp, "output", None)
         task_id = self._get_output_value(output, "task_id")
         if not task_id:
+            self._log_asr_errors(model, "SDK 提交", resp)
             logger.warning(f"[ASR] 模型 {model} 未返回 task_id")
             return None
         logger.info(f"[ASR] 模型 {model} 任务已提交: task_id={task_id}")
 
         start = time.time()
         while True:
+            status_code = getattr(resp, "status_code", None)
+            if status_code is not None and status_code != HTTPStatus.OK:
+                self._log_asr_errors(model, "SDK 请求", resp, task_id=task_id)
+                return None
             status = self._get_output_value(output, "task_status")
-            if status in ("SUCCEEDED", "FAILED"):
+            if status in ("SUCCEEDED", "FAILED", "CANCELED", "CANCELLED"):
                 break
             if time.time() - start > self.timeout:
                 logger.warning(f"[ASR] 模型 {model} 任务超时")
@@ -391,29 +502,29 @@ class ASRService:
 
         status_code = getattr(resp, "status_code", None)
         task_status = self._get_output_value(output, "task_status")
-        status_message = self._get_output_value(output, "status_message") or ""
         logger.info(
-            "[ASR] 模型 {} 任务状态: task_id={}, task_status={}, status_code={}, status_message={}",
-            model, task_id, task_status, status_code, status_message,
+            "[ASR] 模型 {} 任务状态: task_id={}, task_status={}, status_code={}",
+            model, task_id, task_status, status_code,
         )
 
-        if task_status == "FAILED":
-            logger.warning(f"[ASR] 模型 {model} 任务失败: {status_message}")
+        if task_status in ("FAILED", "CANCELED", "CANCELLED"):
+            self._log_asr_errors(model, "SDK", resp, task_id=task_id)
             return None
 
         if status_code != HTTPStatus.OK:
-            logger.warning(f"[ASR] 模型 {model} 请求失败: status_code={status_code}")
+            self._log_asr_errors(model, "SDK 请求", resp, task_id=task_id)
             return None
 
         results = self._get_output_value(output, "results", []) or []
+        if any(item.get("subtask_status") in ("FAILED", "CANCELED", "CANCELLED") for item in results):
+            self._log_asr_errors(model, "SDK 子任务", resp, task_id=task_id)
         for item in results:
             sub_status = item.get("subtask_status")
             transcription_url = item.get("transcription_url")
-            error_message = item.get("error_message") or item.get("message")
             if sub_status:
                 logger.info(
-                    "[ASR] 模型 {} 子任务: subtask_status={}, has_url={}, error={}",
-                    model, sub_status, bool(transcription_url), error_message,
+                    "[ASR] 模型 {} 子任务: subtask_status={}, has_url={}",
+                    model, sub_status, bool(transcription_url),
                 )
             if sub_status == "SUCCEEDED" and transcription_url:
                 return self._download_transcription(transcription_url, title=title)
@@ -454,6 +565,8 @@ class ASRService:
             return None
 
         for model in self.models:
+            if self._skip_unavailable_model(model):
+                continue
             input_path = self._transcode_audio_to_wav(
                 file_path, sample_rate=self._model_sample_rate(model)
             )

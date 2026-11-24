@@ -263,7 +263,7 @@ async def export_videos(
     output_dir: Path,
     cookie: str = "",
     concurrency: int = 2,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """
     批量并发处理并导出视频到 Markdown 文件。
 
@@ -275,7 +275,7 @@ async def export_videos(
         concurrency: 并发度（限制同时进行 DashScope/ASR 调用数）
 
     Returns:
-        (成功数, 失败数)
+        (成功数, 失败数, 完成数)
     """
     from app.services.douyin import DouyinService
     from app.services.comments import fetch_douyin_comments, format_comments_section
@@ -357,6 +357,8 @@ async def export_videos(
             async with sem:
                 vc = await fetcher.fetch_content(video_info)
 
+            if vc.content_source != "asr" or not vc.content.strip():
+                raise RuntimeError(f"[{aweme_id}] ASR 未成功，不生成 Markdown")
             md_content = _build_markdown(vc, vc.content, vc.content_source)
             md_path.write_text(md_content, encoding="utf-8")
             abs_md_path = str(md_path.resolve())
@@ -504,6 +506,11 @@ async def main():
         default=_get_env("DOUYIN_AFTER_DATE"),
         help="只导出该日期（含）之后收藏的视频，格式 YYYY-MM-DD（留空则不限制）",
     )
+    parser.add_argument(
+        "--refresh-collection-cache",
+        action="store_true",
+        help="忽略收藏列表 DB 缓存，重新完整拉取并更新缓存",
+    )
     args = parser.parse_args()
 
     # ── 参数校验 ─────────────────────────────────────────────────────────
@@ -568,7 +575,9 @@ async def main():
         if after_date_arg:
             print(f"🗓️  日期过滤：仅获取 {after_date_arg} 之后收藏的视频")
         try:
-            all_videos = await douyin.get_all_collection_videos(after_date=after_date_arg)
+            all_videos = await douyin.get_all_collection_videos(
+                after_date=after_date_arg, refresh_cache=args.refresh_collection_cache,
+            )
         except Exception as e:
             print(f"❌ 获取失败：{e}")
             sys.exit(1)

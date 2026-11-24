@@ -213,6 +213,17 @@ class DouyinSession(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class DouyinCollectionCache(Base):
+    """Account/query-scoped snapshots of raw Douyin collection metadata."""
+    __tablename__ = 'douyin_collection_cache'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    cache_key = Column(String(64), unique=True, index=True, nullable=False)
+    videos = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class InstapaperSession(Base):
     """Instapaper 登录凭据存储"""
     __tablename__ = 'instapaper_sessions'

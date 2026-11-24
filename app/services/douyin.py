@@ -14,11 +14,18 @@ Cookie 获取方式（浏览器手动复制）：
 """
 
 import asyncio
+import hashlib
+import json
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
+from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert
 
+from app.database import get_db_context
+from app.models import DouyinCollectionCache
 from app.services import douyin_bridge
 
 # 抖音 desc 中 hashtag 的分隔模式：空格 + #xxx 或 空格 + 中文标签
@@ -81,6 +88,39 @@ class DouyinService:
 
     # ==================== 收藏夹接口 ====================
 
+    def _collection_cache_key(self, after_ts: Optional[int], max_pages: int) -> str:
+        cookies = {}
+        for part in self.cookie.split(";"):
+            name, separator, value = part.partition("=")
+            if separator:
+                cookies[name.strip()] = value.strip().strip('"')
+        # Account cookies survive token rotation; never persist raw Cookie values.
+        identity = next(
+            (f"{name}:{cookies[name]}" for name in ("uid_tt", "uid_tt_ss", "sessionid") if cookies.get(name)),
+            self.cookie,
+        )
+        scope = json.dumps([identity, after_ts, max_pages], separators=(",", ":"))
+        return hashlib.sha256(scope.encode("utf-8")).hexdigest()
+
+    async def _load_collection_cache(self, cache_key: str) -> list[dict]:
+        async with get_db_context() as db:
+            result = await db.execute(
+                select(DouyinCollectionCache.videos).where(DouyinCollectionCache.cache_key == cache_key)
+            )
+            return result.scalar_one_or_none() or []
+
+    async def _store_collection_cache(self, cache_key: str, videos: list[dict]) -> None:
+        statement = insert(DouyinCollectionCache).values(
+            cache_key=cache_key, videos=videos, updated_at=datetime.now(timezone.utc),
+        )
+        statement = statement.on_conflict_do_update(
+            index_elements=[DouyinCollectionCache.cache_key],
+            set_={"videos": statement.excluded.videos, "updated_at": statement.excluded.updated_at},
+        )
+        async with get_db_context() as db:
+            await db.execute(statement)
+            await db.commit()
+
     async def get_collection_videos_page(
         self, max_cursor: int = 0, count: int = 20
     ) -> dict:
@@ -115,9 +155,10 @@ class DouyinService:
         self,
         after_date: Optional[str] = None,
         max_pages: int = 200,
+        refresh_cache: bool = False,
     ) -> list[dict]:
         """
-        获取全部收藏夹视频（自动翻页），可按收藏日期过滤。
+        获取收藏夹视频；遇到已缓存视频停止翻页并合并 DB 中的列表。
 
         收藏夹 API 按收藏时间倒序返回，max_cursor 即为收藏时间戳。
         API 不返回单条视频的收藏时间字段，因此：
@@ -127,6 +168,7 @@ class DouyinService:
         Args:
             after_date: 'YYYY-MM-DD' 格式，仅返回此日期之后收藏的视频（含当天）
             max_pages: 最大翻页次数，防止无限循环（默认 200 页 × 20 条 = 4000 个）
+            refresh_cache: 忽略已有列表缓存，完整拉取后替换缓存
 
         Returns:
             视频数据列表，每条为 dict（原始 Douyin API 格式）
@@ -150,7 +192,25 @@ class DouyinService:
             except (OSError, ValueError):
                 return str(cursor)
 
+        cache_key = self._collection_cache_key(after_ts, max_pages)
+        cached_videos = [] if refresh_cache else await self._load_collection_cache(cache_key)
+
+        def _video_id(video: dict) -> str:
+            return str(video.get("aweme_id") or video.get("id") or "")
+
+        cached_ids = {_video_id(video) for video in cached_videos if _video_id(video)}
         all_videos: list[dict] = []
+        seen_ids: set[str] = set()
+
+        def _append_unique(videos: list[dict]) -> None:
+            for video in videos:
+                identifier = _video_id(video)
+                if identifier and identifier in seen_ids:
+                    continue
+                all_videos.append(video)
+                if identifier:
+                    seen_ids.add(identifier)
+
         max_cursor = 0
         page = 0
 
@@ -168,8 +228,16 @@ class DouyinService:
             if not videos:
                 break
 
-            all_videos.extend(videos)
+            _append_unique(videos)
             logger.debug(f"[Douyin] 第 {page} 页获取 {len(videos)} 个视频，累计 {len(all_videos)} 个")
+
+            if any(_video_id(video) in cached_ids for video in videos):
+                _append_unique(cached_videos)
+                logger.info(
+                    "[Douyin] 第 {} 页命中收藏列表 DB 缓存，停止翻页；合并后 {} 个视频",
+                    page, len(all_videos),
+                )
+                break
 
             if not data.get("has_more"):
                 break
@@ -188,6 +256,7 @@ class DouyinService:
 
             await asyncio.sleep(0.8)
 
+        await self._store_collection_cache(cache_key, all_videos)
         return all_videos
 
     # ==================== 创作者作品接口 ====================

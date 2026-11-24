@@ -66,14 +66,26 @@ class ASRService:
             return output.get(key, default)
         return getattr(output, key, default)
 
-    def _transcode_audio_to_pcm(self, file_path: str) -> Optional[str]:
-        """转码为 16k s16le PCM，适配 Recognition"""
+    @staticmethod
+    def _model_sample_rate(model: str) -> int:
+        return 8000 if "-8k-" in model else 16000
+
+    def _transcription_parameters(self, model: str) -> dict:
+        if "paraformer" not in model:
+            return {}
+        languages = ["zh"] if self._model_sample_rate(model) == 8000 else ["zh", "en"]
+        return {"language_hints": languages}
+
+    def _transcode_audio_to_pcm(self, file_path: str, sample_rate: int = 16000) -> Optional[str]:
+        """按模型采样率转码为单声道 s16le PCM，适配 Recognition"""
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             logger.info("未检测到 ffmpeg，无法转码为 PCM")
             return None
         base, _ext = os.path.splitext(file_path)
-        pcm_path = base + ".pcm"
+        pcm_path = base + (".8k.pcm" if sample_rate == 8000 else ".pcm")
+        if pcm_path == file_path:
+            pcm_path = base + ".16k.pcm"
         cmd = [
             ffmpeg,
             "-y",
@@ -81,7 +93,7 @@ class ASRService:
             "-f", "s16le",
             "-acodec", "pcm_s16le",
             "-ac", "1",
-            "-ar", "16000",
+            "-ar", str(sample_rate),
             pcm_path,
         ]
         try:
@@ -100,20 +112,22 @@ class ASRService:
             logger.warning(f"转码 PCM 异常: {e}")
             return None
 
-    def _transcode_audio_to_wav(self, file_path: str) -> Optional[str]:
-        """转码为 16k 单声道 WAV"""
+    def _transcode_audio_to_wav(self, file_path: str, sample_rate: int = 16000) -> Optional[str]:
+        """按模型采样率转码为单声道 WAV"""
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             logger.info("未检测到 ffmpeg，无法转码为 WAV")
             return None
         base, _ext = os.path.splitext(file_path)
-        wav_path = base + ".wav"
+        wav_path = base + (".8k.wav" if sample_rate == 8000 else ".wav")
+        if wav_path == file_path:
+            wav_path = base + ".16k.wav"
         cmd = [
             ffmpeg,
             "-y",
             "-i", file_path,
             "-ac", "1",
-            "-ar", "16000",
+            "-ar", str(sample_rate),
             "-vn",
             wav_path,
         ]
@@ -133,12 +147,12 @@ class ASRService:
             logger.warning(f"转码 WAV 异常: {e}")
             return None
 
-    def _prepare_recognition_input(self, file_path: str) -> Optional[str]:
+    def _prepare_recognition_input(self, file_path: str, sample_rate: int = 16000) -> Optional[str]:
         """按输入格式准备 Recognition 文件"""
         fmt = (self.input_format or "pcm").lower()
         if fmt == "wav":
-            return self._transcode_audio_to_wav(file_path)
-        return self._transcode_audio_to_pcm(file_path)
+            return self._transcode_audio_to_wav(file_path, sample_rate=sample_rate)
+        return self._transcode_audio_to_pcm(file_path, sample_rate=sample_rate)
 
     def _recognize_local_file(self, file_path: str, title: Optional[str] = None) -> Optional[str]:
         """使用 Recognition 直传本地音频，支持多模型自动 fallback"""
@@ -147,20 +161,21 @@ class ASRService:
             logger.warning(f"ASR 本地文件不存在: {file_path}")
             return None
 
-        input_path = self._prepare_recognition_input(file_path)
-        if not input_path:
-            return None
-
         for model in self.local_models:
+            sample_rate = self._model_sample_rate(model)
+            input_path = self._prepare_recognition_input(file_path, sample_rate=sample_rate)
+            if not input_path:
+                logger.warning(f"ASR Recognition 模型 {model} 音频准备失败，尝试下一个...")
+                continue
             logger.info(
-                f"ASR Recognition 使用模型: {model}, format={self.input_format or 'pcm'}"
+                f"ASR Recognition 使用模型: {model}, format={self.input_format or 'pcm'}, sample_rate={sample_rate}"
             )
             try:
                 recognizer = Recognition(
                     model=model,
                     callback=None,
                     format=(self.input_format or "pcm"),
-                    sample_rate=16000,
+                    sample_rate=sample_rate,
                 )
                 with ASRService._recognition_lock:
                     result = recognizer.call(input_path)
@@ -237,9 +252,7 @@ class ASRService:
             "Content-Type": "application/json",
             "X-DashScope-Async": "enable",
         }
-        parameters = {}
-        if "paraformer" in model:
-            parameters["language_hints"] = ["zh", "en"]
+        parameters = self._transcription_parameters(model)
         payload = {"model": model, "input": {"file_urls": [audio_url]}}
         if parameters:
             payload["parameters"] = parameters
@@ -345,9 +358,7 @@ class ASRService:
         if audio_url.startswith("oss://"):
             return self._transcribe_sync_restful(audio_url, model, title=title)
 
-        kwargs = {}
-        if "paraformer" in model:
-            kwargs["language_hints"] = ["zh", "en"]
+        kwargs = self._transcription_parameters(model)
 
         try:
             resp = Transcription.async_call(
@@ -433,8 +444,33 @@ class ASRService:
         return await asyncio.to_thread(self._transcribe_sync, audio_url, title)
 
     async def transcribe_local_file(self, file_path: str, title: Optional[str] = None) -> Optional[str]:
-        """本地文件直传识别（Recognition）"""
-        return await asyncio.to_thread(self._recognize_local_file, file_path, title)
+        """本地文件优先上传后录音识别，失败再回退 Recognition"""
+        return await asyncio.to_thread(self._transcribe_local_file_sync, file_path, title)
+
+    def _transcribe_local_file_sync(self, file_path: str, title: Optional[str] = None) -> Optional[str]:
+        self._configure()
+        if not os.path.exists(file_path):
+            logger.warning(f"ASR 本地文件不存在: {file_path}")
+            return None
+
+        for model in self.models:
+            input_path = self._transcode_audio_to_wav(
+                file_path, sample_rate=self._model_sample_rate(model)
+            )
+            if not input_path:
+                logger.warning(f"[ASR] 录音模型 {model} 音频准备失败，尝试下一个...")
+                continue
+            audio_url = self._upload_temp_file(input_path, model=model)
+            if not audio_url:
+                logger.warning(f"[ASR] 录音模型 {model} 上传失败，尝试下一个...")
+                continue
+            text = self._try_transcribe_with_model(audio_url, model, title=title)
+            if text:
+                return text
+            logger.warning(f"[ASR] 录音模型 {model} 转写失败，尝试下一个...")
+
+        logger.warning("[ASR] 本地文件录音识别失败，回退到 Recognition")
+        return self._recognize_local_file(file_path, title=title)
 
     def _transcribe_sync_with_model(self, audio_url: str, model: str, title: Optional[str] = None) -> Optional[str]:
         """使用指定单个模型转写（用于本地文件上传后的直接调用）"""
